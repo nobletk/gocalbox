@@ -1,0 +1,114 @@
+body { 
+    font-family: system-ui, sans-serif; 
+    background-color: #f4f4f9; 
+    padding: 2rem; 
+    display: flex; 
+    justify-content: center; 
+}
+.card { 
+    background: white; 
+    padding: 2rem; 
+    border-radius: 12px; 
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
+    width: 100%; 
+    max-width: 500px; 
+    text-align: center; 
+}
+.upload-box { 
+    border: 2px dashed #007bff; 
+    padding: 2rem; 
+    margin: 1.5rem 0; 
+    border-radius: 8px; 
+    background-color: #f8fbff; 
+}
+button { 
+    background-color: #007bff; 
+    color: white; 
+    border: none; 
+    padding: 10px 20px; 
+    font-size: 1rem; 
+    border-radius: 6px; 
+    cursor: pointer; 
+}
+button:hover { 
+    background-color: #0056b3; 
+}
+#status { 
+    margin-top: 1rem; 
+    font-weight: bold; 
+}
+hr { 
+    margin: 2rem 0; 
+    border: 0;
+    border-top: 1px solid #eee; 
+}
+
+/* New File List Styles */
+.file-list { 
+    text-align: left; 
+    margin-top: 1rem; 
+}
+
+.file-item { 
+    display: flex; 
+    justify-content: space-between; 
+    padding: 0.75rem; 
+    border-bottom: 1px solid #eee; 
+}
+.file-item a { 
+    color: #007bff; 
+    text-decoration: none;
+    font-weight: bold;
+}
+
+.file-item a:hover {
+    text-decoration: underline;
+}
+
+.file-size {
+    color: #666;
+    font-size: 0.85rem;
+}
+
+.modal-overlay {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.8);
+    justify-content: center;
+    align-items: center;
+}
+
+.modal-window {
+    background: white;
+    padding: 1rem;
+    border-radius: 8px;
+    width: 90%;
+    height: 90%;
+    display: flex;
+    flex-direction: column;
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 1rem;
+}
+
+.modal-title {
+    margin: 0;
+}
+
+.modal-close-btn {
+    background: red;
+    padding: 5px 10px;
+}
+
+.modal-iframe {
+    flex-grow: 1;
+    border: none;
+    width: 100%;
+}

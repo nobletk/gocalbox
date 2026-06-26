@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gocalbox - Secure Storage</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📦</text></svg>">
+</head>
+<body>
+    <div class="card">
+        <h1>📦 Gocalbox</h1>
+        <p>Select a file to securely upload to the local server.</p>
+        
+        <div class="upload-box">
+            <input type="file" id="fileInput" multiple>
+        </div>
+        <button onclick="uploadFile()">Upload File</button>
+        <p id="status"></p>
+
+        <hr>
+        
+        <h3>Your Files</h3>
+        <div id="fileList" class="file-list"></div> 
+    </div>
+
+    <div id="fileModal" class="modal-overlay">
+        <div class="modal-window">
+            <div class="modal-header">
+                <h3 id="modalTitle" class="modal-title">Filename</h3>
+                <button class="modal-close-btn" onclick="closeModal()">X</button>
+            </div>
+            <<iframe id="fileIframe" class="modal-iframe"></iframe>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
