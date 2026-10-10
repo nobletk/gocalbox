@@ -1,326 +1,304 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
+	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
+	"github.com/nobletk/gocalbox/internal/audit"
+	"github.com/nobletk/gocalbox/internal/events"
+	"github.com/nobletk/gocalbox/internal/fsops"
+	"github.com/nobletk/gocalbox/internal/httpapi"
 	"github.com/nobletk/gocalbox/internal/sandbox"
+	"github.com/nobletk/gocalbox/web"
 )
 
-type ClientFileInfo struct {
-	Name  string `json:"name"`
-	Size  int64  `json:"size"`
-	IsDir bool   `json:"isDir"`
-}
-
-type DeleteRequest struct {
-	Path string `json:"path"`
-}
-
-type MoveRequest struct {
-	OldPath string `json:"oldPath"`
-	NewPath string `json:"newPath"`
-}
-
-type CreateFolderRequest struct {
-	Name       string `json:"name"`
-	TargetPath string `json:"targetPath"`
-}
-
 func main() {
+	if err := run(); err != nil {
+		log.Fatalf("Fatal Error: %v", err)
+	}
+}
+
+func run() error {
+	host := flag.String("host", "localhost", "Address to listen on (use 0.0.0.0 to expose the server to the network)")
 	port := flag.String("port", "8080", "Port to run the server on")
 	rootDir := flag.String("root", ".", "The local directory to sandbox and serve")
+	webDir := flag.String("web", "", "Serve the web UI from this directory instead of the embedded copy (for frontend development)")
+	maxUploadMB := flag.Int64("max-upload-mb", 4096, "Maximum size of a single upload in MiB (0 = unlimited)")
+	allowedHosts := flag.String("allowed-hosts", "", "Extra comma-separated host names clients may use to reach the server (e.g. a DNS name)")
+	auditLog := flag.String("audit-log", defaultAuditPath(), "Audit log file; must be outside the served directory")
+	auditListings := flag.Bool("audit-listings", false, "Also record successful directory listings and file checks (HEAD requests, 304 revalidations) in the audit log")
+	auditRangeWindow := flag.Duration("audit-range-window", 5*time.Minute, "Collapse ranged downloads of a file by one client within this window into one summary record (0 = record every request)")
+	auditFailClosed := flag.Bool("audit-fail-closed", false, "Refuse file operations with 503 once the audit log cannot be written")
+	bodyTimeout := flag.Duration("body-timeout", 30*time.Second, "Abort an upload or other request whose body delivers less than 64 KiB in this long (0 = never)")
+	insecureNoAuth := flag.Bool("insecure-no-auth", false, "Allow a non-loopback -host although there is no authentication yet: anyone who can reach the port can read, change and delete the served files")
+	verifyLog := flag.String("verify-audit", "", "Verify the integrity of this audit log file and exit")
 	flag.Parse()
 
-	if info, err := os.Stat(*rootDir); err != nil || !info.IsDir() {
-		log.Fatalf("Fatal Error: Root directory '%s' does not exist or is not a directory.", *rootDir)
+	if *verifyLog != "" {
+		return verifyAudit(*verifyLog)
+	}
+	if err := checkExposure(*host, *insecureNoAuth); err != nil {
+		return err
 	}
 
-	http.Handle("/", eventMiddleware(http.FileServer(http.Dir("web"))))
-
-	fileSystem := os.DirFS(*rootDir)
-	http.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.FS(fileSystem))))
-
-	http.HandleFunc("/api/files", handleListFiles(*rootDir))
-	http.HandleFunc("/api/upload", handleUpload(*rootDir))
-	http.HandleFunc("/api/fs/delete", handleDelete(*rootDir))
-	http.HandleFunc("/api/fs/rename", handleMoveRename(*rootDir))
-	http.HandleFunc("/api/fs/move", handleMoveRename(*rootDir))
-	http.HandleFunc("/api/fs/mkdir", handleCreateFolder(*rootDir))
-
-	log.Printf("Starting secure read-only server on http://localhost:%s", *port)
-	log.Printf("Sandboxing directory: %s", *rootDir)
-
-	if err := http.ListenAndServe(":"+*port, nil); err != nil {
-		log.Fatalf("Server crashed: %v", err)
-	}
-}
-
-func eventMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Event [FileRequested]: %s %s", r.Method, r.URL.Path)
-
-		next.ServeHTTP(w, r)
+	a, err := newApp(config{
+		RootDir:          *rootDir,
+		WebDir:           *webDir,
+		MaxUploadBytes:   *maxUploadMB << 20,
+		AllowedHosts:     hostAllowlist(*host, *allowedHosts),
+		AuditLog:         *auditLog,
+		AuditListings:    *auditListings,
+		AuditRangeWindow: *auditRangeWindow,
+		AuditFailClosed:  *auditFailClosed,
+		BodyTimeout:      *bodyTimeout,
 	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+		defer cancel()
+		if err := a.Close(ctx); err != nil {
+			log.Printf("AUDIT ERROR: closing the audit log: %v", err)
+		}
+	}()
+
+	srv := &http.Server{
+		Addr:              net.JoinHostPort(*host, *port),
+		Handler:           a.Handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+		stop()
+		log.Printf("Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+			srv.Close()
+		}
+	}()
+
+	log.Printf("Starting server on http://%s", srv.Addr)
+	log.Printf("Sandboxing directory: %s", a.Root)
+	log.Printf("Accepted host names: %s", strings.Join(a.AllowedHosts, ", "))
+	log.Printf("Audit log: %s (%d existing records)", a.AuditPath, a.audit.Records())
+
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("server crashed: %w", err)
+	}
+	<-shutdownDone
+	return nil
 }
 
-func handleListFiles(rootDir string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		requestedPath := r.URL.Query().Get("path")
-		log.Printf("Event [FileListRequested]: GET /api/files?path=%s", requestedPath)
+const (
+	drainTimeout = 30 * time.Second
+	flushTimeout = 10 * time.Second
+)
 
-		targetDir, err := sandbox.SecureJoin(rootDir, requestedPath)
-		if err != nil {
-			log.Printf("SECURITY ALERT: Blocked directory read attempt: %v", err)
-			http.Error(w, "Invalid directory path", http.StatusForbidden)
-			return
+type config struct {
+	RootDir          string
+	WebDir           string
+	MaxUploadBytes   int64
+	AllowedHosts     []string // nil disables the Host check
+	AuditLog         string
+	AuditListings    bool
+	AuditRangeWindow time.Duration
+	AuditFailClosed  bool
+	BodyTimeout      time.Duration
+}
+
+type app struct {
+	Handler      http.Handler
+	Root         string
+	AuditPath    string
+	AllowedHosts []string
+
+	sb        *sandbox.Sandbox
+	bus       *events.Bus
+	coalescer *audit.Coalescer
+	audit     *audit.Writer
+	inflight  *httpapi.Tracker
+}
+
+func newApp(cfg config) (*app, error) {
+	sb, err := sandbox.New(cfg.RootDir)
+	if err != nil {
+		return nil, fmt.Errorf("invalid root directory: %w", err)
+	}
+	auditPath, err := audit.EnsureOutside(sb.Root(), cfg.AuditLog)
+	if err != nil {
+		sb.Close()
+		return nil, err
+	}
+	auditWriter, err := audit.Open(auditPath)
+	if err != nil {
+		sb.Close()
+		return nil, err
+	}
+
+	auditHandler := auditWriter.HandleBatch
+	var coalescer *audit.Coalescer
+	if cfg.AuditRangeWindow > 0 {
+		coalescer = audit.NewCoalescer(auditWriter, cfg.AuditRangeWindow)
+		auditHandler = coalescer.HandleBatch
+	}
+
+	bus := events.New()
+	bus.SubscribeBatch("audit", auditHandler, events.Options{
+		Mode:   events.Block,
+		Buffer: 1024,
+		Filter: audit.Filter(cfg.AuditListings),
+	})
+	bus.Subscribe("console", events.LogHandler, events.Options{Mode: events.Drop, Buffer: 1024})
+
+	var webFS fs.FS = web.Assets
+	if cfg.WebDir != "" {
+		webFS = os.DirFS(cfg.WebDir)
+	}
+	inflight := httpapi.NewTracker()
+	opts := httpapi.Options{
+		MaxUploadBytes: cfg.MaxUploadBytes,
+		AllowedHosts:   cfg.AllowedHosts,
+		BodyTimeout:    cfg.BodyTimeout,
+		Tracker:        inflight,
+	}
+	if cfg.AuditFailClosed {
+		opts.Ready = auditWriter.Err
+	}
+
+	return &app{
+		Handler:      httpapi.New(fsops.New(sb, bus), webFS, opts),
+		Root:         sb.Root(),
+		AuditPath:    auditPath,
+		AllowedHosts: cfg.AllowedHosts,
+		sb:           sb,
+		bus:          bus,
+		coalescer:    coalescer,
+		audit:        auditWriter,
+		inflight:     inflight,
+	}, nil
+}
+
+func (a *app) Close(ctx context.Context) error {
+	if left, err := a.inflight.Drain(ctx); err != nil {
+		log.Printf("SHUTDOWN: %d file operation(s) still running at exit; they may be left incomplete and missing from the audit log: %s",
+			len(left), strings.Join(left, "; "))
+	}
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), flushTimeout)
+	defer cancel()
+	err := a.bus.Close(flushCtx)
+	if a.coalescer != nil {
+		a.coalescer.Close()
+	}
+	if cerr := a.audit.Close(); err == nil {
+		err = cerr
+	}
+	if cerr := a.sb.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+func checkExposure(host string, insecureNoAuth bool) error {
+	if isLoopback(host) {
+		return nil
+	}
+	if !insecureNoAuth {
+		return fmt.Errorf("refusing to listen on %q: there is no authentication yet, so anyone who can reach that address "+
+			"could read, change and delete every served file. Use the default -host localhost, or pass -insecure-no-auth to accept the risk", host)
+	}
+	log.Printf("WARNING: listening on %q WITHOUT AUTHENTICATION (-insecure-no-auth): anyone who can reach this port can read, change and delete the served files", host)
+	return nil
+}
+
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func hostAllowlist(listenHost, extra string) []string {
+	hosts := []string{"localhost", "127.0.0.1", "::1"}
+	add := func(h string) {
+		if h = strings.TrimSpace(h); h != "" {
+			hosts = append(hosts, h)
 		}
+	}
 
-		entries, err := os.ReadDir(targetDir)
-		if err != nil {
-			http.Error(w, "Failed to read directory", http.StatusInternalServerError)
-			return
-		}
-
-		var files []ClientFileInfo
-		for _, entry := range entries {
-			sysInfo, err := entry.Info()
-			if err != nil {
-				continue
+	if ip := net.ParseIP(listenHost); listenHost == "" || (ip != nil && ip.IsUnspecified()) {
+		if addrs, err := net.InterfaceAddrs(); err == nil {
+			for _, a := range addrs {
+				if ipnet, ok := a.(*net.IPNet); ok {
+					add(ipnet.IP.String())
+				}
 			}
-
-			files = append(files, ClientFileInfo{
-				Name:  entry.Name(),
-				Size:  sysInfo.Size(),
-				IsDir: entry.IsDir(),
-			})
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(files)
+		if name, err := os.Hostname(); err == nil {
+			add(name)
+			add(name + ".local")
+		}
+	} else {
+		add(listenHost)
 	}
+	for _, h := range strings.Split(extra, ",") {
+		add(h)
+	}
+	return dedupe(hosts)
 }
 
-func handleUpload(rootDir string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Event [UploadInitiated]: %s %s", r.Method, r.URL.Path)
-
-		requestedPath := r.URL.Query().Get("path")
-
-		if err := r.ParseMultipartForm(50 << 20); err != nil {
-			log.Printf("ParseMultipartForm error: %v", err)
-			http.Error(w, "Failed to parse form", http.StatusBadRequest)
-			return
+func dedupe(in []string) []string {
+	seen := map[string]bool{}
+	out := in[:0]
+	for _, s := range in {
+		k := strings.ToLower(s)
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, s)
 		}
-
-		file, header, err := r.FormFile("myFile")
-		if err != nil {
-			log.Printf("FormFile error: %v", err)
-			http.Error(w, "Failed to read file", http.StatusBadRequest)
-			return
-		}
-		defer file.Close()
-
-		logicalPath := filepath.Join(requestedPath, header.Filename)
-
-		destinationPath, err := sandbox.SecureJoin(rootDir, logicalPath)
-		if err != nil {
-			log.Printf("SECURITY ALERT: Blocked upload attempt: %v", err)
-			http.Error(w, "Invalid file path", http.StatusForbidden)
-			return
-		}
-
-		safeDestinationPath := generateUniquePath(destinationPath)
-
-		dst, err := os.Create(safeDestinationPath)
-		if err != nil {
-			log.Printf("Failed to create file on disk: %v", err)
-			http.Error(w, "Failed to save file", http.StatusInternalServerError)
-			return
-		}
-		defer dst.Close()
-
-		if _, err := io.Copy(dst, file); err != nil {
-			log.Printf("Error writing file to disk: %v", err)
-			http.Error(w, "Errot writing file to disk", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("File successfully saved to: %s", safeDestinationPath)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("File uploaded successfully!"))
 	}
+	return out
 }
 
-func handleDelete(rootDir string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req DeleteRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			log.Printf("Failed to decode delete request: %v", err)
-			http.Error(w, "Invalid request body", http.StatusBadRequest)
-			return
-		}
-
-		log.Printf("Event [DeleteRequested]: target=%s", req.Path)
-
-		targetPath, err := sandbox.SecureJoin(rootDir, req.Path)
-		if err != nil {
-			log.Printf("SECURITY ALERT: Blocked delete attempt on: %v", err)
-			http.Error(w, "Invalid file path", http.StatusForbidden)
-			return
-		}
-
-		if _, err := os.Stat(targetPath); os.IsNotExist(err) {
-			log.Printf("Delete aborted: File does not exit: %s", targetPath)
-			http.Error(w, "File not found", http.StatusNotFound)
-			return
-		}
-
-		if err := os.RemoveAll(targetPath); err != nil {
-			log.Printf("Failed to delete file on disk: %v", err)
-			http.Error(w, "Failed to delete file", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("Successfully deleted: %s", targetPath)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("File deleted successfully"))
+func defaultAuditPath() string {
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "gocalbox", "audit.jsonl")
 	}
+	return "gocalbox-audit.jsonl"
 }
 
-func handleMoveRename(rootDir string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
+func verifyAudit(path string) error {
+	rep, err := audit.Verify(path)
+	if err != nil {
+		if rep.Records > 0 || rep.LastHash != audit.GenesisHash {
+			fmt.Printf("%d records verified before the problem\n", rep.Records)
 		}
-
-		var req MoveRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			log.Printf("Failed to decode move/rename request: %v", err)
-			http.Error(w, "Invalid request body", http.StatusBadRequest)
-			return
-		}
-
-		log.Printf("Event [MoveRenameRequested]: %s -> %s", req.OldPath, req.NewPath)
-
-		oldTarget, err := sandbox.SecureJoin(rootDir, req.OldPath)
-		if err != nil {
-			log.Printf("SECURITY ALERT: Blocked invalid source path: %v", err)
-			http.Error(w, "Invalid source path", http.StatusForbidden)
-			return
-		}
-
-		newTarget, err := sandbox.SecureJoin(rootDir, req.NewPath)
-		if err != nil {
-			log.Printf("SECURITY ALERT: Blocked invalid destination path: %v", err)
-			http.Error(w, "Invalid destination path", http.StatusForbidden)
-			return
-		}
-
-		if _, err := os.Stat(oldTarget); os.IsNotExist(err) {
-			log.Printf("Aborted: Source file does not exist: %s", oldTarget)
-			http.Error(w, "Source file not found", http.StatusNotFound)
-			return
-		}
-
-		if _, err := os.Stat(newTarget); err == nil {
-			log.Printf("Aborted: Destination file already exists: %s", newTarget)
-			http.Error(w, "Destination already exists", http.StatusConflict)
-			return
-		}
-
-		targetDir := filepath.Dir(newTarget)
-		if info, err := os.Stat(targetDir); os.IsNotExist(err) || !info.IsDir() {
-			log.Printf("Aborted: Target folder does not exist: %s", targetDir)
-			http.Error(w, "Target folder does not exist", http.StatusBadRequest)
-			return
-		}
-
-		if err := os.Rename(oldTarget, newTarget); err != nil {
-			log.Printf("Failed to move/rename file on disk: %v", err)
-			http.Error(w, "Failed to perform operation", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("Successfully moved/renamed from: %s -> %s", oldTarget, newTarget)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Operation successful"))
+		return fmt.Errorf("%s: %w", path, err)
 	}
-}
-
-func handleCreateFolder(rootDir string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req CreateFolderRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			log.Printf("Failed to decode create folder request: %v", err)
-			http.Error(w, "Invalid request body", http.StatusBadRequest)
-			return
-		}
-
-		log.Printf("Event [CreateFolderRequested]: creating '%s' inside '%s'", req.Name, req.TargetPath)
-
-		logicalPath := filepath.Join(req.TargetPath, req.Name)
-
-		newTarget, err := sandbox.SecureJoin(rootDir, logicalPath)
-		if err != nil {
-			log.Printf("SECURITY ALERT: Blocked invalid path: %v", err)
-			http.Error(w, "Invalid directory path", http.StatusForbidden)
-			return
-		}
-
-		if err := os.Mkdir(newTarget, 0755); err != nil {
-			if os.IsExist(err) {
-				log.Printf("Aborted: Folder already exists: %v", err)
-				http.Error(w, "Folder already exists", http.StatusConflict)
-				return
-			}
-			log.Printf("Failed to create directory on disk: %v", err)
-			http.Error(w, "Failed to create folder", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("Successfully created new folder: %s", newTarget)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Folder created successfully"))
-	}
-}
-
-func generateUniquePath(targetPath string) string {
-	if _, err := os.Stat(targetPath); os.IsNotExist(err) {
-		return targetPath
-	}
-
-	dir := filepath.Dir(targetPath)
-	ext := filepath.Ext(targetPath)
-
-	baseName := strings.TrimSuffix(filepath.Base(targetPath), ext)
-
-	counter := 1
-	for {
-		newName := fmt.Sprintf("%s (%d)%s", baseName, counter, ext)
-		newPath := filepath.Join(dir, newName)
-
-		if _, err := os.Stat(newPath); os.IsNotExist(err) {
-			return newPath
-		}
-		counter++
-	}
+	fmt.Printf("OK: %d records, chain intact\nhead hash: %s\n", rep.Records, rep.LastHash)
+	fmt.Println("Keep the head hash somewhere else: it proves the log was not shortened later.")
+	return nil
 }
