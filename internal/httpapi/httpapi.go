@@ -38,6 +38,12 @@ type Options struct {
 	BodyTimeout time.Duration
 
 	Tracker *Tracker
+
+	// RequireTLS answers plain HTTP requests with a redirect to HTTPS.
+	RequireTLS bool
+
+	// CACert, if set, is served at /ca.crt for devices to install.
+	CACert []byte
 }
 
 type ClientFileInfo struct {
@@ -98,6 +104,9 @@ func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeErrorJSON(w, r, http.StatusNotFound, "not_found", "Unknown API endpoint")
 	})
+	if opts.CACert != nil {
+		mux.Handle("/ca.crt", serveCACert(opts.CACert))
+	}
 
 	cop := http.NewCrossOriginProtection()
 	cop.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -108,8 +117,12 @@ func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 
 	// The body limit is outermost: net/http reads the unread rest of a body
 	// before it replies, so requests refused early must be bounded too.
+	inner := cop.Handler(isolateResources(rejectUnclean(mux)))
+	if opts.RequireTLS {
+		inner = redirectPlain(inner)
+	}
 	return requestContext(limitBodyStalls(opts.BodyTimeout,
-		securityHeaders(checkHost(opts.AllowedHosts, cop.Handler(isolateResources(rejectUnclean(mux)))))))
+		securityHeaders(checkHost(opts.AllowedHosts, inner))))
 }
 
 func rejectUnclean(next http.Handler) http.Handler {
@@ -169,12 +182,62 @@ func checkHost(allowed []string, next http.Handler) http.Handler {
 		set[normalizeHost(h)] = true
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !set[normalizeHost(r.Host)] {
+		host := normalizeHost(r.Host)
+		if !set[host] && !isLocalAddr(r, host) {
 			log.Printf("SECURITY ALERT: Rejected request for unknown host %q from %s", r.Host, r.RemoteAddr)
 			writeErrorJSON(w, r, http.StatusMisdirectedRequest, "host_not_allowed", "Unknown host name")
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// isLocalAddr reports whether host is the IP address the request arrived
+// on, which may be newer than the allowlist. A rebinding attack names its
+// own domain, never an IP address.
+func isLocalAddr(r *http.Request, host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	addr, ok := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
+	return ok && addr.IP.Equal(ip)
+}
+
+func redirectPlain(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Connection", "close")
+		if (r.Method != http.MethodGet && r.Method != http.MethodHead) || r.Host == "" {
+			writeErrorJSON(w, r, http.StatusBadRequest, "https_required", "This server only accepts HTTPS")
+			return
+		}
+		// HTTPS is on the port this request came in on; a Host without a port
+		// means the client used port 80.
+		host, port, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host, port = strings.Trim(r.Host, "[]"), "80"
+		}
+		// Temporary, so browsers do not cache it: plain HTTP may serve this
+		// address later (-insecure-http on loopback).
+		http.Redirect(w, r, "https://"+net.JoinHostPort(host, port)+r.URL.RequestURI(), http.StatusTemporaryRedirect)
+	})
+}
+
+func serveCACert(pemData []byte) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !requireMethod(w, r, http.MethodGet, http.MethodHead) {
+			return
+		}
+		h := w.Header()
+		// This type opens the certificate installer on iOS and Android.
+		h.Set("Content-Type", "application/x-x509-ca-cert")
+		h.Set("Content-Disposition", `attachment; filename="gocalbox-ca.crt"`)
+		h.Set("Cache-Control", "no-cache")
+		w.Write(pemData)
 	})
 }
 
