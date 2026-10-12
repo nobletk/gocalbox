@@ -47,6 +47,10 @@ func run() error {
 	logEvents := flag.Bool("log-events", true, "Print every file event to the console (the audit log is not affected)")
 	bodyTimeout := flag.Duration("body-timeout", 30*time.Second, "Abort an upload or other request whose body delivers less than 64 KiB in this long (0 = never)")
 	insecureNoAuth := flag.Bool("insecure-no-auth", false, "Allow a non-loopback -host although there is no authentication yet: anyone who can reach the port can read, change and delete the served files")
+	tlsDir := flag.String("tls-dir", defaultTLSDir(), "Folder of the local CA that issues the HTTPS certificate when -tls-cert is not given; must be outside the served directory")
+	tlsCert := flag.String("tls-cert", "", "HTTPS certificate chain (PEM) to use instead of one from the local CA, reloaded when the file changes; needs -tls-key")
+	tlsKey := flag.String("tls-key", "", "Private key (PEM) of -tls-cert; must be outside the served directory")
+	insecureHTTP := flag.Bool("insecure-http", false, "Serve plain HTTP instead of HTTPS; allowed only on a loopback -host (for development and benchmarks)")
 	verifyLog := flag.String("verify-audit", "", "Verify the integrity of this audit log file and exit")
 	flag.Parse()
 
@@ -55,6 +59,12 @@ func run() error {
 	}
 	if err := checkExposure(*host, *insecureNoAuth); err != nil {
 		return err
+	}
+	if err := checkTLSFlags(*host, *tlsCert, *tlsKey, *tlsDir, *insecureHTTP); err != nil {
+		return err
+	}
+	if *insecureHTTP {
+		*tlsDir = ""
 	}
 	if *minFreeMB < 0 || *minFreeMB > math.MaxInt64>>20 {
 		return fmt.Errorf("-min-free-mb must be between 0 and %d, got %d", int64(math.MaxInt64>>20), *minFreeMB)
@@ -72,6 +82,9 @@ func run() error {
 		AuditFailClosed:  *auditFailClosed,
 		LogEvents:        *logEvents,
 		BodyTimeout:      *bodyTimeout,
+		TLSCert:          *tlsCert,
+		TLSKey:           *tlsKey,
+		TLSDir:           *tlsDir,
 	})
 	if err != nil {
 		return err
@@ -84,8 +97,18 @@ func run() error {
 		}
 	}()
 
+	ln, err := net.Listen("tcp", net.JoinHostPort(*host, *port))
+	if err != nil {
+		return err
+	}
+	scheme := "http"
+	if a.TLS != nil {
+		scheme = "https"
+		ln = httpapi.SplitTLS(ln, a.TLS.Config, sniffTimeout)
+	}
+	_, boundPort, _ := net.SplitHostPort(ln.Addr().String())
+
 	srv := &http.Server{
-		Addr:    net.JoinHostPort(*host, *port),
 		Handler: a.Handler,
 		// No read or write timeout: they would cut off long uploads and media
 		// streams. Stalled request bodies are limited per request (-body-timeout).
@@ -110,13 +133,14 @@ func run() error {
 		}
 	}()
 
-	log.Printf("Starting server on http://%s", srv.Addr)
+	log.Printf("Starting server on %s://%s", scheme, net.JoinHostPort(*host, boundPort))
 	log.Printf("Sandboxing directory: %s", a.Root)
 	log.Printf("Accepted host names: %s", strings.Join(a.AllowedHosts, ", "))
 	log.Printf("Audit log: %s (%d existing records)", a.AuditPath, a.audit.Records())
 	a.logSpace()
+	a.logTLS(caURL(*host, boundPort, a.AllowedHosts))
 
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server crashed: %w", err)
 	}
 	<-shutdownDone
@@ -126,6 +150,7 @@ func run() error {
 const (
 	drainTimeout = 30 * time.Second
 	flushTimeout = 10 * time.Second
+	sniffTimeout = 10 * time.Second
 )
 
 type config struct {
@@ -140,6 +165,11 @@ type config struct {
 	AuditFailClosed  bool
 	LogEvents        bool
 	BodyTimeout      time.Duration
+
+	// HTTPS uses TLSCert and TLSKey if set, else a certificate from the local
+	// CA in TLSDir. With neither, the server speaks plain HTTP.
+	TLSCert, TLSKey string
+	TLSDir          string
 }
 
 type app struct {
@@ -147,6 +177,7 @@ type app struct {
 	Root         string
 	AuditPath    string
 	AllowedHosts []string
+	TLS          *tlsSetup // nil for plain HTTP
 
 	sb        *sandbox.Sandbox
 	bus       *events.Bus
@@ -171,6 +202,13 @@ func newApp(cfg config) (*app, error) {
 	}
 	auditWriter, err := audit.Open(auditPath)
 	if err != nil {
+		sb.Close()
+		return nil, err
+	}
+	// After the audit log checks, so a start they refuse creates no CA.
+	tlsSetup, err := setupTLS(sb.Root(), cfg)
+	if err != nil {
+		auditWriter.Close()
 		sb.Close()
 		return nil, err
 	}
@@ -217,12 +255,19 @@ func newApp(cfg config) (*app, error) {
 	if cfg.AuditFailClosed {
 		opts.Ready = auditWriter.Err
 	}
+	if tlsSetup != nil {
+		opts.RequireTLS = true
+		if tlsSetup.CA != nil {
+			opts.CACert = tlsSetup.CA.PEM
+		}
+	}
 
 	return &app{
 		Handler:      httpapi.New(fsops.New(sb, bus, fsops.WithSpace(ledger)), webFS, opts),
 		Root:         sb.Root(),
 		AuditPath:    auditPath,
 		AllowedHosts: cfg.AllowedHosts,
+		TLS:          tlsSetup,
 		sb:           sb,
 		bus:          bus,
 		coalescer:    coalescer,
@@ -284,6 +329,21 @@ func checkExposure(host string, insecureNoAuth bool) error {
 	return nil
 }
 
+func checkTLSFlags(host, cert, key, dir string, insecureHTTP bool) error {
+	switch {
+	case (cert == "") != (key == ""):
+		return errors.New("-tls-cert and -tls-key must be given together")
+	case cert == "" && dir == "" && !insecureHTTP:
+		return errors.New("-tls-dir is empty; give a folder for the local CA, or -tls-cert and -tls-key")
+	case insecureHTTP && cert != "":
+		return errors.New("-insecure-http cannot be combined with -tls-cert")
+	case insecureHTTP && !isLoopback(host):
+		return fmt.Errorf("refusing plain HTTP on %q: browsers on other machines need HTTPS, and anyone on the network could read "+
+			"and change the traffic. -insecure-http is allowed only with a loopback -host", host)
+	}
+	return nil
+}
+
 func isLoopback(host string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
@@ -332,6 +392,13 @@ func dedupe(in []string) []string {
 		}
 	}
 	return out
+}
+
+func defaultTLSDir() string {
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "gocalbox", "tls")
+	}
+	return "gocalbox-tls"
 }
 
 func defaultAuditPath() string {

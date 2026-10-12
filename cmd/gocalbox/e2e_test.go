@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -90,9 +92,15 @@ type liveServer struct {
 	cmd       *exec.Cmd
 	out       *syncBuffer
 	url       string
+	addr      string
 	root      string
 	auditPath string
+	tlsDir    string
 	done      chan error
+
+	// tlsConfig trusts the server's certificate; nil with -insecure-http.
+	tlsConfig *tls.Config
+	client    *http.Client
 }
 
 func freePort(t *testing.T) int {
@@ -105,8 +113,37 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// startServer runs the binary on a free port with a fresh root and audit log
-// and waits until it answers.
+// isolatedEnv keeps the default -tls-dir and -audit-log of a test run out of
+// the real user's configuration folder.
+func isolatedEnv(t *testing.T) []string {
+	home := t.TempDir()
+	return append(os.Environ(), "HOME="+home, "XDG_CONFIG_HOME="+filepath.Join(home, ".config"), "AppData="+filepath.Join(home, "AppData"))
+}
+
+func trustClient(roots *x509.CertPool, h2 bool) (*tls.Config, *http.Client) {
+	cfg := &tls.Config{RootCAs: roots}
+	tr := &http.Transport{TLSClientConfig: cfg.Clone(), ForceAttemptHTTP2: h2}
+	if !h2 {
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+	return cfg, &http.Client{Transport: tr}
+}
+
+func certPool(path string) (*x509.CertPool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("no certificate in %s", path)
+	}
+	return pool, nil
+}
+
+// startServer runs the binary on a free port with a fresh root, audit log and
+// local CA, and waits until it answers over HTTPS (HTTP/2, like a browser).
+// With -insecure-http it uses plain HTTP; with -tls-cert it trusts that file.
 func startServer(t *testing.T, extraArgs ...string) *liveServer {
 	t.Helper()
 	bin := binary(t)
@@ -117,20 +154,31 @@ func startServer(t *testing.T, extraArgs ...string) *liveServer {
 		out:       &syncBuffer{},
 		root:      filepath.Join(base, "root"),
 		auditPath: filepath.Join(base, "audit", "audit.jsonl"),
+		tlsDir:    filepath.Join(base, "tls"),
 		done:      make(chan error, 1),
 	}
 	if err := os.Mkdir(s.root, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	port := freePort(t)
-	s.url = fmt.Sprintf("http://127.0.0.1:%d", port)
+	s.addr = fmt.Sprintf("127.0.0.1:%d", port)
+	trusted := filepath.Join(s.tlsDir, "ca.crt")
+	s.url = "https://" + s.addr
+	for _, a := range extraArgs {
+		if a == "-insecure-http" {
+			s.url, trusted = "http://"+s.addr, ""
+		} else if f, ok := strings.CutPrefix(a, "-tls-cert="); ok {
+			trusted = f
+		}
+	}
 
 	args := append([]string{
 		"-host=127.0.0.1", fmt.Sprintf("-port=%d", port),
-		"-root=" + s.root, "-audit-log=" + s.auditPath,
+		"-root=" + s.root, "-audit-log=" + s.auditPath, "-tls-dir=" + s.tlsDir,
 		"-min-free-mb=0", // the tests must not depend on the free space of TMPDIR
 	}, extraArgs...)
 	s.cmd = exec.Command(bin, args...)
+	s.cmd.Env = isolatedEnv(t)
 	s.cmd.Stdout, s.cmd.Stderr = s.out, s.out
 	if err := s.cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -154,9 +202,18 @@ func startServer(t *testing.T, extraArgs ...string) *liveServer {
 			t.Fatalf("server exited during startup: %v\n%s", err, s.out)
 		default:
 		}
-		if resp, err := http.Get(s.url + "/"); err == nil {
-			resp.Body.Close()
-			return s
+		if s.client == nil {
+			if trusted == "" {
+				s.client = &http.Client{}
+			} else if pool, err := certPool(trusted); err == nil {
+				s.tlsConfig, s.client = trustClient(pool, true)
+			}
+		}
+		if s.client != nil {
+			if resp, err := s.client.Get(s.url + "/"); err == nil {
+				resp.Body.Close()
+				return s
+			}
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -187,7 +244,7 @@ func (s *liveServer) wait() error {
 
 func (s *liveServer) get(path string) (int, string) {
 	s.t.Helper()
-	resp, err := http.Get(s.url + path)
+	resp, err := s.client.Get(s.url + path)
 	if err != nil {
 		s.t.Fatal(err)
 	}
@@ -198,7 +255,7 @@ func (s *liveServer) get(path string) (int, string) {
 
 func (s *liveServer) postJSON(path, body string) int {
 	s.t.Helper()
-	resp, err := http.Post(s.url+path, "application/json", strings.NewReader(body))
+	resp, err := s.client.Post(s.url+path, "application/json", strings.NewReader(body))
 	if err != nil {
 		s.t.Fatal(err)
 	}
@@ -212,7 +269,7 @@ func (s *liveServer) upload(dir, name string, content []byte) (int, error) {
 	fw, _ := mw.CreateFormFile("myFile", name)
 	fw.Write(content)
 	mw.Close()
-	resp, err := http.Post(s.url+"/api/upload?path="+dir, mw.FormDataContentType(), &buf)
+	resp, err := s.client.Post(s.url+"/api/upload?path="+dir, mw.FormDataContentType(), &buf)
 	if err != nil {
 		return 0, err
 	}
@@ -234,6 +291,7 @@ func exitCode(err error) int {
 func runToCompletion(t *testing.T, args ...string) (string, int) {
 	t.Helper()
 	cmd := exec.Command(binary(t), args...)
+	cmd.Env = isolatedEnv(t)
 	var out syncBuffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	done := make(chan error, 1)
@@ -303,7 +361,7 @@ func TestE2EGracefulShutdownFlushesTheAuditLog(t *testing.T) {
 				}
 			}
 
-			if _, err := http.Get(s.url + "/"); err == nil {
+			if _, err := s.client.Get(s.url + "/"); err == nil {
 				t.Error("server still answers after shutdown")
 			}
 			if out, code := runToCompletion(t, "-verify-audit="+s.auditPath); code != 0 || !strings.Contains(out, "OK: 5 records") {
@@ -314,7 +372,14 @@ func TestE2EGracefulShutdownFlushesTheAuditLog(t *testing.T) {
 }
 
 func TestE2EInFlightUploadSurvivesShutdown(t *testing.T) {
+	for name, h2 := range map[string]bool{"HTTP/1.1": false, "HTTP/2": true} {
+		t.Run(name, func(t *testing.T) { testInFlightUploadSurvivesShutdown(t, h2) })
+	}
+}
+
+func testInFlightUploadSurvivesShutdown(t *testing.T, h2 bool) {
 	s := startServer(t)
+	_, client := trustClient(s.tlsConfig.RootCAs, h2)
 
 	const chunks, chunkSize = 20, 32 << 10
 	pr, pw := io.Pipe()
@@ -342,13 +407,16 @@ func TestE2EInFlightUploadSurvivesShutdown(t *testing.T) {
 	}
 	resCh := make(chan result, 1)
 	go func() {
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			resCh <- result{err: err}
 			return
 		}
 		resp.Body.Close()
-		resCh <- result{code: resp.StatusCode}
+		if resp.ProtoMajor != map[bool]int{false: 1, true: 2}[h2] {
+			err = fmt.Errorf("served over %s", resp.Proto)
+		}
+		resCh <- result{code: resp.StatusCode, err: err}
 	}()
 
 	select {
@@ -380,7 +448,7 @@ func TestE2EInFlightUploadSurvivesShutdown(t *testing.T) {
 func TestE2EClientDisconnectMidUploadLeavesNoFile(t *testing.T) {
 	s := startServer(t)
 
-	conn, err := net.Dial("tcp", strings.TrimPrefix(s.url, "http://"))
+	conn, err := tls.Dial("tcp", s.addr, s.tlsConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,7 +555,7 @@ func TestE2ERangeDownloadsOverARealConnection(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodGet, s.url+"/files/movie.bin", nil)
 	req.Header.Set("Range", "bytes=500000-500009")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +567,7 @@ func TestE2ERangeDownloadsOverARealConnection(t *testing.T) {
 
 	req, _ = http.NewRequest(http.MethodGet, s.url+"/files/movie.bin", nil)
 	req.Header.Set("Range", "bytes=400000-")
-	resp, err = http.DefaultClient.Do(req)
+	resp, err = s.client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -625,7 +693,9 @@ func TestE2EListensOnLoopbackByDefault(t *testing.T) {
 	os.Mkdir(root, 0o755)
 	port := freePort(t)
 
-	cmd := exec.Command(bin, fmt.Sprintf("-port=%d", port), "-root="+root, "-audit-log="+filepath.Join(base, "a.jsonl"))
+	tlsDir := filepath.Join(base, "tls")
+	cmd := exec.Command(bin, fmt.Sprintf("-port=%d", port), "-root="+root, "-audit-log="+filepath.Join(base, "a.jsonl"), "-tls-dir="+tlsDir)
+	cmd.Env = isolatedEnv(t)
 	var out syncBuffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Start(); err != nil {
@@ -637,12 +707,17 @@ func TestE2EListensOnLoopbackByDefault(t *testing.T) {
 	for time.Now().Before(deadline) && !strings.Contains(out.String(), "Starting server") {
 		time.Sleep(25 * time.Millisecond)
 	}
-	if !strings.Contains(out.String(), fmt.Sprintf("http://localhost:%d", port)) {
+	if !strings.Contains(out.String(), fmt.Sprintf("https://localhost:%d", port)) {
 		t.Fatalf("default address is not localhost:\n%s", out.String())
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	if resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/", port)); err != nil {
+	pool, err := certPool(filepath.Join(tlsDir, "ca.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, client := trustClient(pool, true)
+	if resp, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d/", port)); err != nil {
 		t.Errorf("not reachable on loopback: %v", err)
 	} else {
 		resp.Body.Close()
@@ -676,7 +751,7 @@ func TestE2EBrowserProtections(t *testing.T) {
 				req.Header.Set(k, v)
 			}
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := s.client.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -707,10 +782,9 @@ func TestE2EBrowserProtections(t *testing.T) {
 
 func TestE2ESecondSignalExitsAtOnce(t *testing.T) {
 	s := startServer(t)
-	addr := strings.TrimPrefix(s.url, "http://")
 
 	// An upload in progress keeps the graceful shutdown waiting.
-	conn, err := net.Dial("tcp", addr)
+	conn, err := tls.Dial("tcp", s.addr, s.tlsConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -763,4 +837,100 @@ func TestE2EConsoleEventLogCanBeTurnedOff(t *testing.T) {
 			t.Errorf("%v: audit log %+v, %v", tc.args, rep, err)
 		}
 	}
+}
+
+func TestE2EServesHTTPSByDefault(t *testing.T) {
+	s := startServer(t)
+	plain := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	resp, err := s.client.Get(s.url + "/api/files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 || resp.ProtoMajor != 2 || resp.TLS == nil || resp.TLS.Version != tls.VersionTLS13 {
+		t.Errorf("HTTPS: %d over %s", resp.StatusCode, resp.Proto)
+	}
+
+	resp, err = plain.Get("http://" + s.addr + "/files/x.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTemporaryRedirect || resp.Header.Get("Location") != s.url+"/files/x.txt" {
+		t.Errorf("plain HTTP: %d to %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+
+	old := s.tlsConfig.Clone()
+	old.MaxVersion = tls.VersionTLS11
+	if c, err := tls.Dial("tcp", s.addr, old); err == nil {
+		c.Close()
+		t.Error("TLS 1.1 handshake succeeded")
+	}
+
+	_, ca := s.get("/ca.crt")
+	onDisk, _ := os.ReadFile(filepath.Join(s.tlsDir, "ca.crt"))
+	if ca != string(onDisk) || !strings.HasPrefix(ca, "-----BEGIN CERTIFICATE-----") {
+		t.Errorf("/ca.crt = %.40q, file = %.40q", ca, onDisk)
+	}
+	if info, err := os.Stat(filepath.Join(s.tlsDir, "ca-key.pem")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("CA key: %v, %v", info, err)
+	}
+	for _, want := range []string{"Starting server on https://127.0.0.1:", "Local CA SHA-256 fingerprint: ", "/ca.crt", "created now"} {
+		if !strings.Contains(s.out.String(), want) {
+			t.Errorf("output lacks %q:\n%s", want, s.out)
+		}
+	}
+	s.stop(syscall.SIGTERM)
+}
+
+func TestE2EInsecureHTTPOnLoopbackOnly(t *testing.T) {
+	s := startServer(t, "-insecure-http")
+	if code, _ := s.upload("", "a.txt", []byte("x")); code != 201 {
+		t.Errorf("upload over plain HTTP = %d", code)
+	}
+	if _, err := os.Stat(s.tlsDir); err == nil {
+		t.Error("-insecure-http created a local CA")
+	}
+	if !strings.Contains(s.out.String(), "Starting server on http://127.0.0.1:") {
+		t.Errorf("output:\n%s", s.out)
+	}
+	s.stop(syscall.SIGTERM)
+
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	os.Mkdir(root, 0o755)
+	out, code := runToCompletion(t, "-insecure-http", "-insecure-no-auth", "-host=0.0.0.0", "-port=0", "-root="+root, "-audit-log="+filepath.Join(base, "a.jsonl"))
+	if code == 0 || !strings.Contains(out, "-insecure-http is allowed only with a loopback -host") {
+		t.Errorf("plain HTTP on all interfaces: exit %d\n%s", code, out)
+	}
+}
+
+func TestE2EAdminCertificate(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := writeCertFiles(t, dir, "localhost")
+	s := startServer(t, "-tls-cert="+certPath, "-tls-key="+keyPath)
+
+	resp, err := s.client.Get(s.url + "/api/files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 || !resp.TLS.PeerCertificates[0].Equal(pair.Leaf) {
+		t.Errorf("served %d with a certificate for %v", resp.StatusCode, resp.TLS.PeerCertificates[0].DNSNames)
+	}
+	if code, _ := s.get("/ca.crt"); code != 404 {
+		t.Errorf("/ca.crt with an admin certificate = %d", code)
+	}
+	if _, err := os.Stat(s.tlsDir); err == nil {
+		t.Error("a local CA was created although -tls-cert was given")
+	}
+	if !strings.Contains(s.out.String(), "HTTPS certificate: "+certPath) || !strings.Contains(s.out.String(), "not valid for ::1") {
+		t.Errorf("output:\n%s", s.out)
+	}
+	s.stop(syscall.SIGTERM)
 }
