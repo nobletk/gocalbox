@@ -62,7 +62,12 @@ func (a *api) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// FileName is already reduced to a base name by the standard library.
-		stored, size, err := a.files.Create(r.Context(), r.URL.Query().Get("path"), part.FileName(), part)
+		// The request's length bounds the file's: multipart framing only adds.
+		sizeHint := r.ContentLength
+		if a.maxUpload > 0 && sizeHint > a.maxUpload {
+			sizeHint = a.maxUpload
+		}
+		stored, size, err := a.files.Create(r.Context(), r.URL.Query().Get("path"), part.FileName(), part, sizeHint)
 		if err != nil {
 			writeError(w, r, err)
 			return

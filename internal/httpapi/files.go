@@ -11,6 +11,10 @@ import (
 	"github.com/nobletk/gocalbox/internal/fsops"
 )
 
+// Without "allow-scripts" the sandbox keeps any script in a file from
+// running. Types shown inline keep their origin: a browser's media player
+// fetches the file again, and from an opaque origin that request would be
+// cross-site and refused by CORP and isolateResources.
 const (
 	fileCSPRules  = "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'self'"
 	fileCSP       = "sandbox; " + fileCSPRules
@@ -34,6 +38,8 @@ func (a *api) handleFile(w http.ResponseWriter, r *http.Request) {
 	setContentHeaders(h, info.Name(), r.URL.Query().Has("download"))
 	h.Set("ETag", f.ETag())
 	h.Set("Cache-Control", "private, no-cache")
+	// ServeContent compares an If-Range date to the second, which cannot prove
+	// the client holds this version, so the whole file is sent instead.
 	if ir := r.Header.Get("If-Range"); ir != "" && !isEntityTag(ir) {
 		r.Header.Del("Range")
 	}
@@ -115,7 +121,7 @@ func setContentHeaders(h http.Header, name string, forceDownload bool) {
 	h.Set("Content-Disposition", disposition)
 
 	switch {
-	case ft.ctype == "application/pdf":
+	case ft.ctype == "application/pdf": // browser PDF viewers refuse to render under a CSP sandbox
 	case inline:
 		h.Set("Content-Security-Policy", inlineFileCSP)
 	default:
@@ -123,6 +129,8 @@ func setContentHeaders(h http.Header, name string, forceDownload bool) {
 	}
 }
 
+// transferWriter implements io.ReaderFrom so that http.ServeContent keeps
+// using sendfile.
 type transferWriter struct {
 	http.ResponseWriter
 	r       *http.Request

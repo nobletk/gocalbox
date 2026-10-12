@@ -21,6 +21,7 @@ import (
 
 	"github.com/nobletk/gocalbox/internal/events"
 	"github.com/nobletk/gocalbox/internal/sandbox"
+	"github.com/nobletk/gocalbox/internal/space"
 )
 
 var (
@@ -33,6 +34,10 @@ var (
 	ErrInvalidRange       = errors.New("requested range not satisfiable")
 	ErrPreconditionFailed = errors.New("precondition failed")
 	ErrAborted            = errors.New("transfer aborted")
+
+	ErrInsufficientStorage = space.ErrInsufficient
+	ErrCrossDevice         = errors.New("source and destination are on different file systems")
+	ErrReadOnly            = fmt.Errorf("read-only file system: %w", fs.ErrPermission)
 )
 
 type Entry struct {
@@ -52,15 +57,28 @@ const maxNameBytes = 255
 var maxAutoRename = 10000
 
 type Service struct {
-	sb   *sandbox.Sandbox
-	root *os.Root
-	pub  Publisher
+	sb    *sandbox.Sandbox
+	root  *os.Root
+	pub   Publisher
+	space *space.Ledger
 
+	// mu serializes check-then-act sequences (unique names, no-overwrite
+	// moves) within this process only; other processes are not covered.
 	mu sync.Mutex
 }
 
-func New(sb *sandbox.Sandbox, pub Publisher) *Service {
-	return &Service{sb: sb, root: sb.OSRoot(), pub: pub}
+type Option func(*Service)
+
+// WithSpace makes Create reserve room in l before writing. Without it,
+// uploads are limited only by the disk filling up.
+func WithSpace(l *space.Ledger) Option { return func(s *Service) { s.space = l } }
+
+func New(sb *sandbox.Sandbox, pub Publisher, opts ...Option) *Service {
+	s := &Service{sb: sb, root: sb.OSRoot(), pub: pub}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 func ValidName(name string) bool {
@@ -201,6 +219,9 @@ func (f *File) Content() io.ReadSeeker { return f.f }
 
 func (f *File) Info() fs.FileInfo { return f.info }
 
+// ETag stays the same for an in-place rewrite of the same size within one
+// tick of the kernel's file clock, and, where the OS reports no file identity
+// (Windows), for a replacement with the same size and modification time.
 func (f *File) ETag() string {
 	dev, ino := fileID(f.info)
 	h := sha256.New()
@@ -231,9 +252,11 @@ func (f *File) Close() error {
 	return err
 }
 
-func (s *Service) Create(ctx context.Context, dir, name string, r io.Reader) (string, int64, error) {
-	stored, size, err := s.create(dir, name, r)
-	err = sandbox.FromRoot(err)
+// sizeHint is an upper bound on the length of r, or negative when unknown;
+// room is reserved for it before anything is written.
+func (s *Service) Create(ctx context.Context, dir, name string, r io.Reader, sizeHint int64) (string, int64, error) {
+	stored, size, err := s.create(dir, name, r, sizeHint)
+	err = osErr(sandbox.FromRoot(err))
 	ev := events.Event{Type: events.FileUploaded, Path: logicalJoin(dir, name), Size: size}
 	if err == nil {
 		ev.Path = logicalJoin(dir, path.Base(stored))
@@ -243,7 +266,7 @@ func (s *Service) Create(ctx context.Context, dir, name string, r io.Reader) (st
 	return stored, size, err
 }
 
-func (s *Service) create(dir, name string, r io.Reader) (string, int64, error) {
+func (s *Service) create(dir, name string, r io.Reader, sizeHint int64) (string, int64, error) {
 	p, err := s.sb.Resolve(dir)
 	if err != nil {
 		return "", 0, err
@@ -255,6 +278,14 @@ func (s *Service) create(dir, name string, r io.Reader) (string, int64, error) {
 		return "", 0, ErrParentNotFound
 	}
 
+	var res *space.Reservation
+	if s.space != nil && s.onServedVolume(p.Native()) {
+		if res, err = s.space.Reserve(sizeHint); err != nil {
+			return "", 0, err
+		}
+		defer res.Release()
+	}
+
 	s.mu.Lock()
 	f, rel, err := s.createUnique(p.Rel, name)
 	s.mu.Unlock()
@@ -262,7 +293,11 @@ func (s *Service) create(dir, name string, r io.Reader) (string, int64, error) {
 		return "", 0, fmt.Errorf("create file: %w", err)
 	}
 
-	size, err := io.Copy(f, r)
+	var w io.Writer = f
+	if res != nil {
+		w = res.Writer(f)
+	}
+	size, err := io.Copy(w, r)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
@@ -316,7 +351,7 @@ func numbered(base, ext string, i int) (string, bool) {
 
 func (s *Service) Mkdir(ctx context.Context, parent, name string) (string, error) {
 	p, err := s.mkdir(parent, name)
-	err = sandbox.FromRoot(err)
+	err = osErr(sandbox.FromRoot(err))
 	s.publish(ctx, events.Event{Type: events.FolderCreated, Path: logicalJoin(parent, name), Resolved: p.Rel}, err)
 	return p.Rel, err
 }
@@ -332,6 +367,8 @@ func (s *Service) mkdir(parent, name string) (sandbox.Path, error) {
 	if !s.isDir(filepath.Dir(p.Native())) {
 		return p, ErrParentNotFound
 	}
+	// Under mu because rename(2) silently replaces an empty directory, so a
+	// concurrent Move could overwrite the new folder.
 	s.mu.Lock()
 	err = s.root.Mkdir(p.Native(), 0o755)
 	s.mu.Unlock()
@@ -346,7 +383,7 @@ func (s *Service) mkdir(parent, name string) (sandbox.Path, error) {
 
 func (s *Service) Delete(ctx context.Context, userPath string) (string, error) {
 	p, err := s.delete(userPath)
-	err = sandbox.FromRoot(err)
+	err = osErr(sandbox.FromRoot(err))
 	s.publish(ctx, events.Event{Type: events.FileDeleted, Path: userPath, Resolved: p.Rel}, err)
 	return p.Rel, err
 }
@@ -370,7 +407,7 @@ func (s *Service) delete(userPath string) (sandbox.Path, error) {
 
 func (s *Service) Move(ctx context.Context, oldPath, newPath string) (string, error) {
 	from, to, err := s.move(oldPath, newPath)
-	err = sandbox.FromRoot(err)
+	err = osErr(sandbox.FromRoot(err))
 	s.publish(ctx, events.Event{
 		Type: events.FileMoved, Path: oldPath, Target: newPath,
 		Resolved: from.Rel, ResolvedTarget: to.Rel,
@@ -422,6 +459,41 @@ func notExist(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
+func osErr(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case isNoSpace(err):
+		return fmt.Errorf("%w: %v", ErrInsufficientStorage, err)
+	case isCrossDevice(err):
+		return fmt.Errorf("%w: %v", ErrCrossDevice, err)
+	case isReadOnly(err):
+		return fmt.Errorf("%w: %v", ErrReadOnly, err)
+	}
+	return err
+}
+
+var deviceOf = func(info fs.FileInfo) uint64 {
+	dev, _ := fileID(info)
+	return dev
+}
+
+// The ledger measures only the served folder's file system. A folder on
+// another file system mounted inside the root is not checked, and a full disk
+// there still fails the write. Where fileID reports no device (Windows), every
+// folder counts as being on the served file system.
+func (s *Service) onServedVolume(dir string) bool {
+	root, err := s.root.Stat(".")
+	if err != nil {
+		return true
+	}
+	target, err := s.root.Stat(dir)
+	if err != nil {
+		return true
+	}
+	return deviceOf(root) == deviceOf(target)
+}
+
 func nameErr(err error) error {
 	if errors.Is(err, syscall.ENAMETOOLONG) {
 		return fmt.Errorf("%w: %v", ErrInvalidName, err)
@@ -463,9 +535,12 @@ func outcomeOf(err error) events.Outcome {
 		return events.OutcomeExists
 	case errors.Is(err, ErrAborted):
 		return events.OutcomeAborted
+	case errors.Is(err, ErrInsufficientStorage):
+		return events.OutcomeNoSpace
 	case errors.Is(err, ErrNotDir),
 		errors.Is(err, ErrInvalidName),
 		errors.Is(err, ErrMoveIntoSelf),
+		errors.Is(err, ErrCrossDevice),
 		errors.Is(err, ErrInvalidRange),
 		errors.Is(err, ErrPreconditionFailed),
 		errors.Is(err, sandbox.ErrBrokenLink),

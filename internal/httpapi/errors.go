@@ -64,10 +64,18 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeErrorJSON(w, r, http.StatusBadRequest, "move_into_self", "Cannot move a folder into itself")
 	case errors.Is(err, fsops.ErrExists):
 		writeErrorJSON(w, r, http.StatusConflict, "already_exists", "Already exists")
+	case errors.Is(err, fsops.ErrCrossDevice):
+		writeErrorJSON(w, r, http.StatusConflict, "cross_device", "Source and destination are on different file systems")
+	case errors.Is(err, fsops.ErrInsufficientStorage):
+		log.Printf("Refused for lack of space: %v", err)
+		writeErrorJSON(w, r, http.StatusInsufficientStorage, "insufficient_storage", "Not enough free space on the server")
 
 	case errors.As(err, &tooBig):
 		log.Printf("Request body rejected: larger than %d bytes", tooBig.Limit)
 		writeErrorJSON(w, r, http.StatusRequestEntityTooLarge, "too_large", "Request body too large")
+	case errors.Is(err, fsops.ErrReadOnly):
+		log.Printf("Refused on a read-only file system: %v", err)
+		writeErrorJSON(w, r, http.StatusForbidden, "permission_denied", "The folder is on a read-only file system")
 	case errors.Is(err, fs.ErrPermission):
 		log.Printf("Permission denied: %v", err)
 		writeErrorJSON(w, r, http.StatusForbidden, "permission_denied", "Permission denied")

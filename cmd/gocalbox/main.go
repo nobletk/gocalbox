@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/nobletk/gocalbox/internal/fsops"
 	"github.com/nobletk/gocalbox/internal/httpapi"
 	"github.com/nobletk/gocalbox/internal/sandbox"
+	"github.com/nobletk/gocalbox/internal/space"
 	"github.com/nobletk/gocalbox/web"
 )
 
@@ -35,12 +37,14 @@ func run() error {
 	port := flag.String("port", "8080", "Port to run the server on")
 	rootDir := flag.String("root", ".", "The local directory to sandbox and serve")
 	webDir := flag.String("web", "", "Serve the web UI from this directory instead of the embedded copy (for frontend development)")
-	maxUploadMB := flag.Int64("max-upload-mb", 4096, "Maximum size of a single upload in MiB (0 = unlimited)")
+	maxUploadMB := flag.Int64("max-upload-mb", 0, "Maximum size of a single upload in MiB (0 = no limit beyond the free space)")
+	minFreeMB := flag.Int64("min-free-mb", 1024, "Free space in MiB that uploads must leave on the served volume (0 = only refuse uploads that do not fit)")
 	allowedHosts := flag.String("allowed-hosts", "", "Extra comma-separated host names clients may use to reach the server (e.g. a DNS name)")
 	auditLog := flag.String("audit-log", defaultAuditPath(), "Audit log file; must be outside the served directory")
 	auditListings := flag.Bool("audit-listings", false, "Also record successful directory listings and file checks (HEAD requests, 304 revalidations) in the audit log")
 	auditRangeWindow := flag.Duration("audit-range-window", 5*time.Minute, "Collapse ranged downloads of a file by one client within this window into one summary record (0 = record every request)")
 	auditFailClosed := flag.Bool("audit-fail-closed", false, "Refuse file operations with 503 once the audit log cannot be written")
+	logEvents := flag.Bool("log-events", true, "Print every file event to the console (the audit log is not affected)")
 	bodyTimeout := flag.Duration("body-timeout", 30*time.Second, "Abort an upload or other request whose body delivers less than 64 KiB in this long (0 = never)")
 	insecureNoAuth := flag.Bool("insecure-no-auth", false, "Allow a non-loopback -host although there is no authentication yet: anyone who can reach the port can read, change and delete the served files")
 	verifyLog := flag.String("verify-audit", "", "Verify the integrity of this audit log file and exit")
@@ -52,16 +56,21 @@ func run() error {
 	if err := checkExposure(*host, *insecureNoAuth); err != nil {
 		return err
 	}
+	if *minFreeMB < 0 || *minFreeMB > math.MaxInt64>>20 {
+		return fmt.Errorf("-min-free-mb must be between 0 and %d, got %d", int64(math.MaxInt64>>20), *minFreeMB)
+	}
 
 	a, err := newApp(config{
 		RootDir:          *rootDir,
 		WebDir:           *webDir,
 		MaxUploadBytes:   *maxUploadMB << 20,
+		MinFreeBytes:     *minFreeMB << 20,
 		AllowedHosts:     hostAllowlist(*host, *allowedHosts),
 		AuditLog:         *auditLog,
 		AuditListings:    *auditListings,
 		AuditRangeWindow: *auditRangeWindow,
 		AuditFailClosed:  *auditFailClosed,
+		LogEvents:        *logEvents,
 		BodyTimeout:      *bodyTimeout,
 	})
 	if err != nil {
@@ -76,8 +85,10 @@ func run() error {
 	}()
 
 	srv := &http.Server{
-		Addr:              net.JoinHostPort(*host, *port),
-		Handler:           a.Handler,
+		Addr:    net.JoinHostPort(*host, *port),
+		Handler: a.Handler,
+		// No read or write timeout: they would cut off long uploads and media
+		// streams. Stalled request bodies are limited per request (-body-timeout).
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -103,6 +114,7 @@ func run() error {
 	log.Printf("Sandboxing directory: %s", a.Root)
 	log.Printf("Accepted host names: %s", strings.Join(a.AllowedHosts, ", "))
 	log.Printf("Audit log: %s (%d existing records)", a.AuditPath, a.audit.Records())
+	a.logSpace()
 
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server crashed: %w", err)
@@ -120,11 +132,13 @@ type config struct {
 	RootDir          string
 	WebDir           string
 	MaxUploadBytes   int64
+	MinFreeBytes     int64
 	AllowedHosts     []string // nil disables the Host check
 	AuditLog         string
 	AuditListings    bool
 	AuditRangeWindow time.Duration
 	AuditFailClosed  bool
+	LogEvents        bool
 	BodyTimeout      time.Duration
 }
 
@@ -139,6 +153,10 @@ type app struct {
 	coalescer *audit.Coalescer
 	audit     *audit.Writer
 	inflight  *httpapi.Tracker
+	volume    *os.File
+	space     *space.Ledger // nil where free space cannot be measured
+	spaceErr  error
+	minFree   int64
 }
 
 func newApp(cfg config) (*app, error) {
@@ -156,6 +174,17 @@ func newApp(cfg config) (*app, error) {
 		sb.Close()
 		return nil, err
 	}
+	volume, err := sb.OSRoot().Open(".")
+	if err != nil {
+		auditWriter.Close()
+		sb.Close()
+		return nil, fmt.Errorf("open root directory: %w", err)
+	}
+	var ledger *space.Ledger
+	_, spaceErr := space.Free(volume)
+	if spaceErr == nil {
+		ledger = space.NewLedger(func() (int64, error) { return space.Free(volume) }, cfg.MinFreeBytes)
+	}
 
 	auditHandler := auditWriter.HandleBatch
 	var coalescer *audit.Coalescer
@@ -170,7 +199,9 @@ func newApp(cfg config) (*app, error) {
 		Buffer: 1024,
 		Filter: audit.Filter(cfg.AuditListings),
 	})
-	bus.Subscribe("console", events.LogHandler, events.Options{Mode: events.Drop, Buffer: 1024})
+	if cfg.LogEvents {
+		bus.Subscribe("console", events.LogHandler, events.Options{Mode: events.Drop, Buffer: 1024})
+	}
 
 	var webFS fs.FS = web.Assets
 	if cfg.WebDir != "" {
@@ -188,7 +219,7 @@ func newApp(cfg config) (*app, error) {
 	}
 
 	return &app{
-		Handler:      httpapi.New(fsops.New(sb, bus), webFS, opts),
+		Handler:      httpapi.New(fsops.New(sb, bus, fsops.WithSpace(ledger)), webFS, opts),
 		Root:         sb.Root(),
 		AuditPath:    auditPath,
 		AllowedHosts: cfg.AllowedHosts,
@@ -197,6 +228,10 @@ func newApp(cfg config) (*app, error) {
 		coalescer:    coalescer,
 		audit:        auditWriter,
 		inflight:     inflight,
+		volume:       volume,
+		space:        ledger,
+		spaceErr:     spaceErr,
+		minFree:      cfg.MinFreeBytes,
 	}, nil
 }
 
@@ -215,10 +250,26 @@ func (a *app) Close(ctx context.Context) error {
 	if cerr := a.audit.Close(); err == nil {
 		err = cerr
 	}
+	if cerr := a.volume.Close(); err == nil {
+		err = cerr
+	}
 	if cerr := a.sb.Close(); err == nil {
 		err = cerr
 	}
 	return err
+}
+
+func (a *app) logSpace() {
+	if a.space == nil {
+		log.Printf("Free space: cannot be measured (%v); uploads are refused with 507 only when the disk is full", a.spaceErr)
+		return
+	}
+	free, err := space.Free(a.volume)
+	if err != nil {
+		log.Printf("Free space: %v", err)
+		return
+	}
+	log.Printf("Free space: %.1f GiB on the served volume; uploads leave at least %d MiB free", float64(free)/(1<<30), a.minFree>>20)
 }
 
 func checkExposure(host string, insecureNoAuth bool) error {

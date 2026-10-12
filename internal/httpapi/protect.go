@@ -80,6 +80,8 @@ type stallLimitedBody struct {
 func (b *stallLimitedBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	b.got += int64(n)
+	// Never once the body has ended: net/http then clears the deadline for its
+	// background read, and a new one would cancel the request's context.
 	if b.got >= bodyProgress && err == nil {
 		b.got = 0
 		b.rc.SetReadDeadline(time.Now().Add(b.timeout))

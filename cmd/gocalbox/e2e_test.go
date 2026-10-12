@@ -128,6 +128,7 @@ func startServer(t *testing.T, extraArgs ...string) *liveServer {
 	args := append([]string{
 		"-host=127.0.0.1", fmt.Sprintf("-port=%d", port),
 		"-root=" + s.root, "-audit-log=" + s.auditPath,
+		"-min-free-mb=0", // the tests must not depend on the free space of TMPDIR
 	}, extraArgs...)
 	s.cmd = exec.Command(bin, args...)
 	s.cmd.Stdout, s.cmd.Stderr = s.out, s.out
@@ -559,6 +560,13 @@ func TestE2EStartupFailures(t *testing.T) {
 		}
 	})
 
+	t.Run("negative free-space reserve", func(t *testing.T) {
+		out, code := runToCompletion(t, "-min-free-mb=-1", "-port=0", "-root="+root, "-audit-log="+good)
+		if code == 0 || !strings.Contains(out, "-min-free-mb") {
+			t.Errorf("exit %d\n%s", code, out)
+		}
+	})
+
 	t.Run("root does not exist", func(t *testing.T) {
 		out, code := runToCompletion(t, "-root="+filepath.Join(base, "missing"), "-audit-log="+good)
 		if code == 0 || !strings.Contains(out, "invalid root directory") {
@@ -730,5 +738,29 @@ func TestE2ESecondSignalExitsAtOnce(t *testing.T) {
 	}
 	if err == nil {
 		t.Error("process exited normally; want it ended by the second signal")
+	}
+}
+
+func TestE2EConsoleEventLogCanBeTurnedOff(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{nil, true},
+		{[]string{"-log-events=false"}, false},
+	} {
+		s := startServer(t, tc.args...)
+		if code, err := s.upload("", "a.txt", []byte("x")); err != nil || code != 201 {
+			t.Fatalf("%v: upload = %d, %v", tc.args, code, err)
+		}
+		if err := s.stop(syscall.SIGTERM); err != nil {
+			t.Fatalf("%v: exit: %v", tc.args, err)
+		}
+		if got := strings.Contains(s.out.String(), "Event [file.uploaded]"); got != tc.want {
+			t.Errorf("%v: event on the console = %v, want %v\n%s", tc.args, got, tc.want, s.out)
+		}
+		if rep, err := audit.Verify(s.auditPath); err != nil || rep.Records != 1 {
+			t.Errorf("%v: audit log %+v, %v", tc.args, rep, err)
+		}
 	}
 }

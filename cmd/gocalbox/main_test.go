@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -51,6 +53,22 @@ func newTestApp(t *testing.T, mutate ...func(*config)) (*app, config) {
 		t.Fatal(err)
 	}
 	return a, cfg
+}
+
+func uploadRequest(t *testing.T, name string, size int, chunked bool) *http.Request {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	w, _ := mw.CreateFormFile("myFile", name)
+	w.Write(bytes.Repeat([]byte("x"), size))
+	mw.Close()
+	req := httptest.NewRequest(http.MethodPost, "/api/upload", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if chunked {
+		req.Body = io.NopCloser(req.Body)
+		req.ContentLength = -1
+	}
+	return req
 }
 
 func closeApp(t *testing.T, a *app) {
@@ -366,5 +384,33 @@ func TestCloseWaitsForOperationsStillRunning(t *testing.T) {
 	}
 	if code := <-result; code != 200 {
 		t.Errorf("delete answered %d", code)
+	}
+}
+
+func TestUploadsKeepTheFreeSpaceReserve(t *testing.T) {
+	a, cfg := newTestApp(t, func(c *config) { c.MinFreeBytes = 1 << 62 })
+	if a.space == nil {
+		closeApp(t, a)
+		t.Skipf("free space cannot be measured here: %v", a.spaceErr)
+	}
+	for _, chunked := range []bool{false, true} {
+		rec := httptest.NewRecorder()
+		a.Handler.ServeHTTP(rec, uploadRequest(t, "a.bin", 10, chunked))
+		if rec.Code != http.StatusInsufficientStorage {
+			t.Errorf("chunked=%v: %d %s", chunked, rec.Code, rec.Body)
+		}
+	}
+	closeApp(t, a)
+	if _, err := os.Stat(filepath.Join(cfg.RootDir, "a.bin")); err == nil {
+		t.Error("an upload below the reserve was stored")
+	}
+	evs := auditEvents(t, cfg.AuditLog)
+	if len(evs) != 2 {
+		t.Fatalf("audit records: %+v", evs)
+	}
+	for _, ev := range evs {
+		if ev.Type != events.FileUploaded || ev.Outcome != events.OutcomeNoSpace {
+			t.Errorf("audit record %+v, want file.uploaded / no_space", ev)
+		}
 	}
 }

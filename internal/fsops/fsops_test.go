@@ -203,7 +203,7 @@ func TestOpen(t *testing.T) {
 func TestCreateAutoRename(t *testing.T) {
 	e := newEnv(t)
 	for i, want := range []string{"x.txt", "x (1).txt", "x (2).txt"} {
-		got, size, err := e.svc.Create(bg, "", "x.txt", strings.NewReader(fmt.Sprint("c", i)))
+		got, size, err := e.svc.Create(bg, "", "x.txt", strings.NewReader(fmt.Sprint("c", i)), -1)
 		if err != nil || got != want || size != 2 {
 			t.Fatalf("Create #%d = %q, %d, %v; want %q", i, got, size, err, want)
 		}
@@ -212,14 +212,14 @@ func TestCreateAutoRename(t *testing.T) {
 		}
 	}
 
-	e.svc.Create(bg, "", ".env", strings.NewReader("1"))
-	got, _, _ := e.svc.Create(bg, "", ".env", strings.NewReader("2"))
+	e.svc.Create(bg, "", ".env", strings.NewReader("1"), -1)
+	got, _, _ := e.svc.Create(bg, "", ".env", strings.NewReader("2"), -1)
 	if got != ".env (1)" {
 		t.Errorf("dotfile duplicate = %q", got)
 	}
 
 	os.Mkdir(filepath.Join(e.root, "docs"), 0o755)
-	if got, _, err := e.svc.Create(bg, "/x/../docs/", "n.txt", strings.NewReader("")); err != nil || got != "docs/n.txt" {
+	if got, _, err := e.svc.Create(bg, "/x/../docs/", "n.txt", strings.NewReader(""), -1); err != nil || got != "docs/n.txt" {
 		t.Errorf("Create returns canonical path: %q, %v", got, err)
 	}
 }
@@ -230,7 +230,7 @@ func TestCreateErrors(t *testing.T) {
 	e.symlink(e.outside, "escape")
 
 	create := func(dir, name string) error {
-		_, _, err := e.svc.Create(bg, dir, name, strings.NewReader("x"))
+		_, _, err := e.svc.Create(bg, dir, name, strings.NewReader("x"), -1)
 		return err
 	}
 	is(t, create("", ".."), ErrInvalidName, "bad name")
@@ -263,7 +263,7 @@ func TestCreateRemovesPartialFileOnError(t *testing.T) {
 	e := newEnv(t)
 	boom := errors.New("connection reset")
 
-	_, _, err := e.svc.Create(bg, "", "partial.bin", &failingReader{data: "half", err: boom})
+	_, _, err := e.svc.Create(bg, "", "partial.bin", &failingReader{data: "half", err: boom}, -1)
 	is(t, err, boom, "reader error is propagated")
 	if e.exists("partial.bin") {
 		t.Error("partial file left on disk")
@@ -280,7 +280,7 @@ func TestCreateConcurrentSameNameGetsDistinctFiles(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			name, _, err := e.svc.Create(bg, "", "same.txt", strings.NewReader(fmt.Sprint("content-", i)))
+			name, _, err := e.svc.Create(bg, "", "same.txt", strings.NewReader(fmt.Sprint("content-", i)), -1)
 			if err != nil {
 				t.Error(err)
 				return
@@ -492,7 +492,7 @@ func TestAutoRenameKeepsLongNamesWithinTheLimit(t *testing.T) {
 	for _, name := range []string{strings.Repeat("x", 251) + ".txt", strings.Repeat("é", 125) + ".txt"} {
 		var stored []string
 		for i := 0; i < 3; i++ {
-			rel, _, err := e.svc.Create(bg, "", name, strings.NewReader("x"))
+			rel, _, err := e.svc.Create(bg, "", name, strings.NewReader("x"), -1)
 			if err != nil {
 				t.Fatalf("upload %d of a %d-byte name: %v", i+1, len(name), err)
 			}
@@ -511,18 +511,18 @@ func TestAutoRenameGivesUpWithErrExists(t *testing.T) {
 	maxAutoRename = 3
 	e := newEnv(t)
 	for i := 0; i < 3; i++ {
-		if _, _, err := e.svc.Create(bg, "", "a.txt", strings.NewReader("x")); err != nil {
+		if _, _, err := e.svc.Create(bg, "", "a.txt", strings.NewReader("x"), -1); err != nil {
 			t.Fatal(err)
 		}
 	}
-	_, _, err := e.svc.Create(bg, "", "a.txt", strings.NewReader("x"))
+	_, _, err := e.svc.Create(bg, "", "a.txt", strings.NewReader("x"), -1)
 	is(t, err, ErrExists, "fourth upload with three variants allowed")
 
-	_, _, err = e.svc.Create(bg, "", "b."+strings.Repeat("e", 252), strings.NewReader("x"))
+	_, _, err = e.svc.Create(bg, "", "b."+strings.Repeat("e", 252), strings.NewReader("x"), -1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = e.svc.Create(bg, "", "b."+strings.Repeat("e", 252), strings.NewReader("x"))
+	_, _, err = e.svc.Create(bg, "", "b."+strings.Repeat("e", 252), strings.NewReader("x"), -1)
 	is(t, err, ErrExists, "duplicate whose extension leaves no room for a number")
 }
 

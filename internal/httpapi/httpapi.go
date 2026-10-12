@@ -22,7 +22,7 @@ import (
 type FileService interface {
 	List(ctx context.Context, dir string) ([]fsops.Entry, error)
 	Open(ctx context.Context, path string) (*fsops.File, error)
-	Create(ctx context.Context, dir, name string, r io.Reader) (string, int64, error)
+	Create(ctx context.Context, dir, name string, r io.Reader, sizeHint int64) (string, int64, error)
 	Mkdir(ctx context.Context, parent, name string) (string, error)
 	Delete(ctx context.Context, path string) (string, error)
 	Move(ctx context.Context, oldPath, newPath string) (string, error)
@@ -106,6 +106,8 @@ func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 		writeErrorJSON(w, r, http.StatusForbidden, "cross_origin", "Cross-origin requests are not allowed")
 	}))
 
+	// The body limit is outermost: net/http reads the unread rest of a body
+	// before it replies, so requests refused early must be bounded too.
 	return requestContext(limitBodyStalls(opts.BodyTimeout,
 		securityHeaders(checkHost(opts.AllowedHosts, cop.Handler(isolateResources(rejectUnclean(mux)))))))
 }
@@ -152,6 +154,7 @@ func requestContext(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-ID", id)
 
 		ctx := events.WithRequestID(r.Context(), id)
+		// X-Forwarded-For is ignored because any client can forge it.
 		ctx = events.WithActor(ctx, events.Actor{ID: events.AnonymousID, RemoteAddr: r.RemoteAddr})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

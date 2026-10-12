@@ -87,8 +87,8 @@ func TestEveryOperationPublishesExactlyOneEvent(t *testing.T) {
 		{"list missing", func() { e.svc.List(bg, "nope") }, events.FileListed, events.OutcomeNotFound, "nope"},
 		{"download ok", func() { download(e, "a.txt") }, events.FileDownloaded, events.OutcomeOK, "a.txt"},
 		{"download missing", func() { download(e, "nope.txt") }, events.FileDownloaded, events.OutcomeNotFound, "nope.txt"},
-		{"upload ok", func() { e.svc.Create(bg, "dir", "new.txt", strings.NewReader("12345")) }, events.FileUploaded, events.OutcomeOK, "dir/new.txt"},
-		{"upload bad name", func() { e.svc.Create(bg, "dir", "..", strings.NewReader("x")) }, events.FileUploaded, events.OutcomeInvalid, "dir/.."},
+		{"upload ok", func() { e.svc.Create(bg, "dir", "new.txt", strings.NewReader("12345"), -1) }, events.FileUploaded, events.OutcomeOK, "dir/new.txt"},
+		{"upload bad name", func() { e.svc.Create(bg, "dir", "..", strings.NewReader("x"), -1) }, events.FileUploaded, events.OutcomeInvalid, "dir/.."},
 		{"mkdir ok", func() { e.svc.Mkdir(bg, "dir", "sub") }, events.FolderCreated, events.OutcomeOK, "dir/sub"},
 		{"mkdir exists", func() { e.svc.Mkdir(bg, "dir", "sub") }, events.FolderCreated, events.OutcomeExists, "dir/sub"},
 		{"move ok", func() { e.svc.Move(bg, "a.txt", "b.txt") }, events.FileMoved, events.OutcomeOK, "a.txt"},
@@ -133,7 +133,7 @@ func TestEventDetails(t *testing.T) {
 	if mv := rec.last(t); mv.Path != "a.txt" || mv.Target != "b.txt" {
 		t.Errorf("move event = %+v", mv)
 	}
-	e.svc.Create(bg, "", "b.txt", strings.NewReader("123456"))
+	e.svc.Create(bg, "", "b.txt", strings.NewReader("123456"), -1)
 	if up := rec.last(t); up.Path != "b (1).txt" || up.Size != 6 || up.Outcome != events.OutcomeOK {
 		t.Errorf("upload event should name the file as stored, with size: %+v", up)
 	}
@@ -216,7 +216,7 @@ func TestBlockedAttemptsAreDeniedAndKeepTheRawPath(t *testing.T) {
 		{"list traversal", func() { e.svc.List(bg, "../outside") }, events.FileListed, "../outside"},
 		{"download traversal", func() { download(e, "../outside/secret.txt") }, events.FileDownloaded, "../outside/secret.txt"},
 		{"download via symlink", func() { download(e, "escape/secret.txt") }, events.FileDownloaded, "escape/secret.txt"},
-		{"upload traversal", func() { e.svc.Create(bg, "../outside", "x.txt", strings.NewReader("x")) }, events.FileUploaded, "../outside/x.txt"},
+		{"upload traversal", func() { e.svc.Create(bg, "../outside", "x.txt", strings.NewReader("x"), -1) }, events.FileUploaded, "../outside/x.txt"},
 		{"mkdir via symlink", func() { e.svc.Mkdir(bg, "escape", "x") }, events.FolderCreated, "escape/x"},
 		{"move out", func() { e.svc.Move(bg, "a.txt", "../a.txt") }, events.FileMoved, "a.txt"},
 		{"delete traversal", func() { e.svc.Delete(bg, "../outside/secret.txt") }, events.FileDeleted, "../outside/secret.txt"},
@@ -264,7 +264,7 @@ func TestOutcomeClassification(t *testing.T) {
 
 func TestFailedUploadIsRecordedAsErrorWithSize(t *testing.T) {
 	e, rec := newObservedEnv(t)
-	e.svc.Create(bg, "", "partial.bin", &failingReader{data: "half", err: errors.New("connection reset")})
+	e.svc.Create(bg, "", "partial.bin", &failingReader{data: "half", err: errors.New("connection reset")}, -1)
 
 	ev := rec.one(t)
 	check(t, ev, events.FileUploaded, events.OutcomeError, "partial.bin")
@@ -304,7 +304,7 @@ func TestEventsFromConcurrentOperations(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e.svc.Create(bg, "", "same.txt", strings.NewReader("x"))
+			e.svc.Create(bg, "", "same.txt", strings.NewReader("x"), -1)
 		}()
 	}
 	wg.Wait()
