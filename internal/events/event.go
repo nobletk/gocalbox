@@ -26,6 +26,7 @@ const (
 	OutcomeInvalid  Outcome = "invalid"
 	OutcomeDenied   Outcome = "denied"  // blocked by the sandbox or the OS
 	OutcomeAborted  Outcome = "aborted" // a transfer that stopped early
+	OutcomeNoSpace  Outcome = "no_space"
 	OutcomeError    Outcome = "error"
 )
 

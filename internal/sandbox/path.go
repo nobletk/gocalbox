@@ -25,6 +25,9 @@ type Sandbox struct {
 }
 
 type Path struct {
+	// Rel is canonical (no symlinks, "." or ".."), so access rules must use it.
+	// On case-insensitive file systems, spellings differing in case or Unicode
+	// normalization can still give different Rel values.
 	Rel string
 	Abs string
 }

@@ -98,6 +98,10 @@ func Verify(path string) (Report, error) {
 		if err := json.Unmarshal(body, &rec); err != nil {
 			return rep, &TamperError{Line: line, Reason: "not a valid record: " + err.Error()}
 		}
+		// The hash covers only the event object, and encoding/json accepts
+		// keys in any letter case, unknown and duplicate keys and extra white
+		// space. Requiring the writer's exact bytes leaves no byte of the line
+		// unprotected.
 		if canonical, err := json.Marshal(rec); err != nil || !bytes.Equal(canonical, body) {
 			return rep, &TamperError{Line: line, Reason: "record is not in the form the audit writer produces (edited)"}
 		}

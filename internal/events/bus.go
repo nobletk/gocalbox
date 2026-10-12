@@ -8,8 +8,10 @@ import (
 	"time"
 )
 
+// Handler must not Publish to the same bus: with full queues that deadlocks.
 type Handler func(Event)
 
+// BatchHandler must not retain the slice; it is reused after the call.
 type BatchHandler func([]Event)
 
 type Mode int
@@ -26,8 +28,10 @@ const (
 )
 
 type Options struct {
-	Buffer   int  // 256 default
-	Mode     Mode // Block (default) or Drop
+	Buffer int  // 256 default
+	Mode   Mode // Block (default) or Drop
+	// Filter is called only from the dispatcher goroutine, so it may keep
+	// state without locking.
 	Filter   func(Event) bool
 	MaxBatch int // 256 default
 }
