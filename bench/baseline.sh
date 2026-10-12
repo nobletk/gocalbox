@@ -11,12 +11,16 @@
 #   DROP_CACHES=1                   drop the page cache before each download (asks for sudo)
 #   LOG_EVENTS=1                    keep the server's console event log on; by default it is
 #                                   turned off where the server allows it, so its cost is not measured
+#   TRANSPORT=https-h2              https-h2 (HTTPS with HTTP/2, as browsers use it), https-h1 (HTTPS
+#                                   with HTTP/1.1) or http (plain HTTP/1.1, the only transport before
+#                                   HTTPS); comparing https-h1 with http isolates the cost of TLS
 #
 # Columns that need a definition:
 #   durable_upper_seconds  upload time plus an fsync of the stored file started right after it:
 #                          an upper bound on replying only once the file is on disk
 #   http_code              for upload_batch rows, 201 when all 100 uploads got it, otherwise
 #                          every code with its count, such as "201x97 507x3"
+#   transport              the TRANSPORT of the run; results from before this column existed are http
 set -euo pipefail
 trap 'echo "baseline.sh: failed at line $LINENO" >&2' ERR
 export LC_ALL=C
@@ -27,7 +31,14 @@ WORK=${WORK:-$PWD/bench/.work}
 DROP_CACHES=${DROP_CACHES:-0}
 LOG_EVENTS=${LOG_EVENTS:-0}
 PORT=${PORT:-18080}
-URL="http://localhost:$PORT"
+TRANSPORT=${TRANSPORT:-https-h2}
+case $TRANSPORT in
+  https-h2) SCHEME=https; WANT_HTTP=2;   CURL=(curl -sS --http2) ;;
+  https-h1) SCHEME=https; WANT_HTTP=1.1; CURL=(curl -sS --http1.1) ;;
+  http)     SCHEME=http;  WANT_HTTP=1.1; CURL=(curl -sS --http1.1) ;;
+  *) echo "TRANSPORT must be https-h2, https-h1 or http" >&2; exit 1 ;;
+esac
+URL="$SCHEME://localhost:$PORT"
 
 [ -f go.mod ] && [ -d cmd/gocalbox ] || { echo "run from the repository root" >&2; exit 1; }
 [ "${BASH_VERSINFO[0]}" -ge 5 ] || { echo "needs bash 5 or later" >&2; exit 1; }
@@ -44,7 +55,7 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 mkdir -p bench/results "$WORK/data"
 CSV="bench/results/$COMMIT-$STAMP.csv"
 ENV="bench/results/$COMMIT-$STAMP-env.txt"
-ROOT="$WORK/root"; AUDIT="$WORK/audit.jsonl"; CODES="$WORK/codes"
+ROOT="$WORK/root"; AUDIT="$WORK/audit.jsonl"; CODES="$WORK/codes"; TLS_DIR="$WORK/tls"
 rm -rf "${ROOT:?}" "$AUDIT"; mkdir -p "$ROOT"
 
 # Random, so neither compression nor sparse files flatter the numbers.
@@ -59,17 +70,30 @@ GOVERNOR=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 
 go build -o "$WORK/gocalbox" ./cmd/gocalbox
 SERVER_CMD=("$WORK/gocalbox" -port "$PORT" -root "$ROOT" -audit-log "$AUDIT" -max-upload-mb 0)
+FLAGS=$("$WORK/gocalbox" -h 2>&1 || true)
 CONSOLE_LOG=on
 if [ "$LOG_EVENTS" != 1 ]; then
-  case $("$WORK/gocalbox" -h 2>&1 || true) in
+  case $FLAGS in
     *-log-events*) SERVER_CMD+=(-log-events=false); CONSOLE_LOG=off ;;
     *) echo "warning: this server has no -log-events flag, so its console event log is part of what is measured" >&2 ;;
   esac
 fi
+case $FLAGS in
+  *-tls-dir*)
+    if [ "$SCHEME" = https ]; then SERVER_CMD+=(-tls-dir "$TLS_DIR"); CURL+=(--cacert "$TLS_DIR/ca.crt")
+    else SERVER_CMD+=(-insecure-http); fi ;;
+  *) [ "$SCHEME" = http ] || { echo "this server has no HTTPS; run with TRANSPORT=http" >&2; exit 1; } ;;
+esac
 "${SERVER_CMD[@]}" > "$WORK/server.log" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null || true' EXIT
-for _ in $(seq 100); do curl -fs -o /dev/null "$URL/" && break; sleep 0.1; done
+for _ in $(seq 100); do "${CURL[@]}" -f -o /dev/null "$URL/" 2>/dev/null && break; sleep 0.1; done
+GOT_HTTP=$("${CURL[@]}" -o /dev/null -w '%{http_version}' "$URL/")
+[ "$GOT_HTTP" = "$WANT_HTTP" ] || { echo "negotiated HTTP/$GOT_HTTP, not HTTP/$WANT_HTTP; for https-h2, curl needs HTTP/2 support (curl -V lists HTTP2)" >&2; exit 1; }
+TLS_PARAMS=n/a
+if [ "$SCHEME" = https ] && command -v openssl >/dev/null; then
+  TLS_PARAMS=$(openssl s_client -brief -connect "127.0.0.1:$PORT" < /dev/null 2>&1 | awk '/^Protocol version:/ {sub(/^Protocol version: /, ""); v = $0} /^Ciphersuite:/ {sub(/^Ciphersuite: /, ""); c = $0} /^(Negotiated TLS[0-9.]* group|Server Temp Key):/ {sub(/^[^:]*: /, ""); g = $0} END {printf "%s, %s, key exchange %s", (v == "" ? "unknown version" : v), (c == "" ? "unknown cipher" : c), (g == "" ? "not reported" : g)}' || true)
+fi
 
 TICK=$(getconf CLK_TCK)
 # Sets CPU to the server's CPU time in clock ticks. It does not fork, so it adds nothing to the timings around it.
@@ -78,7 +102,7 @@ cpus() { awk -v a="$1" -v b="$2" -v t="$TICK" 'BEGIN{printf "%.4f", (b-a)/t}'; }
 sub() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.4f", b-a}'; }
 rate() { awk -v b="$1" -v s="$2" 'BEGIN{printf "%.1f", (s>0)?b/1048576/s:0}'; }
 tally() { sort "$1" | uniq -c | awk -v n="$2" '{k[NR]=$1; c[NR]=$2} END {if (NR==1 && k[1]==n) {print c[1]; exit} for (i=1; i<=NR; i++) printf "%s%sx%s", (i>1?" ":""), c[i], k[i]; print ""}'; }
-row() { echo "$COMMIT,$DIRTY,$*" >> "$CSV"; }
+row() { echo "$COMMIT,$DIRTY,$*,$TRANSPORT" >> "$CSV"; }
 
 {
   echo "commit: $COMMIT (dirty=$DIRTY)   date: $(date -Is)"
@@ -93,19 +117,21 @@ row() { echo "$COMMIT,$DIRTY,$*" >> "$CSV"; }
   echo "cpu governor: $GOVERNOR"
   echo "server command: ${SERVER_CMD[*]@Q}"
   echo "console event log: $CONSOLE_LOG"
+  echo "transport: $TRANSPORT (negotiated HTTP/$GOT_HTTP; $("${CURL[@]}" --version | head -1))"
+  echo "tls as openssl s_client negotiates it: $TLS_PARAMS"
   echo "sizes: $SIZES"
   echo "reps: $REPS"
   echo "drop caches before downloads: $DROP_CACHES"
 } > "$ENV"
 
-echo "commit,dirty,scenario,size_bytes,files,concurrency,rep,seconds,mib_per_s,durable_upper_seconds,server_cpu_s,http_code" > "$CSV"
+echo "commit,dirty,scenario,size_bytes,files,concurrency,rep,seconds,mib_per_s,durable_upper_seconds,server_cpu_s,http_code,transport" > "$CSV"
 
 for s in $SIZES; do
   src="$WORK/data/$s.bin"; bytes=$(stat -c %s "$src")
   for rep in $(seq "$REPS"); do
     sync
     read_cpu; c0=$CPU
-    IFS=, read -r code secs < <(curl -sS -o /dev/null -w '%{http_code},%{time_total}\n' -F "myFile=@$src" "$URL/api/upload")
+    IFS=, read -r code secs < <("${CURL[@]}" -o /dev/null -w '%{http_code},%{time_total}\n' -F "myFile=@$src" "$URL/api/upload")
     t0=$EPOCHREALTIME
     read_cpu; c1=$CPU
     durable=
@@ -118,7 +144,7 @@ for s in $SIZES; do
 
     if [ "$DROP_CACHES" = 1 ]; then sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'; fi
     read_cpu; c0=$CPU
-    IFS=, read -r code secs < <(curl -sS -o /dev/null -w '%{http_code},%{time_total}\n' "$URL/files/$s.bin")
+    IFS=, read -r code secs < <("${CURL[@]}" -o /dev/null -w '%{http_code},%{time_total}\n' "$URL/files/$s.bin")
     read_cpu; c1=$CPU
     row "download,$bytes,1,1,$rep,$secs,$(rate "$bytes" "$secs"),,$(cpus "$c0" "$c1"),$code"
     rm -f "$ROOT/$s.bin"
@@ -132,7 +158,7 @@ for conc in 1 4 16; do
     rm -rf "${ROOT:?}"/*; sync
     : > "$CODES"
     read_cpu; c0=$CPU; t0=$EPOCHREALTIME
-    seq 100 | xargs -P "$conc" -I{} curl -sS -o /dev/null -w '%{http_code}\n' -F "myFile=@$batch;filename=f{}.bin" "$URL/api/upload" >> "$CODES" || true
+    seq 100 | xargs -P "$conc" -I{} "${CURL[@]}" -o /dev/null -w '%{http_code}\n' -F "myFile=@$batch;filename=f{}.bin" "$URL/api/upload" >> "$CODES" || true
     t1=$EPOCHREALTIME; read_cpu; c1=$CPU
     code=$(tally "$CODES" 100)
     [ "$code" = 201 ] || echo "warning: 100 x 1M at concurrency $conc, rep $rep: $code" >&2
