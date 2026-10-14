@@ -23,7 +23,20 @@ func TestPolicy(t *testing.T) {
 		{"bob", "passwordpassword", "repetitive"},
 		{"bob", "aaaaaaaaaaaaaaaaaaaa", "repetitive"},
 		{"bob", "xyzxyzxyzxyzxyzxy", "repetitive"},
-		{"bob", "xyzxyzxyzxyzxyzxq", ""},
+		{"bob", "kqmkqmkqmkqmkqmkr", ""},
+		{"bob", "abcdefghijklmno", "sequential"},
+		{"bob", "ABCDEFGHIJKLMNO!", "sequential"},
+		{"bob", "onmlkjihgfedcba", "sequential"},
+		{"bob", "123456789012345", "sequential"},
+		{"bob", "0987654321098765", "sequential"},
+		{"bob", "qwertyuiopasdfghjkl", "sequential"},
+		{"bob", "abcdef123456789", "sequential"},
+		{"bob", "aaabbbcccdddeee", "sequential"},
+		{"bob", "xyzxyzxyzxyzxyzxq", "sequential"},
+		{"bob", "abcdefghijkl!x9", ""},
+		{"bob", "correct horse battery staple", ""},
+		{"bob", "my abc puzzle is fun to solve", ""},
+		{"bob", "tH7#qz!pL4mW8vRk", ""},
 		{"bob", "caf\xe9 au lait, s'il vous plait", "not_utf8"},
 		{"bob", strings.Repeat("\xff", 15), "not_utf8"},
 	} {
@@ -46,6 +59,9 @@ func TestPolicyLowerMinimumUsesTheBlocklist(t *testing.T) {
 	}
 	if err := p.Check("alice", "tH7#qz!pL"); err != nil {
 		t.Errorf("uncommon 9-character password: %v", err)
+	}
+	if err := p.Check("alice", "lmnopqr7"); !errors.As(err, &we) || we.Reason != "sequential" {
+		t.Errorf("lmnopqr7: %v", err)
 	}
 }
 

@@ -30,7 +30,7 @@ var commonPasswords = sync.OnceValue(func() map[string]struct{} {
 
 // WeakPasswordError says why the policy refused a password. Reason is one
 // of too_long, not_utf8, too_short, common, contains_username,
-// contains_service_name and repetitive.
+// contains_service_name, repetitive and sequential.
 type WeakPasswordError struct {
 	Reason  string
 	Message string
@@ -69,6 +69,9 @@ func (p Policy) Check(username, password string) error {
 	if repetitive(lower) {
 		return &WeakPasswordError{"repetitive", "the password repeats one short sequence, such as \"abcabcabc\""}
 	}
+	if sequential(lower) {
+		return &WeakPasswordError{"sequential", "the password is almost all runs such as \"abcdef\", \"12345\", \"qwerty\" or \"aaaa\""}
+	}
 	return nil
 }
 
@@ -86,6 +89,45 @@ func repetitive(s string) bool {
 			}
 		}
 		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// Neighbours in either direction continue a run; 9 and 0 are neighbours, as
+// on the keyboard.
+var sequences = []string{"abcdefghijklmnopqrstuvwxyz", "01234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"}
+
+const (
+	minRun = 3
+	// A password needs at least this many characters outside runs, so that
+	// "abcdefghijklmno" and "abcdefghijklmno!" are both refused.
+	minOutsideRuns = 3
+)
+
+// sequential reports whether all but a few characters of s lie in runs of
+// at least minRun that repeat a character or step through one of sequences,
+// such as "abcdef", "12345", "qwerty", "aaaa" and "abcba".
+func sequential(s string) bool {
+	r := []rune(s)
+	outside, start := 0, 0
+	for i := 1; i <= len(r); i++ {
+		if i < len(r) && (r[i] == r[i-1] || adjacent(r[i-1], r[i])) {
+			continue
+		}
+		if n := i - start; n < minRun {
+			outside += n
+		}
+		start = i
+	}
+	return outside < minOutsideRuns
+}
+
+func adjacent(a, b rune) bool {
+	pair, reversed := string([]rune{a, b}), string([]rune{b, a})
+	for _, s := range sequences {
+		if strings.Contains(s, pair) || strings.Contains(s, reversed) {
 			return true
 		}
 	}
