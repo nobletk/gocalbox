@@ -9,6 +9,9 @@ import (
 func LogHandler(ev Event) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Event [%s] outcome=%s actor=%s", ev.Type, ev.Outcome, ev.Actor.ID)
+	if ev.Actor.Name != "" {
+		fmt.Fprintf(&b, "(%s)", ev.Actor.Name)
+	}
 	if ev.Actor.RemoteAddr != "" {
 		fmt.Fprintf(&b, "@%s", ev.Actor.RemoteAddr)
 	}

@@ -15,6 +15,10 @@ const (
 	FileMoved       Type = "file.moved"
 	FileDeleted     Type = "file.deleted"
 	FileReadSummary Type = "file.read_summary"
+
+	AuthSetupCompleted  Type = "auth.setup_completed"
+	AuthPasswordChanged Type = "auth.password_changed"
+	UserCreated         Type = "user.created"
 )
 
 type Outcome string
@@ -30,10 +34,16 @@ const (
 	OutcomeError    Outcome = "error"
 )
 
-const AnonymousID = "anonymous"
+// Actor IDs that are not user IDs. No username may take these names.
+const (
+	AnonymousID = "anonymous"
+	ConsoleID   = "console" // the gocalbox command run from a shell, such as "users add"
+	SystemID    = "system"  // the server acting on its own, such as at start-up
+)
 
 type Actor struct {
 	ID         string `json:"id"`
+	Name       string `json:"name,omitempty"` // username at the time of the event
 	Role       string `json:"role,omitempty"`
 	RemoteAddr string `json:"remote_addr,omitempty"`
 }
