@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -472,16 +473,21 @@ func TestPathsThroughFilesAndLinkLoopsAreNotInternalErrors(t *testing.T) {
 func TestMoveValidatesTheNewName(t *testing.T) {
 	e := newEnv(t)
 	e.write("a.txt", "x")
-	e.write("old\nname.txt", "legacy")
 
-	for _, dst := range []string{"b\nc.txt", `b\c.txt`, " lead.txt", strings.Repeat("n", 256)} {
+	for _, dst := range []string{"b\nc.txt", `b\c.txt`, `d/b\c.txt`, " lead.txt", strings.Repeat("n", 256)} {
 		_, err := e.svc.Move(bg, "a.txt", dst)
 		is(t, err, ErrInvalidName, fmt.Sprintf("move to %q", dst))
 	}
 	if !e.exists("a.txt") {
 		t.Fatal("a rejected move moved the file")
 	}
+	// Windows file names can't contain a newline, so no such legacy name
+	// exists there.
+	if runtime.GOOS == "windows" {
+		return
+	}
 	// A name that predates the rules can still be fixed by renaming it.
+	e.write("old\nname.txt", "legacy")
 	if _, err := e.svc.Move(bg, "old\nname.txt", "fixed.txt"); err != nil {
 		t.Errorf("renaming a legacy name: %v", err)
 	}

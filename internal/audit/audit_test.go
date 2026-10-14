@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -71,7 +72,7 @@ func TestWriteAndVerify(t *testing.T) {
 	}
 
 	info, _ := os.Stat(path)
-	if perm := info.Mode().Perm(); perm != 0o600 {
+	if perm := info.Mode().Perm(); perm != 0o600 && runtime.GOOS != "windows" {
 		t.Errorf("file mode = %o, want 600", perm)
 	}
 	if n := len(lines(t, path)); n != 5 {
@@ -128,6 +129,15 @@ func (f *flakyFile) Truncate(size int64) error {
 	return f.File.Truncate(size)
 }
 
+// Windows can't remove a test's folder while a file in it is still open.
+func reopen(path string) error {
+	w, err := Open(path)
+	if err == nil {
+		w.Close()
+	}
+	return err
+}
+
 func TestFailedWriteIsRolledBackAndTheChainContinues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 	w, _ := Open(path)
@@ -145,7 +155,7 @@ func TestFailedWriteIsRolledBackAndTheChainContinues(t *testing.T) {
 	if err != nil || rep.Records != 2 {
 		t.Errorf("after rolled-back write: %+v, %v (want records 1 and 4 only)", rep, err)
 	}
-	if _, err := Open(path); err != nil {
+	if err := reopen(path); err != nil {
 		t.Errorf("log refused at next start: %v", err)
 	}
 }
@@ -166,7 +176,7 @@ func TestWriterStopsWhenRollbackFails(t *testing.T) {
 	if after, _ := os.ReadFile(path); !bytes.Equal(before, after) {
 		t.Error("a broken writer kept appending")
 	}
-	if _, err := Open(path); err != nil {
+	if err := reopen(path); err != nil {
 		t.Errorf("Open after a stopped writer: %v", err)
 	}
 }
@@ -195,7 +205,7 @@ func TestFailedSyncRollsTheBatchBackAndTheChainContinues(t *testing.T) {
 	if err != nil || rep.Records != 2 {
 		t.Errorf("after a failed sync: %+v, %v (want records 1 and 4)", rep, err)
 	}
-	if _, err := Open(path); err != nil {
+	if err := reopen(path); err != nil {
 		t.Errorf("log refused at next start: %v", err)
 	}
 }

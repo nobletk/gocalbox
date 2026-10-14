@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -49,7 +50,7 @@ func TestUsersCommands(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "Created bench (contributor, u-") || !strings.Contains(out, "/users/bench") {
 		t.Fatalf("users add = %d %q %q", code, out, errOut)
 	}
-	if fi, err := os.Stat(filepath.Dir(statePath)); err != nil || fi.Mode().Perm() != 0o700 {
+	if fi, err := os.Stat(filepath.Dir(statePath)); err != nil || fi.Mode().Perm() != 0o700 && runtime.GOOS != "windows" {
 		t.Errorf("state folder: %v, %v", fi, err)
 	}
 	users := readUsers(t, statePath)

@@ -116,7 +116,7 @@ func FromRoot(err error) error {
 			return fmt.Errorf("%w: %v", ErrTraversal, err)
 		}
 	}
-	if errors.Is(err, syscall.ENAMETOOLONG) {
+	if IsBadName(err) {
 		return fmt.Errorf("%w: %v", ErrInvalidPath, err)
 	}
 	return err
@@ -159,11 +159,12 @@ func cleanRel(userPath string) (string, error) {
 	}
 	trimmed := strings.TrimLeft(userPath, "/"+string(filepath.Separator))
 	rel := filepath.Clean(filepath.FromSlash(trimmed))
-	if rel == "." {
-		return ".", nil
-	}
-	if !filepath.IsLocal(rel) {
+	if rel != "." && !filepath.IsLocal(rel) {
 		return "", ErrTraversal
+	}
+	// Client paths are separated by "/" only, on every system.
+	if filepath.Separator == '\\' && strings.ContainsRune(userPath, '\\') {
+		return "", ErrInvalidPath
 	}
 	return rel, nil
 }
@@ -186,7 +187,7 @@ func evalExisting(p string) (string, error) {
 		if isLoop(err) {
 			return "", fmt.Errorf("%w: %v", ErrBrokenLink, err)
 		}
-		if errors.Is(err, syscall.ENAMETOOLONG) {
+		if IsBadName(err) {
 			return "", fmt.Errorf("%w: %v", ErrInvalidPath, err)
 		}
 		if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {

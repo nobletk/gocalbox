@@ -420,6 +420,11 @@ func (s *Service) move(oldPath, newPath string) (from, to sandbox.Path, err erro
 		return sandbox.Path{}, sandbox.Path{}, err
 	}
 	if to, err = s.sb.ResolveEntry(newPath); err != nil {
+		// A new name holding a backslash is an invalid name on every system,
+		// also where the path is refused for using it as a separator.
+		if errors.Is(err, sandbox.ErrInvalidPath) && strings.ContainsRune(path.Base(newPath), '\\') {
+			return from, sandbox.Path{}, ErrInvalidName
+		}
 		return from, sandbox.Path{}, err
 	}
 	if !ValidName(path.Base(to.Rel)) {
@@ -495,7 +500,7 @@ func (s *Service) onServedVolume(dir string) bool {
 }
 
 func nameErr(err error) error {
-	if errors.Is(err, syscall.ENAMETOOLONG) {
+	if sandbox.IsBadName(err) {
 		return fmt.Errorf("%w: %v", ErrInvalidName, err)
 	}
 	return err
