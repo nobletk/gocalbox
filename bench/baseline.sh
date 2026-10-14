@@ -78,11 +78,13 @@ if [ "$LOG_EVENTS" != 1 ]; then
     *) echo "warning: this server has no -log-events flag, so its console event log is part of what is measured" >&2 ;;
   esac
 fi
+BENCH_PW=
 case $FLAGS in
   *-state*)
     # Without an admin the server starts in setup mode and refuses every file request.
     STATE="$WORK/state.db"; rm -f "$STATE"
-    head -c 24 /dev/urandom | base64 | "$WORK/gocalbox" users add -username bench -role admin -state "$STATE" -audit-log "$AUDIT" > /dev/null
+    BENCH_PW=$(head -c 24 /dev/urandom | base64)
+    printf '%s\n' "$BENCH_PW" | "$WORK/gocalbox" users add -username bench -role admin -state "$STATE" -audit-log "$AUDIT" > /dev/null
     SERVER_CMD+=(-state "$STATE") ;;
 esac
 case $FLAGS in
@@ -97,6 +99,21 @@ trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null || true' EXIT
 for _ in $(seq 100); do "${CURL[@]}" -f -o /dev/null "$URL/" 2>/dev/null && break; sleep 0.1; done
 GOT_HTTP=$("${CURL[@]}" -o /dev/null -w '%{http_version}' "$URL/")
 [ "$GOT_HTTP" = "$WANT_HTTP" ] || { echo "negotiated HTTP/$GOT_HTTP, not HTTP/$WANT_HTTP; for https-h2, curl needs HTTP/2 support (curl -V lists HTTP2)" >&2; exit 1; }
+# login USER PASSWORD FILE logs in and writes the session cookie to FILE as a header for curl -H @FILE,
+# so neither the password nor the cookie appears on a command line.
+login() {
+  local token
+  token=$(printf '{"username":"%s","password":"%s"}' "$1" "$2" |
+    "${CURL[@]}" -o /dev/null -D - -H 'Content-Type: application/json' --data-binary @- "$URL/api/auth/login" |
+    sed -n 's/^[Ss]et-[Cc]ookie: __Host-gocalbox-session=\([^;]*\);.*/\1/p')
+  [ -n "$token" ] || { echo "cannot log in as $1" >&2; exit 1; }
+  (umask 077; printf 'Cookie: __Host-gocalbox-session=%s\n' "$token" > "$3")
+}
+case $FLAGS in
+  *-session-idle*)
+    login bench "$BENCH_PW" "$WORK/session-header"
+    CURL+=(-H "@$WORK/session-header") ;;
+esac
 TLS_PARAMS=n/a
 if [ "$SCHEME" = https ] && command -v openssl >/dev/null; then
   TLS_PARAMS=$(openssl s_client -brief -connect "127.0.0.1:$PORT" < /dev/null 2>&1 | awk '/^Protocol version:/ {sub(/^Protocol version: /, ""); v = $0} /^Ciphersuite:/ {sub(/^Ciphersuite: /, ""); c = $0} /^(Negotiated TLS[0-9.]* group|Server Temp Key):/ {sub(/^[^:]*: /, ""); g = $0} END {printf "%s, %s, key exchange %s", (v == "" ? "unknown version" : v), (c == "" ? "unknown cipher" : c), (g == "" ? "not reported" : g)}' || true)
