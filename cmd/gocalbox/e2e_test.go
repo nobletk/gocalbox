@@ -10,11 +10,13 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,6 +24,7 @@ import (
 	"time"
 
 	"github.com/nobletk/gocalbox/internal/audit"
+	"github.com/nobletk/gocalbox/internal/auth"
 	"github.com/nobletk/gocalbox/internal/events"
 )
 
@@ -221,9 +224,13 @@ func (s *liveServer) start(extraArgs ...string) {
 		}
 		if s.client == nil {
 			if trusted == "" {
-				s.client = &http.Client{}
+				s.client = &http.Client{Transport: http.DefaultTransport}
 			} else if pool, err := certPool(trusted); err == nil {
 				s.tlsConfig, s.client = trustClient(pool, true)
+			}
+			if s.client != nil {
+				s.client.Jar, _ = cookiejar.New(nil)
+				s.client.Transport = sessionTransport{s.client.Transport, s.statePath}
 			}
 		}
 		if s.client != nil {
@@ -235,6 +242,27 @@ func (s *liveServer) start(extraArgs ...string) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("server did not start listening\n%s", s.out)
+}
+
+// sessionTransport sends the session seeded in the server's state file with
+// every request that has no session cookie, such as one from the jar.
+type sessionTransport struct {
+	base      http.RoundTripper
+	statePath string
+}
+
+func (st sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if _, err := r.Cookie(auth.SessionCookie); err != nil {
+		if _, ok := testSessions.Load(st.statePath); ok {
+			r = r.Clone(r.Context())
+			r.AddCookie(sessionCookie(st.statePath))
+		}
+	}
+	return st.base.RoundTrip(r)
+}
+
+func (s *liveServer) cookieLine() string {
+	return "Cookie: " + sessionCookie(s.statePath).String() + "\r\n"
 }
 
 func (s *liveServer) stop(sig syscall.Signal) error {
@@ -417,6 +445,7 @@ func testInFlightUploadSurvivesShutdown(t *testing.T, h2 bool) {
 
 	req, _ := http.NewRequest(http.MethodPost, s.url+"/api/upload", pr)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.AddCookie(sessionCookie(s.statePath))
 	type result struct {
 		code int
 		err  error
@@ -471,7 +500,7 @@ func TestE2EClientDisconnectMidUploadLeavesNoFile(t *testing.T) {
 	head := "--BOUND\r\nContent-Disposition: form-data; name=\"myFile\"; filename=\"cut.bin\"\r\n" +
 		"Content-Type: application/octet-stream\r\n\r\n"
 	// Promise a megabyte, deliver 100 KiB, then hang up.
-	fmt.Fprintf(conn, "POST /api/upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: multipart/form-data; boundary=BOUND\r\nContent-Length: %d\r\n\r\n", 1<<20)
+	fmt.Fprintf(conn, "POST /api/upload HTTP/1.1\r\nHost: 127.0.0.1\r\n%sContent-Type: multipart/form-data; boundary=BOUND\r\nContent-Length: %d\r\n\r\n", s.cookieLine(), 1<<20)
 	io.WriteString(conn, head)
 	conn.Write(bytes.Repeat([]byte("y"), 100<<10))
 	time.Sleep(200 * time.Millisecond)
@@ -635,13 +664,20 @@ func TestE2EStartupFailures(t *testing.T) {
 		}
 	})
 
-	t.Run("network address without authentication", func(t *testing.T) {
-		out, code := runToCompletion(t, "-host=0.0.0.0", "-port=0", "-root="+root, "-audit-log="+good)
-		if code == 0 || !strings.Contains(out, "-insecure-no-auth") {
+	t.Run("the removed -insecure-no-auth", func(t *testing.T) {
+		out, code := runToCompletion(t, "-insecure-no-auth", "-port=0", "-root="+root, "-audit-log="+good)
+		if code == 0 || !strings.Contains(out, "flag provided but not defined: -insecure-no-auth") {
 			t.Errorf("exit %d\n%s", code, out)
 		}
 		if _, err := os.Stat(good); err == nil {
 			t.Error("the refused start created the audit log")
+		}
+	})
+
+	t.Run("session lifetime of zero", func(t *testing.T) {
+		out, code := runToCompletion(t, "-session-idle=0", "-port=0", "-root="+root, "-audit-log="+good)
+		if code == 0 || !strings.Contains(out, "-session-idle") {
+			t.Errorf("exit %d\n%s", code, out)
 		}
 	})
 
@@ -806,8 +842,8 @@ func TestE2ESecondSignalExitsAtOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	fmt.Fprintf(conn, "POST /api/upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: multipart/form-data; boundary=B\r\nContent-Length: %d\r\n\r\n"+
-		"--B\r\nContent-Disposition: form-data; name=\"myFile\"; filename=\"held.bin\"\r\n\r\n", 1<<20)
+	fmt.Fprintf(conn, "POST /api/upload HTTP/1.1\r\nHost: 127.0.0.1\r\n%sContent-Type: multipart/form-data; boundary=B\r\nContent-Length: %d\r\n\r\n"+
+		"--B\r\nContent-Disposition: form-data; name=\"myFile\"; filename=\"held.bin\"\r\n\r\n", s.cookieLine(), 1<<20)
 	conn.Write(make([]byte, 100<<10))
 	time.Sleep(200 * time.Millisecond)
 
@@ -917,7 +953,7 @@ func TestE2EInsecureHTTPOnLoopbackOnly(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "root")
 	os.Mkdir(root, 0o755)
-	out, code := runToCompletion(t, "-insecure-http", "-insecure-no-auth", "-host=0.0.0.0", "-port=0", "-root="+root, "-audit-log="+filepath.Join(base, "a.jsonl"))
+	out, code := runToCompletion(t, "-insecure-http", "-host=0.0.0.0", "-port=0", "-root="+root, "-audit-log="+filepath.Join(base, "a.jsonl"))
 	if code == 0 || !strings.Contains(out, "-insecure-http is allowed only with a loopback -host") {
 		t.Errorf("plain HTTP on all interfaces: exit %d\n%s", code, out)
 	}
@@ -979,7 +1015,7 @@ func TestE2ESetupFromACleanStart(t *testing.T) {
 	if err := s.stop(syscall.SIGTERM); err != nil {
 		t.Fatalf("exit: %v\n%s", err, s.out)
 	}
-	if n, err := verifyOnly(s.auditPath); err != nil || n != 4 {
+	if n, err := verifyOnly(s.auditPath); err != nil || n != 5 {
 		t.Errorf("audit log: %d records, %v", n, err)
 	}
 }
@@ -992,6 +1028,7 @@ func TestE2EUsersAddBeforeTheFirstStart(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "Created root (admin, u-") {
 		t.Fatalf("users add: %v\n%s", err, out)
 	}
+	seedSession(t, s.statePath, "root")
 	s.start()
 	if strings.Contains(s.out.String(), "SETUP:") {
 		t.Errorf("setup mode although an admin exists:\n%s", s.out)
@@ -1004,5 +1041,58 @@ func TestE2EUsersAddBeforeTheFirstStart(t *testing.T) {
 	}
 	if n, err := verifyOnly(s.auditPath); err != nil || n != 4 {
 		t.Errorf("audit log: %d records (user.created and three folders), %v", n, err)
+	}
+}
+
+func TestE2ELoginAndASessionThatSurvivesARestart(t *testing.T) {
+	s := startServer(t)
+	_, c := trustClient(s.tlsConfig.RootCAs, true)
+	c.Jar, _ = cookiejar.New(nil)
+	call := func(method, path, body string) int {
+		t.Helper()
+		req, _ := http.NewRequest(method, s.url+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := call("GET", "/api/files?path=", ""); code != 401 {
+		t.Errorf("before login = %d", code)
+	}
+	if code := call("POST", "/api/auth/login", fmt.Sprintf(`{"username":"admin","password":%q}`, testPassword)); code != 200 {
+		t.Fatalf("login = %d\n%s", code, s.out)
+	}
+	if code := call("GET", "/api/files?path=", ""); code != 200 {
+		t.Errorf("after login = %d", code)
+	}
+	if err := s.stop(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	s.done = make(chan error, 1)
+	s.start()
+	if code := call("GET", "/api/files?path=", ""); code != 200 {
+		t.Errorf("after a restart = %d", code)
+	}
+	if code := call("POST", "/api/auth/logout", ""); code != 204 {
+		t.Errorf("logout = %d", code)
+	}
+	if code := call("GET", "/api/files?path=", ""); code != 401 {
+		t.Errorf("after logout = %d", code)
+	}
+	if err := s.stop(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	var types []events.Type
+	for _, ev := range auditEvents(t, s.auditPath) {
+		types = append(types, ev.Type)
+		if ev.Actor.Name != "admin" || len(ev.Actor.Session) != 16 {
+			t.Errorf("%s by %+v", ev.Type, ev.Actor)
+		}
+	}
+	if !slices.Equal(types, []events.Type{events.AuthLogin, events.AuthLogout}) {
+		t.Errorf("audit events %v", types)
 	}
 }

@@ -11,7 +11,9 @@ import (
 	"mime"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nobletk/gocalbox/internal/auth"
 	"github.com/nobletk/gocalbox/internal/events"
@@ -44,6 +46,7 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var tooBig *http.MaxBytesError
 	var weak *auth.WeakPasswordError
 	var layout *auth.LayoutExistsError
+	var tooMany *auth.TooManyAttemptsError
 
 	switch {
 	case errors.Is(err, sandbox.ErrTraversal):
@@ -91,6 +94,28 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeErrorJSON(w, r, http.StatusConflict, "username_taken", "This username is taken")
 	case errors.As(err, &weak):
 		writeErrorJSON(w, r, http.StatusBadRequest, "weak_password", "Password refused: "+weak.Message)
+	case errors.Is(err, auth.ErrInvalidCredentials):
+		writeErrorJSON(w, r, http.StatusUnauthorized, "invalid_credentials", "Wrong username or password")
+	case errors.Is(err, auth.ErrAccountDisabled):
+		writeErrorJSON(w, r, http.StatusForbidden, "account_disabled", "This account is disabled")
+	case errors.Is(err, auth.ErrPasswordDisabled):
+		writeErrorJSON(w, r, http.StatusForbidden, "password_disabled",
+			"The password was disabled after too many failed attempts; ask an admin for a reset link")
+	case errors.As(err, &tooMany) && tooMany.RetryAfter > 0:
+		secs := int((tooMany.RetryAfter + time.Second - 1) / time.Second)
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		writeErrorJSON(w, r, http.StatusTooManyRequests, "too_many_attempts",
+			fmt.Sprintf("Too many failed attempts; try again in %d seconds", secs))
+	case errors.As(err, &tooMany):
+		writeErrorJSON(w, r, http.StatusTooManyRequests, "too_many_attempts",
+			"Too many failed attempts on this account from browsers it was never used in; "+
+				"log in from a browser you used before, or ask an admin for a reset link")
+	case errors.Is(err, auth.ErrTooManyWrongPasswords):
+		writeErrorJSON(w, r, http.StatusUnauthorized, "unauthenticated", "Five wrong passwords in a row ended the session; log in again")
+	case errors.Is(err, auth.ErrSessionEnded):
+		writeErrorJSON(w, r, http.StatusUnauthorized, "unauthenticated", "The session has ended; log in again")
+	case errors.Is(err, auth.ErrNoSuchSession):
+		writeErrorJSON(w, r, http.StatusNotFound, "not_found", "No such session")
 	case errors.Is(err, auth.ErrBusy):
 		writeErrorJSON(w, r, http.StatusServiceUnavailable, "busy", "The server is busy; try again in a moment")
 

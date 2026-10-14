@@ -72,7 +72,7 @@ func newTLSEnv(t *testing.T, opts Options, sniffTimeout time.Duration) *tlsEnv {
 	if opts.AllowedHosts == nil {
 		opts.AllowedHosts = []string{"127.0.0.1"}
 	}
-	handler := New(fsops.New(sb, rec), fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}, opts)
+	handler := newTestHandler(fsops.New(sb, rec), fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}, opts)
 
 	cert, pool := testCert(t)
 	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2", "http/1.1"}, MinVersion: tls.VersionTLS12}

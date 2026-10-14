@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nobletk/gocalbox/internal/auth"
 	"github.com/nobletk/gocalbox/internal/events"
 	"github.com/nobletk/gocalbox/internal/fsops"
 )
@@ -45,8 +46,9 @@ type Options struct {
 	// CACert, if set, is served at /ca.crt for devices to install.
 	CACert []byte
 
-	// Accounts, if set, serves setup and holds back every other API request
-	// and every file until the first admin exists.
+	// Accounts serves setup, logins and sessions, and holds back every other
+	// API request and every file until the first admin exists. Without it,
+	// every route but the UI and /ca.crt answers 401.
 	Accounts AccountService
 }
 
@@ -109,6 +111,18 @@ func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 	if a.accounts != nil {
 		mux.Handle("/api/setup", a.gate(http.HandlerFunc(a.handleSetup)))
 		mux.HandleFunc("/api/status", a.handleStatus)
+		mux.Handle("/api/auth/login", a.track(http.HandlerFunc(a.handleLogin)))
+		for p, h := range map[string]func(http.ResponseWriter, *http.Request, auth.Identity){
+			"/api/auth/logout":                 a.handleLogout,
+			"/api/auth/me":                     a.handleMe,
+			"/api/auth/confirm":                a.handleConfirm,
+			"/api/auth/password":               a.handlePassword,
+			"/api/auth/sessions":               a.handleSessions,
+			"/api/auth/sessions/revoke":        a.handleRevokeSession,
+			"/api/auth/sessions/revoke-others": a.handleRevokeOthers,
+		} {
+			mux.Handle(p, a.track(withIdentity(h)))
+		}
 	}
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeErrorJSON(w, r, http.StatusNotFound, "not_found", "Unknown API endpoint")
@@ -126,11 +140,11 @@ func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 
 	// The body limit is outermost: net/http reads the unread rest of a body
 	// before it replies, so requests refused early must be bounded too.
-	var routes http.Handler = mux
+	var routes http.Handler = requireSession(mux)
 	if a.accounts != nil {
-		routes = requireSetupDone(a.accounts, mux)
+		routes = requireSetupDone(a.accounts, routes)
 	}
-	inner := cop.Handler(isolateResources(rejectUnclean(routes)))
+	inner := cop.Handler(isolateResources(rejectUnclean(authenticate(a.accounts, routes))))
 	if opts.RequireTLS {
 		inner = redirectPlain(inner)
 	}
@@ -168,8 +182,15 @@ func (a *api) gate(next http.Handler) http.Handler {
 			inner.ServeHTTP(w, r)
 		})
 	}
+	return a.track(h)
+}
+
+// track counts the request among the operations in progress, without the
+// audit gate: logins, logouts and password changes go on when the audit log
+// fails.
+func (a *api) track(h http.Handler) http.Handler {
 	if a.tracker != nil {
-		h = a.tracker.track(h)
+		return a.tracker.track(h)
 	}
 	return h
 }

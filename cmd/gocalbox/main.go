@@ -57,21 +57,20 @@ func run() error {
 	auditFailClosed := flag.Bool("audit-fail-closed", false, "Refuse file operations with 503 once the audit log cannot be written")
 	logEvents := flag.Bool("log-events", true, "Print every file event to the console (the audit log is not affected)")
 	bodyTimeout := flag.Duration("body-timeout", 30*time.Second, "Abort an upload or other request whose body delivers less than 64 KiB in this long (0 = never)")
-	insecureNoAuth := flag.Bool("insecure-no-auth", false, "Allow a non-loopback -host although there is no authentication yet: anyone who can reach the port can read, change and delete the served files")
 	tlsDir := flag.String("tls-dir", defaultTLSDir(), "Folder of the local CA that issues the HTTPS certificate when -tls-cert is not given; must be outside the served directory")
 	tlsCert := flag.String("tls-cert", "", "HTTPS certificate chain (PEM) to use instead of one from the local CA, reloaded when the file changes; needs -tls-key")
 	tlsKey := flag.String("tls-key", "", "Private key (PEM) of -tls-cert; must be outside the served directory")
 	insecureHTTP := flag.Bool("insecure-http", false, "Serve plain HTTP instead of HTTPS; allowed only on a loopback -host (for development and benchmarks)")
 	stateFile := flag.String("state", defaultStatePath(), "State file with the accounts and folder bindings; must be outside the served directory")
 	minPasswordLength := flag.Int("min-password-length", auth.DefaultMinPasswordLength, fmt.Sprintf("Fewest characters a password may have (%d to %d)", auth.LowestMinPasswordLength, auth.MaxPasswordBytes))
+	sessionIdle := flag.Duration("session-idle", auth.DefaultSessions.Idle, "Log a browser out after this long without a request")
+	sessionMax := flag.Duration("session-max", auth.DefaultSessions.Max, "Log a browser out this long after it logged in, however active it is")
+	reauthWindow := flag.Duration("reauth-window", auth.DefaultSessions.Reauth, "How long after entering their password an admin may change users and folder access")
 	verifyLog := flag.String("verify-audit", "", "Verify the integrity of this audit log file and exit")
 	flag.Parse()
 
 	if *verifyLog != "" {
 		return verifyAudit(*verifyLog)
-	}
-	if err := checkExposure(*host, *insecureNoAuth); err != nil {
-		return err
 	}
 	if err := checkTLSFlags(*host, *tlsCert, *tlsKey, *tlsDir, *insecureHTTP); err != nil {
 		return err
@@ -80,6 +79,10 @@ func run() error {
 		*tlsDir = ""
 	}
 	if err := checkMinLength(*minPasswordLength); err != nil {
+		return err
+	}
+	sessions := auth.SessionConfig{Idle: *sessionIdle, Max: *sessionMax, Reauth: *reauthWindow}
+	if err := checkSessions(sessions); err != nil {
 		return err
 	}
 	if *minFreeMB < 0 || *minFreeMB > math.MaxInt64>>20 {
@@ -103,6 +106,7 @@ func run() error {
 		TLSDir:           *tlsDir,
 		StateFile:        *stateFile,
 		MinPasswordLen:   *minPasswordLength,
+		Sessions:         sessions,
 	})
 	if err != nil {
 		return err
@@ -192,7 +196,8 @@ type config struct {
 	TLSDir          string
 
 	StateFile      string
-	MinPasswordLen int // auth.DefaultMinPasswordLength when 0
+	MinPasswordLen int                // auth.DefaultMinPasswordLength when 0
+	Sessions       auth.SessionConfig // auth.DefaultSessions when zero
 }
 
 type app struct {
@@ -316,11 +321,12 @@ func newApp(cfg config) (_ *app, err error) {
 	minPwLen := cmp.Or(cfg.MinPasswordLen, auth.DefaultMinPasswordLength)
 	files := fsops.New(sb, bus, fsops.WithSpace(ledger))
 	accounts := auth.New(auth.Config{
-		DB:      db,
-		Hasher:  auth.NewHasher(auth.DefaultParams, hashSlots, hashWait),
-		Policy:  auth.Policy{MinLength: minPwLen},
-		Folders: files,
-		Events:  bus,
+		DB:       db,
+		Hasher:   auth.NewHasher(auth.DefaultParams, hashSlots, hashWait),
+		Policy:   auth.Policy{MinLength: minPwLen},
+		Folders:  files,
+		Events:   bus,
+		Sessions: cfg.Sessions,
 	})
 	opts.Accounts = accounts
 	setupCode, err := accounts.StartSetup()
@@ -332,6 +338,10 @@ func newApp(cfg config) (_ *app, err error) {
 			log.Printf("WARNING: %s", w)
 		}
 	}
+	if err := accounts.Start(); err != nil {
+		return nil, fmt.Errorf("read the sessions: %w", err)
+	}
+	undo = append(undo, accounts.Close)
 
 	return &app{
 		Handler:      httpapi.New(files, webFS, opts),
@@ -376,6 +386,9 @@ func (a *app) Close(ctx context.Context) error {
 	if cerr := a.audit.Close(); err == nil {
 		err = cerr
 	}
+	if cerr := a.accounts.Close(); err == nil {
+		err = cerr
+	}
 	if cerr := a.state.Close(); err == nil {
 		err = cerr
 	}
@@ -401,15 +414,10 @@ func (a *app) logSpace() {
 	log.Printf("Free space: %.1f GiB on the served volume; uploads leave at least %d MiB free", float64(free)/(1<<30), a.minFree>>20)
 }
 
-func checkExposure(host string, insecureNoAuth bool) error {
-	if isLoopback(host) {
-		return nil
+func checkSessions(c auth.SessionConfig) error {
+	if c.Idle <= 0 || c.Max <= 0 || c.Reauth <= 0 {
+		return errors.New("-session-idle, -session-max and -reauth-window must be longer than 0")
 	}
-	if !insecureNoAuth {
-		return fmt.Errorf("refusing to listen on %q: there is no authentication yet, so anyone who can reach that address "+
-			"could read, change and delete every served file. Use the default -host localhost, or pass -insecure-no-auth to accept the risk", host)
-	}
-	log.Printf("WARNING: listening on %q WITHOUT AUTHENTICATION (-insecure-no-auth): anyone who can reach this port can read, change and delete the served files", host)
 	return nil
 }
 

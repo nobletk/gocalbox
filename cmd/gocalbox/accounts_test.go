@@ -330,14 +330,20 @@ func TestSecondServerOnOneStateFileFails(t *testing.T) {
 	}
 }
 
-func postSetup(t *testing.T, h http.Handler, body any) (int, string) {
+// postSetup returns the answer and the session cookie it set, if any.
+func postSetup(t *testing.T, h http.Handler, body any) (int, string, *http.Cookie) {
 	t.Helper()
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, "/api/setup", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	return rec.Code, rec.Body.String()
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == auth.SessionCookie {
+			return rec.Code, rec.Body.String(), c
+		}
+	}
+	return rec.Code, rec.Body.String(), nil
 }
 
 func TestSetupFromACleanStart(t *testing.T) {
@@ -356,15 +362,22 @@ func TestSetupFromACleanStart(t *testing.T) {
 	if c, body := get(t, a.Handler, "/api/status"); c != 200 || !strings.Contains(body, `"setupRequired":true`) {
 		t.Errorf("status = %d %s", c, body)
 	}
-	if c, body := postSetup(t, a.Handler, map[string]any{"code": "AAAAA", "username": "alice", "password": testPassword}); c != 403 || !strings.Contains(body, "setup_code_invalid") {
+	if c, body, _ := postSetup(t, a.Handler, map[string]any{"code": "AAAAA", "username": "alice", "password": testPassword}); c != 403 || !strings.Contains(body, "setup_code_invalid") {
 		t.Errorf("wrong code = %d %s", c, body)
 	}
-	c, body := postSetup(t, a.Handler, map[string]any{"code": auth.FormatCode(code), "username": "Alice", "password": testPassword})
-	if c != 201 || !strings.Contains(body, `"username":"alice"`) || !strings.Contains(body, `"home":"users/alice"`) {
+	c, body, cookie := postSetup(t, a.Handler, map[string]any{"code": auth.FormatCode(code), "username": "Alice", "password": testPassword})
+	if c != 201 || !strings.Contains(body, `"username":"alice"`) || !strings.Contains(body, `"home":"users/alice"`) || cookie == nil {
 		t.Fatalf("setup = %d %s", c, body)
 	}
-	if c, _ := get(t, a.Handler, "/api/files?path=users"); c != 200 {
-		t.Errorf("files after setup = %d", c)
+	if c, _ := get(t, a.Handler, "/api/files?path=users"); c != 401 {
+		t.Errorf("files after setup without the cookie = %d", c)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/files?path=users", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	a.Handler.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("files after setup = %d", rec.Code)
 	}
 	closeApp(t, a)
 
@@ -373,11 +386,14 @@ func TestSetupFromACleanStart(t *testing.T) {
 	for _, ev := range evs {
 		types = append(types, ev.Type)
 	}
-	if !slices.Equal(types, []events.Type{events.FolderCreated, events.FolderCreated, events.FolderCreated, events.AuthSetupCompleted}) {
+	if !slices.Equal(types, []events.Type{events.FolderCreated, events.FolderCreated, events.FolderCreated, events.AuthSetupCompleted, events.AuthLogin}) {
 		t.Errorf("audit events %v", types)
 	}
-	if last := evs[len(evs)-1]; last.Actor.Name != "alice" || !strings.HasPrefix(last.Actor.ID, "u-") {
-		t.Errorf("setup recorded as %+v", last.Actor)
+	if setup := evs[3]; setup.Actor.Name != "alice" || !strings.HasPrefix(setup.Actor.ID, "u-") {
+		t.Errorf("setup recorded as %+v", setup.Actor)
+	}
+	if login := evs[4]; login.Actor.Name != "alice" || len(login.Actor.Session) != 16 || login.Detail != "setup" {
+		t.Errorf("setup's login recorded as %+v", login)
 	}
 
 	b, err := newApp(cfg)

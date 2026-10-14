@@ -69,7 +69,7 @@ func newEnvOpts(t *testing.T, opts Options) *env {
 	t.Cleanup(func() { sb.Close() })
 	web := fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}
 	rec := &recorder{}
-	srv := httptest.NewServer(New(fsops.New(sb, rec), web, opts))
+	srv := httptest.NewServer(newTestHandler(fsops.New(sb, rec), web, opts))
 	t.Cleanup(srv.Close)
 	return &env{t: t, root: sb.Root(), outside: outside, srv: srv, rec: rec}
 }
@@ -579,7 +579,8 @@ func TestFailedRenameIsAuditedWithRequestIDAndActor(t *testing.T) {
 	if ev.Type != events.FileMoved || ev.Outcome != events.OutcomeNotFound || ev.Path != "dog4.jpg" || ev.Target != "dog3.jpg" {
 		t.Errorf("event = %+v", ev)
 	}
-	if ev.Actor.ID != events.AnonymousID || !strings.HasPrefix(ev.Actor.RemoteAddr, "127.0.0.1:") {
+	if ev.Actor.ID != tester.User.ID || ev.Actor.Name != "tester" || ev.Actor.Role != "admin" || ev.Actor.Session != tester.Session.ID ||
+		!strings.HasPrefix(ev.Actor.RemoteAddr, "127.0.0.1:") {
 		t.Errorf("actor = %+v", ev.Actor)
 	}
 

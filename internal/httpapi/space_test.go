@@ -41,7 +41,7 @@ func newFailingServer(t *testing.T, err error, opts ...Options) (*httptest.Serve
 	}
 	t.Cleanup(func() { sb.Close() })
 	svc := &failingService{FileService: fsops.New(sb, nil), err: err}
-	srv := httptest.NewServer(New(svc, fstest.MapFS{}, o))
+	srv := httptest.NewServer(newTestHandler(svc, fstest.MapFS{}, o))
 	t.Cleanup(srv.Close)
 	return srv, svc
 }

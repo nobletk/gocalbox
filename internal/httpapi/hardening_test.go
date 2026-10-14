@@ -264,7 +264,7 @@ func newSlowEnv(t *testing.T, opts Options) (*httptest.Server, *slowService, str
 	}
 	t.Cleanup(func() { sb.Close() })
 	svc := &slowService{FileService: fsops.New(sb, nil), started: make(chan struct{}), release: make(chan struct{})}
-	srv := httptest.NewServer(New(svc, fstest.MapFS{}, opts))
+	srv := httptest.NewServer(newTestHandler(svc, fstest.MapFS{}, opts))
 	t.Cleanup(srv.Close)
 	t.Cleanup(svc.free) // runs before srv.Close, which waits for the handler
 	return srv, svc, root

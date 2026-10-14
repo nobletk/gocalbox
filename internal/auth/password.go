@@ -95,6 +95,16 @@ func (h *Hasher) Verify(ctx context.Context, encoded, password string) (ok, reha
 	return ok, rehash, nil
 }
 
+// dummy is a hash of no password, checked for unknown usernames so that
+// their answer takes as long as a wrong password's.
+func (h *Hasher) dummy() string {
+	salt, key := make([]byte, saltLen), make([]byte, keyLen)
+	rand.Read(salt)
+	rand.Read(key)
+	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
+		argon2.Version, h.params.Memory, h.params.Time, h.params.Threads, b64.EncodeToString(salt), b64.EncodeToString(key))
+}
+
 func (h *Hasher) affordable(p Params) bool {
 	work := uint64(p.Memory) * uint64(p.Time)
 	ownWork := uint64(h.params.Memory) * uint64(h.params.Time)

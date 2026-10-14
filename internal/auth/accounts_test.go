@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,6 +29,18 @@ func (r *recorder) Publish(ev events.Event) {
 	r.mu.Unlock()
 }
 
+func (r *recorder) withDetail(substr string) []events.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []events.Event
+	for _, ev := range r.evs {
+		if strings.Contains(ev.Detail, substr) {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
 func (r *recorder) types() []events.Type {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -39,15 +52,40 @@ func (r *recorder) types() []events.Type {
 }
 
 type fixture struct {
-	acc  *Accounts
-	db   *state.DB
-	root string
-	rec  *recorder
+	acc   *Accounts
+	db    *state.DB
+	root  string
+	rec   *recorder
+	clock *clock
+}
+
+type clock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *clock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *clock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
 }
 
 const goodPassword = "a long enough passphrase"
 
 func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	return newFixtureWith(t, testParams, func(int) time.Duration { return 0 })
+}
+
+// newFixtureWith hashes with p, so that checks can be made to overlap, and
+// waits delay(n) after the nth failure.
+func newFixtureWith(t *testing.T, p Params, delay func(int) time.Duration) *fixture {
 	t.Helper()
 	base := t.TempDir()
 	root := filepath.Join(base, "root")
@@ -63,11 +101,18 @@ func newFixture(t *testing.T) *fixture {
 	}
 	t.Cleanup(func() { db.Close() })
 	rec := &recorder{}
+	clk := &clock{t: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
 	acc := New(Config{
-		DB: db, Hasher: NewHasher(testParams, 2, time.Second), Policy: Policy{MinLength: 15},
-		Folders: fsops.New(sb, rec), Events: rec,
+		DB: db, Hasher: NewHasher(p, 2, 5*time.Second), Policy: Policy{MinLength: 15},
+		Folders: fsops.New(sb, rec), Events: rec, Now: clk.now,
+		FailureDelay: delay,
+		OwnNetworks:  func() []netip.Prefix { return []netip.Prefix{netip.MustParsePrefix("2001:db8:1:2::/64")} },
 	})
-	return &fixture{acc: acc, db: db, root: sb.Root(), rec: rec}
+	if err := acc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { acc.Close() })
+	return &fixture{acc: acc, db: db, root: sb.Root(), rec: rec, clock: clk}
 }
 
 func (f *fixture) exists(rel string) bool {
@@ -95,12 +140,17 @@ func TestSetupCreatesAdminLayoutAndBindings(t *testing.T) {
 	f := newFixture(t)
 	code := f.startSetup(t)
 	actx := events.WithActor(ctx, events.Actor{ID: events.AnonymousID, RemoteAddr: "192.0.2.7:5000"})
-	me, err := f.acc.CompleteSetup(actx, SetupRequest{Code: FormatCode(code), Username: "Alice", Password: goodPassword})
+	grant, err := f.acc.CompleteSetup(actx, SetupRequest{Code: FormatCode(code), Username: "Alice", Password: goodPassword}, Client{Addr: "192.0.2.9:4000"})
+	me := grant.Me
 	if err != nil {
 		t.Fatal(err)
 	}
 	if me.Username != "alice" || me.Role != state.RoleAdmin || me.Home != "users/alice" || !strings.HasPrefix(me.ID, "u-") {
 		t.Errorf("me = %+v", me)
+	}
+	id, ok := f.acc.Authenticate(grant.Token)
+	if !ok || id.User.ID != me.ID || grant.Device == "" || me.ReauthUntil == nil {
+		t.Errorf("setup did not log the new admin in: %+v", grant)
 	}
 	if !slices.Equal(me.Bindings, []MeBinding{{"public", state.RoleContributor}, {"users/alice", state.RoleContributor}}) {
 		t.Errorf("me.Bindings = %+v", me.Bindings)
@@ -129,8 +179,11 @@ func TestSetupCreatesAdminLayoutAndBindings(t *testing.T) {
 			}
 		}
 	}
-	if got := f.rec.types(); !slices.Equal(got, []events.Type{events.FolderCreated, events.FolderCreated, events.FolderCreated, events.AuthSetupCompleted}) {
+	if got := f.rec.types(); !slices.Equal(got, []events.Type{events.FolderCreated, events.FolderCreated, events.FolderCreated, events.AuthSetupCompleted, events.AuthLogin}) {
 		t.Errorf("events %v", got)
+	}
+	if login := f.rec.evs[len(f.rec.evs)-1]; login.Actor.Session != id.Session.ID || login.Detail != "setup" || login.Outcome != events.OutcomeOK {
+		t.Errorf("setup's login event %+v", login)
 	}
 	for _, ev := range f.rec.evs {
 		if ev.Actor.ID != me.ID || ev.Actor.Name != "alice" || ev.Actor.RemoteAddr != "192.0.2.7:5000" {
@@ -138,7 +191,7 @@ func TestSetupCreatesAdminLayoutAndBindings(t *testing.T) {
 		}
 	}
 
-	if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "mallory", Password: goodPassword}); !errors.Is(err, ErrSetupDone) {
+	if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "mallory", Password: goodPassword}, Client{Addr: "192.0.2.9:4000"}); !errors.Is(err, ErrSetupDone) {
 		t.Errorf("second setup: %v", err)
 	}
 	if again, _ := f.acc.StartSetup(); again != "" {
@@ -158,7 +211,7 @@ func TestSetupRefusals(t *testing.T) {
 		{SetupRequest{Code: code, Username: "console", Password: goodPassword}, ErrUsernameTaken},
 		{SetupRequest{Code: code, Username: "alice", Password: "too short"}, &WeakPasswordError{}},
 	} {
-		_, err := f.acc.CompleteSetup(ctx, tc.req)
+		_, err := f.acc.CompleteSetup(ctx, tc.req, Client{Addr: "192.0.2.9:4000"})
 		var we *WeakPasswordError
 		if _, weak := tc.want.(*WeakPasswordError); weak && !errors.As(err, &we) || !weak && !errors.Is(err, tc.want) {
 			t.Errorf("%+v: %v", tc.req, err)
@@ -167,7 +220,7 @@ func TestSetupRefusals(t *testing.T) {
 	if !f.acc.SetupRequired() || f.exists("users") || len(f.rec.types()) != 0 {
 		t.Error("a refused setup changed something")
 	}
-	if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword}); err != nil {
+	if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword}, Client{Addr: "192.0.2.9:4000"}); err != nil {
 		t.Errorf("the code stopped working after refusals: %v", err)
 	}
 }
@@ -178,7 +231,7 @@ func TestSetupWithAnExistingLayout(t *testing.T) {
 	os.MkdirAll(filepath.Join(f.root, "public", "old"), 0o755)
 	os.MkdirAll(filepath.Join(f.root, "users"), 0o755)
 
-	_, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword})
+	_, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword}, Client{Addr: "192.0.2.9:4000"})
 	var le *LayoutExistsError
 	if !errors.As(err, &le) || !slices.Equal(le.Paths, []string{"users", "public"}) {
 		t.Fatalf("err = %v", err)
@@ -188,11 +241,11 @@ func TestSetupWithAnExistingLayout(t *testing.T) {
 	}
 
 	os.MkdirAll(filepath.Join(f.root, "users", "alice", "stuff"), 0o755)
-	_, err = f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword, UseExisting: true})
+	_, err = f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword, UseExisting: true}, Client{Addr: "192.0.2.9:4000"})
 	if !errors.Is(err, ErrHomeExists) {
 		t.Fatalf("non-empty home: %v", err)
 	}
-	if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "bob", Password: goodPassword, UseExisting: true}); err != nil {
+	if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "bob", Password: goodPassword, UseExisting: true}, Client{Addr: "192.0.2.9:4000"}); err != nil {
 		t.Fatal(err)
 	}
 	if !f.exists("public/old") || !f.exists("users/bob") {
@@ -207,7 +260,7 @@ func TestConcurrentSetupsCreateOneAdmin(t *testing.T) {
 	results := make([]error, 8)
 	for i := range results {
 		wg.Go(func() {
-			_, results[i] = f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "admin" + string(rune('a'+i)), Password: goodPassword})
+			_, results[i] = f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "admin" + string(rune('a'+i)), Password: goodPassword}, Client{Addr: "192.0.2.9:4000"})
 		})
 	}
 	wg.Wait()
@@ -282,7 +335,8 @@ func TestSetupRecordsHomesOfConsoleUsersAsTheServer(t *testing.T) {
 	}
 	code := f.startSetup(t)
 	actx := events.WithRequestID(events.WithActor(ctx, events.Actor{ID: events.AnonymousID, RemoteAddr: "192.0.2.7:5000"}), "req-1")
-	me, err := f.acc.CompleteSetup(actx, SetupRequest{Code: code, Username: "alice", Password: goodPassword})
+	grant, err := f.acc.CompleteSetup(actx, SetupRequest{Code: code, Username: "alice", Password: goodPassword}, Client{Addr: "192.0.2.9:4000"})
+	me := grant.Me
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +431,7 @@ func TestSetupHonoursAContextDeadlineWhileHashing(t *testing.T) {
 	f.acc.hasher.slots <- struct{}{}
 	dctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
 	defer cancel()
-	if _, err := f.acc.CompleteSetup(dctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword}); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := f.acc.CompleteSetup(dctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword}, Client{Addr: "192.0.2.9:4000"}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v", err)
 	}
 }
@@ -388,7 +442,7 @@ func TestSetupChecksForAnAdminAgainWhenCommitting(t *testing.T) {
 	if _, err := f.acc.CreateUser(events.WithActor(ctx, events.Actor{ID: events.ConsoleID}), "early", state.RoleAdmin, goodPassword); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword}); !errors.Is(err, ErrSetupDone) {
+	if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword}, Client{Addr: "192.0.2.9:4000"}); !errors.Is(err, ErrSetupDone) {
 		t.Fatalf("err = %v", err)
 	}
 	if f.exists("users") || f.exists("public") {
@@ -399,7 +453,7 @@ func TestSetupChecksForAnAdminAgainWhenCommitting(t *testing.T) {
 func TestEnsureLayoutRecreatesADeletedPublicFolder(t *testing.T) {
 	f := newFixture(t)
 	code := f.startSetup(t)
-	if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword}); err != nil {
+	if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: code, Username: "alice", Password: goodPassword}, Client{Addr: "192.0.2.9:4000"}); err != nil {
 		t.Fatal(err)
 	}
 	os.Remove(filepath.Join(f.root, "public"))

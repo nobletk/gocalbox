@@ -20,6 +20,9 @@ func securityHeaders(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
+		if p := r.URL.Path; p == "/api" || strings.HasPrefix(p, "/api/") {
+			h.Set("Cache-Control", "no-store")
+		}
 		if isResourcePath(r.URL.Path) {
 			h.Set("Cross-Origin-Resource-Policy", "same-origin")
 			h.Set("X-Frame-Options", "SAMEORIGIN")

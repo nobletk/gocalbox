@@ -27,15 +27,9 @@ var windowsDevices = []string{
 
 var reservedNames = []string{events.AnonymousID, events.ConsoleID, events.SystemID}
 
-// NormalizeUsername lowercases ASCII letters and checks the result. Only
-// ASCII is lowered: Unicode case mapping would turn the Kelvin sign into "k".
+// NormalizeUsername lowercases ASCII letters and checks the result.
 func NormalizeUsername(s string) (string, error) {
-	name := strings.Map(func(r rune) rune {
-		if 'A' <= r && r <= 'Z' {
-			return r + ('a' - 'A')
-		}
-		return r
-	}, s)
+	name := asciiLower(s)
 	if !usernamePattern.MatchString(name) {
 		return "", ErrInvalidUsername
 	}
@@ -48,6 +42,17 @@ func NormalizeUsername(s string) (string, error) {
 		return "", ErrUsernameTaken
 	}
 	return name, nil
+}
+
+// asciiLower lowers ASCII letters only: Unicode case mapping would turn the
+// Kelvin sign into "k".
+func asciiLower(s string) string {
+	return strings.Map(func(r rune) rune {
+		if 'A' <= r && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, s)
 }
 
 // HomeOf is the home folder of a username, relative to the served root.

@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,7 +45,8 @@ func post(t *testing.T, h http.Handler, path, body string) int {
 
 // seedAdmin gives a new state file an admin, "admin" with the password
 // testPassword, and creates the folder layout setup would, so a server
-// starts outside setup mode and creates nothing at start-up.
+// starts outside setup mode and creates nothing at start-up. The admin is
+// logged in, as the session in testSessions.
 func seedAdmin(t *testing.T, statePath, root string) state.User {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
@@ -72,7 +77,70 @@ func seedAdmin(t *testing.T, statePath, root string) state.User {
 			t.Fatal(err)
 		}
 	}
+	storeSession(t, db, statePath, admin)
 	return admin
+}
+
+// testSessions maps a state file to the token of a session seedSession
+// stored in it.
+var testSessions sync.Map
+
+// seedSession logs username in by storing a session in the state file,
+// without the cost of a password check.
+func seedSession(t *testing.T, statePath, username string) {
+	t.Helper()
+	db, err := state.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var u state.User
+	if err := db.View(func(tx *state.Tx) error { u, err = tx.UserByName(username); return err }); err != nil {
+		t.Fatal(err)
+	}
+	storeSession(t, db, statePath, u)
+}
+
+func storeSession(t *testing.T, db *state.DB, statePath string, u state.User) {
+	t.Helper()
+	var b [32]byte
+	rand.Read(b[:])
+	token := base64.RawURLEncoding.EncodeToString(b[:])
+	key := sha256.Sum256([]byte(token))
+	now := time.Now().UTC()
+	err := db.Update(func(tx *state.Tx) error {
+		return tx.PutSession(key[:], state.Session{ID: state.NewID(), User: u.ID, Created: now, LastSeen: now, AuthTime: now, Epoch: u.Epoch})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testSessions.Store(statePath, token)
+}
+
+func sessionCookie(statePath string) *http.Cookie {
+	token, _ := testSessions.Load(statePath)
+	tok, _ := token.(string)
+	return &http.Cookie{Name: auth.SessionCookie, Value: tok}
+}
+
+// openTestApp is newApp with a handler that sends the session of cfg's
+// state file with every request that has no session cookie.
+func openTestApp(t *testing.T, cfg config) (*app, error) {
+	t.Helper()
+	a, err := newApp(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := testSessions.Load(cfg.StateFile); ok {
+		h, c := a.Handler, sessionCookie(cfg.StateFile)
+		a.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, err := r.Cookie(auth.SessionCookie); err != nil {
+				r.AddCookie(c)
+			}
+			h.ServeHTTP(w, r)
+		})
+	}
+	return a, nil
 }
 
 const testPassword = "test password of some length"
@@ -104,7 +172,7 @@ func newTestApp(t *testing.T, mutate ...func(*config)) (*app, config) {
 	for _, m := range mutate {
 		m(&cfg)
 	}
-	a, err := newApp(cfg)
+	a, err := openTestApp(t, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +324,7 @@ func TestAuditLogContinuesAcrossRestarts(t *testing.T) {
 	post(t, a.Handler, "/api/fs/delete", `{"path":"a.txt"}`)
 	closeApp(t, a)
 
-	b, err := newApp(cfg)
+	b, err := openTestApp(t, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,18 +446,39 @@ func TestHostAllowlist(t *testing.T) {
 	}
 }
 
-func TestCheckExposure(t *testing.T) {
-	for _, host := range []string{"localhost", "LocalHost", "127.0.0.1", "127.0.0.2", "::1", "[::1]"} {
-		if err := checkExposure(host, false); err != nil {
-			t.Errorf("%q refused: %v", host, err)
-		}
+func TestCloseRecordsWhenSessionsWereLastUsed(t *testing.T) {
+	a, cfg := newTestApp(t)
+	before := time.Now().UTC()
+	if code, _ := get(t, a.Handler, "/api/files?path="); code != 200 {
+		t.Fatalf("listing = %d", code)
 	}
-	for _, host := range []string{"0.0.0.0", "::", "", "192.168.1.5", "myhost.lan", "localhost.example"} {
-		if err := checkExposure(host, false); err == nil || !strings.Contains(err.Error(), "-insecure-no-auth") {
-			t.Errorf("%q allowed without -insecure-no-auth: %v", host, err)
-		}
-		if err := checkExposure(host, true); err != nil {
-			t.Errorf("%q refused despite -insecure-no-auth: %v", host, err)
+	closeApp(t, a)
+	db, err := state.Open(cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.View(func(tx *state.Tx) error {
+		return tx.Sessions(func(_ []byte, s state.Session) error {
+			if s.LastSeen.Before(before) {
+				t.Errorf("lastSeen %v, the request came at %v or later", s.LastSeen, before)
+			}
+			return nil
+		})
+	})
+}
+
+func TestCheckSessions(t *testing.T) {
+	if err := checkSessions(auth.DefaultSessions); err != nil {
+		t.Errorf("defaults refused: %v", err)
+	}
+	for _, c := range []auth.SessionConfig{
+		{Idle: 0, Max: time.Hour, Reauth: time.Minute},
+		{Idle: time.Hour, Max: -time.Hour, Reauth: time.Minute},
+		{Idle: time.Hour, Max: time.Hour, Reauth: 0},
+	} {
+		if err := checkSessions(c); err == nil {
+			t.Errorf("%+v accepted", c)
 		}
 	}
 }

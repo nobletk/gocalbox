@@ -1,10 +1,12 @@
 package auth
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -47,24 +49,46 @@ type Publisher interface {
 }
 
 type Config struct {
-	DB      *state.DB
-	Hasher  *Hasher
-	Policy  Policy
-	Folders Folders // nil where no folders are created, as in the users command
-	Events  Publisher
-	Now     func() time.Time
+	DB       *state.DB
+	Hasher   *Hasher
+	Policy   Policy
+	Folders  Folders // nil where no folders are created, as in the users command
+	Events   Publisher
+	Now      func() time.Time
+	Sessions SessionConfig // zero fields take DefaultSessions' values
+
+	// FailureDelay is how long the answer to the nth consecutive failed
+	// password of an account waits; up to 5 s when nil.
+	FailureDelay func(n int) time.Duration
+	// OwnNetworks lists the /64s of the server's own IPv6 networks; read from
+	// the interfaces when nil.
+	OwnNetworks func() []netip.Prefix
 }
 
 type Accounts struct {
-	db      *state.DB
-	hasher  *Hasher
-	policy  Policy
-	folders Folders
-	events  Publisher
-	now     func() time.Time
+	db           *state.DB
+	hasher       *Hasher
+	policy       Policy
+	folders      Folders
+	events       Publisher
+	now          func() time.Time
+	sessionCfg   SessionConfig
+	failureDelay func(int) time.Duration
 
 	mu    sync.Mutex // serializes setup and layout changes
 	setup atomic.Pointer[SetupCode]
+
+	// users is rebuilt after every change, so each request reads the
+	// account without a transaction. usersMu holds a change and its rebuild
+	// together, so an older rebuild cannot replace a newer one.
+	usersMu   sync.Mutex
+	users     atomic.Pointer[map[string]state.User]
+	sessions  *sessionStore
+	throttle  *throttle
+	deviceKey []byte
+	dummyHash string
+
+	stop, stopped chan struct{}
 }
 
 func New(c Config) *Accounts {
@@ -72,15 +96,61 @@ func New(c Config) *Accounts {
 	if now == nil {
 		now = time.Now
 	}
-	return &Accounts{db: c.DB, hasher: c.Hasher, policy: c.Policy, folders: c.Folders, events: c.Events, now: now}
+	a := &Accounts{
+		db: c.DB, hasher: c.Hasher, policy: c.Policy, folders: c.Folders, events: c.Events, now: now,
+		sessionCfg: SessionConfig{
+			Idle:   cmp.Or(c.Sessions.Idle, DefaultSessions.Idle),
+			Max:    cmp.Or(c.Sessions.Max, DefaultSessions.Max),
+			Reauth: cmp.Or(c.Sessions.Reauth, DefaultSessions.Reauth),
+		},
+		failureDelay: c.FailureDelay, sessions: newSessionStore(),
+	}
+	if a.failureDelay == nil {
+		a.failureDelay = defaultFailureDelay
+	}
+	a.throttle = newThrottle(a.wallNow, c.OwnNetworks)
+	if c.Hasher != nil {
+		a.dummyHash = c.Hasher.dummy()
+	}
+	a.users.Store(&map[string]state.User{})
+	return a
+}
+
+// update runs fn in a write transaction and then rebuilds the users snapshot.
+func (a *Accounts) update(fn func(*state.Tx) error) error {
+	a.usersMu.Lock()
+	defer a.usersMu.Unlock()
+	if err := a.db.Update(fn); err != nil {
+		return err
+	}
+	if err := a.reloadUsers(); err != nil {
+		log.Printf("accounts: cannot reload the users after a change: %v", err)
+	}
+	return nil
+}
+
+func (a *Accounts) reloadUsers() error {
+	return a.db.View(func(tx *state.Tx) error {
+		list, err := tx.Users()
+		if err != nil {
+			return err
+		}
+		m := make(map[string]state.User, len(list))
+		for _, u := range list {
+			m[u.ID] = u
+		}
+		a.users.Store(&m)
+		return nil
+	})
 }
 
 type Me struct {
-	ID       string      `json:"id"`
-	Username string      `json:"username"`
-	Role     state.Role  `json:"role"`
-	Home     string      `json:"home,omitempty"`
-	Bindings []MeBinding `json:"bindings"`
+	ID          string      `json:"id"`
+	Username    string      `json:"username"`
+	Role        state.Role  `json:"role"`
+	Home        string      `json:"home,omitempty"`
+	Bindings    []MeBinding `json:"bindings"`
+	ReauthUntil *time.Time  `json:"reauthUntil,omitempty"`
 }
 
 type MeBinding struct {
@@ -114,33 +184,39 @@ func (a *Accounts) StartSetup() (string, error) {
 
 func (a *Accounts) SetupRequired() bool { return a.setup.Load() != nil }
 
-// CompleteSetup creates the first admin, the folder layout and its bindings.
-// The code is checked before anything else, so a wrong one costs no hashing.
+// CompleteSetup creates the first admin, the folder layout and its bindings,
+// and logs the admin in. The code is checked before anything else, under the
+// address's back-off for codes and tokens, so a wrong one costs no hashing.
 // A request that fails leaves the code valid.
-func (a *Accounts) CompleteSetup(ctx context.Context, req SetupRequest) (Me, error) {
+func (a *Accounts) CompleteSetup(ctx context.Context, req SetupRequest, c Client) (Grant, error) {
 	code := a.setup.Load()
 	if code == nil {
-		return Me{}, ErrSetupDone
+		return Grant{}, ErrSetupDone
+	}
+	addr := a.throttle.group(c.Addr)
+	if wait := a.throttle.wait(codeKey(addr)); wait > 0 {
+		return Grant{}, &TooManyAttemptsError{RetryAfter: wait}
 	}
 	if !code.Matches(req.Code) {
-		return Me{}, ErrSetupCodeInvalid
+		a.throttle.fail(codeKey(addr))
+		return Grant{}, ErrSetupCodeInvalid
 	}
 	name, err := NormalizeUsername(req.Username)
 	if err != nil {
-		return Me{}, err
+		return Grant{}, err
 	}
 	if err := a.policy.Check(name, req.Password); err != nil {
-		return Me{}, err
+		return Grant{}, err
 	}
 	hash, err := a.hasher.Hash(ctx, req.Password)
 	if err != nil {
-		return Me{}, err
+		return Grant{}, err
 	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.setup.Load() != code {
-		return Me{}, ErrSetupDone
+		return Grant{}, ErrSetupDone
 	}
 	now := a.now().UTC()
 	user := state.User{
@@ -158,7 +234,7 @@ func (a *Accounts) CompleteSetup(ctx context.Context, req SetupRequest) (Me, err
 		{Path: home, Detail: "home", IfExists: fsops.TakeOverEmpty},
 		{Path: publicFolder, Detail: "layout", IfExists: layout},
 	}, func() error {
-		return a.db.Update(func(tx *state.Tx) error {
+		return a.update(func(tx *state.Tx) error {
 			if ok, err := tx.HasEnabledAdmin(); err != nil || ok {
 				return orElse(err, ErrSetupDone)
 			}
@@ -182,15 +258,25 @@ func (a *Accounts) CompleteSetup(ctx context.Context, req SetupRequest) (Me, err
 		})
 	})
 	if err != nil {
-		return Me{}, folderError(err, home)
+		return Grant{}, folderError(err, home)
 	}
 	a.setup.Store(nil)
+	a.throttle.reset(codeKey(addr))
 	a.publish(ctx, events.Event{Type: events.AuthSetupCompleted, Path: name, Detail: "id=" + user.ID})
 
 	for _, w := range a.ensureLayout(events.WithActor(ctx, events.Actor{ID: events.SystemID})) {
 		log.Printf("WARNING: %s", w)
 	}
-	return a.Me(user.ID)
+	grant, e, ended, err := a.startSession(user, c)
+	if err != nil {
+		return Grant{}, fmt.Errorf("the admin %s was created, but logging in failed: %w", name, err)
+	}
+	actor := events.ActorFrom(ctx)
+	actor.Session = e.rec.ID
+	ctx = events.WithActor(ctx, actor)
+	a.publish(ctx, events.Event{Type: events.AuthLogin, Path: name, Detail: "setup"})
+	a.publishEnded(ctx, ended)
+	return grant, nil
 }
 
 func orElse(err, otherwise error) error {
@@ -250,7 +336,7 @@ func (a *Accounts) ensureLayout(ctx context.Context) []string {
 		}
 	} else if hasAdmin {
 		err := a.folders.Provision(ctx, []fsops.Folder{{Path: publicFolder, Detail: "layout", IfExists: fsops.Refuse}}, func() error {
-			return a.db.Update(func(tx *state.Tx) error { return tx.PutBinding(publicBinding(events.SystemID, now)) })
+			return a.update(func(tx *state.Tx) error { return tx.PutBinding(publicBinding(events.SystemID, now)) })
 		})
 		var ce *fsops.ConflictError
 		switch {
@@ -279,7 +365,7 @@ func (a *Accounts) ensureLayout(ctx context.Context) []string {
 				{Path: usersFolder, Detail: "layout", IfExists: fsops.Reuse},
 				{Path: home, Detail: "home", IfExists: fsops.TakeOverEmpty},
 			}, func() error {
-				return a.db.Update(func(tx *state.Tx) error {
+				return a.update(func(tx *state.Tx) error {
 					current, err := tx.Bindings()
 					if err != nil {
 						return err
@@ -325,7 +411,7 @@ func (a *Accounts) CreateUser(ctx context.Context, username string, role state.R
 		ID: state.NewUserID(), Username: name, Role: role, Hash: hash,
 		CreatedAt: now, CreatedBy: events.ActorFrom(ctx).ID, PasswordChangedAt: now,
 	}
-	if err := a.db.Update(func(tx *state.Tx) error { return tx.CreateUser(u) }); err != nil {
+	if err := a.update(func(tx *state.Tx) error { return tx.CreateUser(u) }); err != nil {
 		return state.User{}, err
 	}
 	a.publish(ctx, events.Event{Type: events.UserCreated, Path: name, Detail: fmt.Sprintf("id=%s role=%s", u.ID, role)})
@@ -352,7 +438,7 @@ func (a *Accounts) SetPassword(ctx context.Context, username, password string) (
 	if err != nil {
 		return u, err
 	}
-	err = a.db.Update(func(tx *state.Tx) error {
+	err = a.update(func(tx *state.Tx) error {
 		current, err := tx.User(u.ID)
 		if err != nil {
 			return err
@@ -360,6 +446,7 @@ func (a *Accounts) SetPassword(ctx context.Context, username, password string) (
 		u = current
 		u.Hash, u.Epoch, u.PasswordChangedAt = hash, u.Epoch+1, a.now().UTC()
 		u.Failures, u.PasswordDisabled = 0, false
+		a.throttle.resetAccount(u.ID)
 		return tx.UpdateUser(u)
 	})
 	if err != nil {
@@ -367,6 +454,23 @@ func (a *Accounts) SetPassword(ctx context.Context, username, password string) (
 	}
 	a.publish(ctx, events.Event{Type: events.AuthPasswordChanged, Path: u.Username, Detail: "id=" + u.ID})
 	return u, nil
+}
+
+// MeFor describes the user of a session, with the end of its window for
+// admin changes.
+func (a *Accounts) MeFor(id Identity) Me {
+	return a.meFor(id.User, id.Session)
+}
+
+func (a *Accounts) meFor(u state.User, s state.Session) Me {
+	me, err := a.Me(u.ID)
+	if err != nil {
+		log.Printf("accounts: cannot read the bindings of %s: %v", u.Username, err)
+		me = Me{ID: u.ID, Username: u.Username, Role: u.Role, Bindings: []MeBinding{}}
+	}
+	until := s.AuthTime.Add(a.sessionCfg.Reauth)
+	me.ReauthUntil = &until
+	return me
 }
 
 func (a *Accounts) Me(id string) (Me, error) {
@@ -422,6 +526,6 @@ func (a *Accounts) publish(ctx context.Context, ev events.Event) {
 	}
 	ev.Actor = events.ActorFrom(ctx)
 	ev.RequestID = events.RequestIDFrom(ctx)
-	ev.Outcome = events.OutcomeOK
+	ev.Outcome = cmp.Or(ev.Outcome, events.OutcomeOK)
 	a.events.Publish(ev)
 }

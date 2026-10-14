@@ -69,7 +69,7 @@ func (a *app) logSetup(listenHost, port string) {
 	fragment := "/#setup=" + code
 	local, other := setupAddresses(listenHost, port, a.AllowedHosts, a.TLS)
 
-	log.Printf("SETUP: There is no admin account yet. Until there is, every file and API request is answered with 503 setup_required.")
+	log.Printf("SETUP: There is no admin account yet. Until there is, files and the API answer 503 setup_required, except setup, status, login and the session routes.")
 	log.Printf("SETUP: One-time setup code: %s (valid until it is used or the server stops)", auth.FormatCode(code))
 	if local != "" {
 		log.Printf("SETUP: On this machine, open %s%s", local, fragment)
