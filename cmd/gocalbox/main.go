@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -13,26 +14,36 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/nobletk/gocalbox/internal/audit"
+	"github.com/nobletk/gocalbox/internal/auth"
 	"github.com/nobletk/gocalbox/internal/events"
 	"github.com/nobletk/gocalbox/internal/fsops"
 	"github.com/nobletk/gocalbox/internal/httpapi"
 	"github.com/nobletk/gocalbox/internal/sandbox"
 	"github.com/nobletk/gocalbox/internal/space"
+	"github.com/nobletk/gocalbox/internal/state"
 	"github.com/nobletk/gocalbox/web"
 )
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "users" || os.Args[1] == "state") {
+		os.Exit(command(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	}
 	if err := run(); err != nil {
 		log.Fatalf("Fatal Error: %v", err)
 	}
 }
 
 func run() error {
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage:\n  gocalbox [flags]\n%s\nFlags:\n", commandsUsage)
+		flag.PrintDefaults()
+	}
 	host := flag.String("host", "localhost", "Address to listen on (use 0.0.0.0 to expose the server to the network)")
 	port := flag.String("port", "8080", "Port to run the server on")
 	rootDir := flag.String("root", ".", "The local directory to sandbox and serve")
@@ -51,6 +62,8 @@ func run() error {
 	tlsCert := flag.String("tls-cert", "", "HTTPS certificate chain (PEM) to use instead of one from the local CA, reloaded when the file changes; needs -tls-key")
 	tlsKey := flag.String("tls-key", "", "Private key (PEM) of -tls-cert; must be outside the served directory")
 	insecureHTTP := flag.Bool("insecure-http", false, "Serve plain HTTP instead of HTTPS; allowed only on a loopback -host (for development and benchmarks)")
+	stateFile := flag.String("state", defaultStatePath(), "State file with the accounts and folder bindings; must be outside the served directory")
+	minPasswordLength := flag.Int("min-password-length", auth.DefaultMinPasswordLength, fmt.Sprintf("Fewest characters a password may have (%d to %d)", auth.LowestMinPasswordLength, auth.MaxPasswordBytes))
 	verifyLog := flag.String("verify-audit", "", "Verify the integrity of this audit log file and exit")
 	flag.Parse()
 
@@ -65,6 +78,9 @@ func run() error {
 	}
 	if *insecureHTTP {
 		*tlsDir = ""
+	}
+	if err := checkMinLength(*minPasswordLength); err != nil {
+		return err
 	}
 	if *minFreeMB < 0 || *minFreeMB > math.MaxInt64>>20 {
 		return fmt.Errorf("-min-free-mb must be between 0 and %d, got %d", int64(math.MaxInt64>>20), *minFreeMB)
@@ -85,6 +101,8 @@ func run() error {
 		TLSCert:          *tlsCert,
 		TLSKey:           *tlsKey,
 		TLSDir:           *tlsDir,
+		StateFile:        *stateFile,
+		MinPasswordLen:   *minPasswordLength,
 	})
 	if err != nil {
 		return err
@@ -137,8 +155,10 @@ func run() error {
 	log.Printf("Sandboxing directory: %s", a.Root)
 	log.Printf("Accepted host names: %s", strings.Join(a.AllowedHosts, ", "))
 	log.Printf("Audit log: %s (%d existing records)", a.AuditPath, a.audit.Records())
+	log.Printf("State file: %s", a.StatePath)
 	a.logSpace()
 	a.logTLS(caURL(*host, boundPort, a.AllowedHosts))
+	a.logSetup(*host, boundPort)
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server crashed: %w", err)
@@ -170,6 +190,9 @@ type config struct {
 	// CA in TLSDir. With neither, the server speaks plain HTTP.
 	TLSCert, TLSKey string
 	TLSDir          string
+
+	StateFile      string
+	MinPasswordLen int // auth.DefaultMinPasswordLength when 0
 }
 
 type app struct {
@@ -178,8 +201,13 @@ type app struct {
 	AuditPath    string
 	AllowedHosts []string
 	TLS          *tlsSetup // nil for plain HTTP
+	StatePath    string
 
 	sb        *sandbox.Sandbox
+	state     *state.DB
+	accounts  *auth.Accounts
+	setupCode string // shown once on the console, then cleared
+	minPwLen  int
 	bus       *events.Bus
 	coalescer *audit.Coalescer
 	audit     *audit.Writer
@@ -190,34 +218,55 @@ type app struct {
 	minFree   int64
 }
 
-func newApp(cfg config) (*app, error) {
+func newApp(cfg config) (_ *app, err error) {
+	var undo []func() error
+	defer func() {
+		if err != nil {
+			for _, f := range slices.Backward(undo) {
+				f()
+			}
+		}
+	}()
+
 	sb, err := sandbox.New(cfg.RootDir)
 	if err != nil {
 		return nil, fmt.Errorf("invalid root directory: %w", err)
 	}
+	undo = append(undo, sb.Close)
 	auditPath, err := audit.EnsureOutside(sb.Root(), cfg.AuditLog)
 	if err != nil {
-		sb.Close()
 		return nil, err
 	}
 	auditWriter, err := audit.Open(auditPath)
+	if errors.Is(err, audit.ErrLocked) {
+		return nil, fmt.Errorf("audit log %s is in use by another gocalbox process, a server or a users command; stop it, or give each server its own -audit-log", auditPath)
+	}
 	if err != nil {
-		sb.Close()
 		return nil, err
 	}
+	undo = append(undo, auditWriter.Close)
+	statePath, err := prepareStateFile(sb.Root(), cfg.StateFile)
+	if err != nil {
+		return nil, err
+	}
+	db, err := state.Open(statePath)
+	if errors.Is(err, state.ErrLocked) {
+		return nil, fmt.Errorf("state file %s is in use by another gocalbox process, a server or a users command; stop it, or give each server its own -state", statePath)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("state file %s: %w", statePath, err)
+	}
+	undo = append(undo, db.Close)
 	// After the audit log checks, so a start they refuse creates no CA.
 	tlsSetup, err := setupTLS(sb.Root(), cfg)
 	if err != nil {
-		auditWriter.Close()
-		sb.Close()
 		return nil, err
 	}
 	volume, err := sb.OSRoot().Open(".")
 	if err != nil {
-		auditWriter.Close()
-		sb.Close()
 		return nil, fmt.Errorf("open root directory: %w", err)
 	}
+	undo = append(undo, volume.Close)
 	var ledger *space.Ledger
 	_, spaceErr := space.Free(volume)
 	if spaceErr == nil {
@@ -229,9 +278,11 @@ func newApp(cfg config) (*app, error) {
 	if cfg.AuditRangeWindow > 0 {
 		coalescer = audit.NewCoalescer(auditWriter, cfg.AuditRangeWindow)
 		auditHandler = coalescer.HandleBatch
+		undo = append(undo, func() error { coalescer.Close(); return nil })
 	}
 
 	bus := events.New()
+	undo = append(undo, func() error { return bus.Close(context.Background()) })
 	bus.SubscribeBatch("audit", auditHandler, events.Options{
 		Mode:   events.Block,
 		Buffer: 1024,
@@ -262,13 +313,38 @@ func newApp(cfg config) (*app, error) {
 		}
 	}
 
+	minPwLen := cmp.Or(cfg.MinPasswordLen, auth.DefaultMinPasswordLength)
+	files := fsops.New(sb, bus, fsops.WithSpace(ledger))
+	accounts := auth.New(auth.Config{
+		DB:      db,
+		Hasher:  auth.NewHasher(auth.DefaultParams, hashSlots, hashWait),
+		Policy:  auth.Policy{MinLength: minPwLen},
+		Folders: files,
+		Events:  bus,
+	})
+	opts.Accounts = accounts
+	setupCode, err := accounts.StartSetup()
+	if err != nil {
+		return nil, fmt.Errorf("read the accounts: %w", err)
+	}
+	if setupCode == "" {
+		for _, w := range accounts.EnsureLayout(context.Background()) {
+			log.Printf("WARNING: %s", w)
+		}
+	}
+
 	return &app{
-		Handler:      httpapi.New(fsops.New(sb, bus, fsops.WithSpace(ledger)), webFS, opts),
+		Handler:      httpapi.New(files, webFS, opts),
 		Root:         sb.Root(),
 		AuditPath:    auditPath,
 		AllowedHosts: cfg.AllowedHosts,
 		TLS:          tlsSetup,
+		StatePath:    statePath,
 		sb:           sb,
+		state:        db,
+		accounts:     accounts,
+		setupCode:    setupCode,
+		minPwLen:     minPwLen,
 		bus:          bus,
 		coalescer:    coalescer,
 		audit:        auditWriter,
@@ -279,6 +355,11 @@ func newApp(cfg config) (*app, error) {
 		minFree:      cfg.MinFreeBytes,
 	}, nil
 }
+
+const (
+	hashSlots = 2
+	hashWait  = 5 * time.Second
+)
 
 func (a *app) Close(ctx context.Context) error {
 	if left, err := a.inflight.Drain(ctx); err != nil {
@@ -293,6 +374,9 @@ func (a *app) Close(ctx context.Context) error {
 		a.coalescer.Close()
 	}
 	if cerr := a.audit.Close(); err == nil {
+		err = cerr
+	}
+	if cerr := a.state.Close(); err == nil {
 		err = cerr
 	}
 	if cerr := a.volume.Close(); err == nil {
@@ -399,6 +483,13 @@ func defaultTLSDir() string {
 		return filepath.Join(dir, "gocalbox", "tls")
 	}
 	return "gocalbox-tls"
+}
+
+func defaultStatePath() string {
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "gocalbox", "state.db")
+	}
+	return "gocalbox-state.db"
 }
 
 func defaultAuditPath() string {

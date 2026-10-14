@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -96,6 +97,7 @@ type liveServer struct {
 	root      string
 	auditPath string
 	tlsDir    string
+	statePath string
 	done      chan error
 
 	// tlsConfig trusts the server's certificate; nil with -insecure-http.
@@ -141,13 +143,20 @@ func certPool(path string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
-// startServer runs the binary on a free port with a fresh root, audit log and
-// local CA, and waits until it answers over HTTPS (HTTP/2, like a browser).
-// With -insecure-http it uses plain HTTP; with -tls-cert it trusts that file.
+// startServer runs the binary on a free port with a fresh root, audit log,
+// local CA and state file with an admin, and waits until it answers over
+// HTTPS (HTTP/2, like a browser). With -insecure-http it uses plain HTTP;
+// with -tls-cert it trusts that file.
 func startServer(t *testing.T, extraArgs ...string) *liveServer {
 	t.Helper()
-	bin := binary(t)
+	s := newLiveServer(t)
+	seedAdmin(t, s.statePath, s.root)
+	s.start(extraArgs...)
+	return s
+}
 
+func newLiveServer(t *testing.T) *liveServer {
+	t.Helper()
 	base := t.TempDir()
 	s := &liveServer{
 		t:         t,
@@ -155,11 +164,19 @@ func startServer(t *testing.T, extraArgs ...string) *liveServer {
 		root:      filepath.Join(base, "root"),
 		auditPath: filepath.Join(base, "audit", "audit.jsonl"),
 		tlsDir:    filepath.Join(base, "tls"),
+		statePath: filepath.Join(base, "state", "state.db"),
 		done:      make(chan error, 1),
 	}
 	if err := os.Mkdir(s.root, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	return s
+}
+
+func (s *liveServer) start(extraArgs ...string) {
+	t := s.t
+	t.Helper()
+	bin := binary(t)
 	port := freePort(t)
 	s.addr = fmt.Sprintf("127.0.0.1:%d", port)
 	trusted := filepath.Join(s.tlsDir, "ca.crt")
@@ -174,7 +191,7 @@ func startServer(t *testing.T, extraArgs ...string) *liveServer {
 
 	args := append([]string{
 		"-host=127.0.0.1", fmt.Sprintf("-port=%d", port),
-		"-root=" + s.root, "-audit-log=" + s.auditPath, "-tls-dir=" + s.tlsDir,
+		"-root=" + s.root, "-audit-log=" + s.auditPath, "-tls-dir=" + s.tlsDir, "-state=" + s.statePath,
 		"-min-free-mb=0", // the tests must not depend on the free space of TMPDIR
 	}, extraArgs...)
 	s.cmd = exec.Command(bin, args...)
@@ -212,13 +229,12 @@ func startServer(t *testing.T, extraArgs ...string) *liveServer {
 		if s.client != nil {
 			if resp, err := s.client.Get(s.url + "/"); err == nil {
 				resp.Body.Close()
-				return s
+				return
 			}
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("server did not start listening\n%s", s.out)
-	return nil
 }
 
 func (s *liveServer) stop(sig syscall.Signal) error {
@@ -500,7 +516,7 @@ func TestE2EConcurrentUploadsOfTheSameName(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			codes[i], errs[i] = s.upload("", "same.txt", []byte(fmt.Sprintf("content-%02d", i)))
+			codes[i], errs[i] = s.upload("public", "same.txt", []byte(fmt.Sprintf("content-%02d", i)))
 		}(i)
 	}
 	wg.Wait()
@@ -510,13 +526,14 @@ func TestE2EConcurrentUploadsOfTheSameName(t *testing.T) {
 		}
 	}
 
-	entries, _ := os.ReadDir(s.root)
+	dir := filepath.Join(s.root, "public")
+	entries, _ := os.ReadDir(dir)
 	if len(entries) != n {
 		t.Fatalf("%d files for %d uploads", len(entries), n)
 	}
 	seen := map[string]bool{}
 	for _, e := range entries {
-		b, _ := os.ReadFile(filepath.Join(s.root, e.Name()))
+		b, _ := os.ReadFile(filepath.Join(dir, e.Name()))
 		if !strings.HasPrefix(string(b), "content-") || seen[string(b)] {
 			t.Errorf("%s holds %q (missing or duplicated payload)", e.Name(), b)
 		}
@@ -933,4 +950,59 @@ func TestE2EAdminCertificate(t *testing.T) {
 		t.Errorf("output:\n%s", s.out)
 	}
 	s.stop(syscall.SIGTERM)
+}
+
+func TestE2ESetupFromACleanStart(t *testing.T) {
+	s := newLiveServer(t)
+	s.start()
+	out := s.out.String()
+	m := regexp.MustCompile(`On this machine, open https://localhost:\d+/#setup=([A-Z2-7]{26})`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("no setup link in the console output:\n%s", out)
+	}
+	if strings.Count(out, m[1]) != 2 {
+		t.Errorf("the code should appear in the link and the curl line only:\n%s", out)
+	}
+	if code, _ := s.get("/api/files?path="); code != http.StatusServiceUnavailable {
+		t.Errorf("files before setup = %d", code)
+	}
+	body := fmt.Sprintf(`{"code":%q,"username":"alice","password":%q}`, m[1], testPassword)
+	if code := s.postJSON("/api/setup", body); code != http.StatusCreated {
+		t.Fatalf("setup = %d\n%s", code, s.out)
+	}
+	if code := s.postJSON("/api/setup", body); code != http.StatusConflict {
+		t.Errorf("second setup = %d", code)
+	}
+	if code, list := s.get("/api/files?path=users"); code != 200 || !strings.Contains(list, `"alice"`) {
+		t.Errorf("files after setup = %d %s", code, list)
+	}
+	if err := s.stop(syscall.SIGTERM); err != nil {
+		t.Fatalf("exit: %v\n%s", err, s.out)
+	}
+	if n, err := verifyOnly(s.auditPath); err != nil || n != 4 {
+		t.Errorf("audit log: %d records, %v", n, err)
+	}
+}
+
+func TestE2EUsersAddBeforeTheFirstStart(t *testing.T) {
+	s := newLiveServer(t)
+	cmd := exec.Command(binary(t), "users", "add", "-username", "root", "-role", "admin", "-state", s.statePath, "-audit-log", s.auditPath)
+	cmd.Env = isolatedEnv(t)
+	cmd.Stdin = strings.NewReader(testPassword + "\n")
+	if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "Created root (admin, u-") {
+		t.Fatalf("users add: %v\n%s", err, out)
+	}
+	s.start()
+	if strings.Contains(s.out.String(), "SETUP:") {
+		t.Errorf("setup mode although an admin exists:\n%s", s.out)
+	}
+	if code, list := s.get("/api/files?path="); code != 200 || !strings.Contains(list, `"users"`) || !strings.Contains(list, `"public"`) {
+		t.Errorf("files = %d %s", code, list)
+	}
+	if err := s.stop(syscall.SIGTERM); err != nil {
+		t.Fatalf("exit: %v\n%s", err, s.out)
+	}
+	if n, err := verifyOnly(s.auditPath); err != nil || n != 4 {
+		t.Errorf("audit log: %d records (user.created and three folders), %v", n, err)
+	}
 }

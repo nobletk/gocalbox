@@ -27,7 +27,7 @@ func TestFullVolumeAnswers507(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "root")
 	os.Mkdir(root, 0o755)
 	mountSmall(t, root, "2m")
-	a, err := newApp(config{RootDir: root, AuditLog: filepath.Join(t.TempDir(), "a.jsonl")})
+	a, err := newApp(seeded(t, config{RootDir: root, AuditLog: filepath.Join(t.TempDir(), "a.jsonl")}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestMoveIntoAnotherMountAnswers409(t *testing.T) {
 	os.Mkdir(ext, 0o755)
 	mountSmall(t, ext, "1m")
 	os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644)
-	a, err := newApp(config{RootDir: root, AuditLog: filepath.Join(t.TempDir(), "a.jsonl")})
+	a, err := newApp(seeded(t, config{RootDir: root, AuditLog: filepath.Join(t.TempDir(), "a.jsonl")}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestUploadIntoAnotherMountIgnoresTheServedDisk(t *testing.T) {
 	ext := filepath.Join(root, "ext")
 	os.Mkdir(ext, 0o755)
 	mountSmall(t, ext, "2m")
-	a, err := newApp(config{RootDir: root, AuditLog: filepath.Join(t.TempDir(), "a.jsonl"), MinFreeBytes: 1 << 62})
+	a, err := newApp(seeded(t, config{RootDir: root, AuditLog: filepath.Join(t.TempDir(), "a.jsonl"), MinFreeBytes: 1 << 62}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestReadOnlyMountAnswers403(t *testing.T) {
 	if err := syscall.Mount("tmpfs", ro, "tmpfs", syscall.MS_REMOUNT|syscall.MS_RDONLY, "size=1m"); err != nil {
 		t.Skipf("cannot make the test file system read-only: %v", err)
 	}
-	a, err := newApp(config{RootDir: root, AuditLog: filepath.Join(t.TempDir(), "a.jsonl")})
+	a, err := newApp(seeded(t, config{RootDir: root, AuditLog: filepath.Join(t.TempDir(), "a.jsonl")}))
 	if err != nil {
 		t.Fatal(err)
 	}

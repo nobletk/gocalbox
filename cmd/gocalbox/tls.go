@@ -49,10 +49,8 @@ func setupTLS(root string, cfg config) (*tlsSetup, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Checked before creating the folder too, so a refused start leaves
-		// nothing in the served directory.
-		if sandbox.Within(root, abs) {
-			return nil, insideRootError("-tls-dir", abs, root)
+		if err := refuseInsideRoot(root, abs, "-tls-dir"); err != nil {
+			return nil, err
 		}
 		if err := os.MkdirAll(abs, 0o700); err != nil {
 			return nil, fmt.Errorf("create -tls-dir: %w", err)
@@ -139,6 +137,12 @@ func (a *app) logTLS(caURL string) {
 
 // caURL returns where a device on the network can download the local CA.
 func caURL(listenHost, port string, allowed []string) string {
+	return "https://" + net.JoinHostPort(lanHost(listenHost, allowed), port) + "/ca.crt"
+}
+
+// lanHost returns the host other devices can reach the server at, or
+// "localhost" when none is known.
+func lanHost(listenHost string, allowed []string) string {
 	host := "localhost"
 	switch ip := net.ParseIP(strings.Trim(listenHost, "[]")); {
 	case isLoopback(listenHost):
@@ -154,5 +158,5 @@ func caURL(listenHost, port string, allowed []string) string {
 			}
 		}
 	}
-	return "https://" + net.JoinHostPort(host, port) + "/ca.crt"
+	return host
 }

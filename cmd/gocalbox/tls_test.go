@@ -116,9 +116,10 @@ func TestTLSSecretsInsideTheServedDirectoryAreRefused(t *testing.T) {
 	root := filepath.Join(base, "root")
 	os.Mkdir(root, 0o755)
 	auditLog := filepath.Join(base, "audit.jsonl")
+	stateFile := filepath.Join(base, "state.db")
 
 	inside := filepath.Join(root, "tls")
-	if _, err := newApp(config{RootDir: root, AuditLog: auditLog, TLSDir: inside}); err == nil || !strings.Contains(err.Error(), "-tls-dir") {
+	if _, err := newApp(config{RootDir: root, AuditLog: auditLog, StateFile: stateFile, TLSDir: inside}); err == nil || !strings.Contains(err.Error(), "-tls-dir") {
 		t.Errorf("-tls-dir inside the root: %v", err)
 	}
 	if _, err := os.Stat(inside); err == nil {
@@ -127,7 +128,7 @@ func TestTLSSecretsInsideTheServedDirectoryAreRefused(t *testing.T) {
 
 	link := filepath.Join(base, "link")
 	if err := os.Symlink(root, link); err == nil {
-		if _, err := newApp(config{RootDir: root, AuditLog: auditLog, TLSDir: filepath.Join(link, "tls")}); err == nil {
+		if _, err := newApp(config{RootDir: root, AuditLog: auditLog, StateFile: stateFile, TLSDir: filepath.Join(link, "tls")}); err == nil {
 			t.Error("-tls-dir reaching the root through a symlink was accepted")
 		}
 	}
@@ -135,12 +136,17 @@ func TestTLSSecretsInsideTheServedDirectoryAreRefused(t *testing.T) {
 	certPath, keyPath := writeCertFiles(t, base, "localhost")
 	keyInside := filepath.Join(root, "key.pem")
 	os.Rename(keyPath, keyInside)
-	if _, err := newApp(config{RootDir: root, AuditLog: auditLog, TLSCert: certPath, TLSKey: keyInside}); err == nil || !strings.Contains(err.Error(), "-tls-key") {
+	if _, err := newApp(config{RootDir: root, AuditLog: auditLog, StateFile: stateFile, TLSCert: certPath, TLSKey: keyInside}); err == nil || !strings.Contains(err.Error(), "-tls-key") {
 		t.Errorf("-tls-key inside the root: %v", err)
 	}
 }
 
 func writeCertFiles(t *testing.T, dir string, names ...string) (string, string) {
+	t.Helper()
+	return writeCertFilesFor(t, dir, names, []net.IP{net.ParseIP("127.0.0.1")})
+}
+
+func writeCertFilesFor(t *testing.T, dir string, names []string, ips []net.IP) (string, string) {
 	t.Helper()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	tmpl := &x509.Certificate{
@@ -148,7 +154,7 @@ func writeCertFiles(t *testing.T, dir string, names ...string) (string, string) 
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 		DNSNames:     names,
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		IPAddresses:  ips,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)

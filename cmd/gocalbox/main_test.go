@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/nobletk/gocalbox/internal/audit"
+	"github.com/nobletk/gocalbox/internal/auth"
 	"github.com/nobletk/gocalbox/internal/events"
+	"github.com/nobletk/gocalbox/internal/state"
 )
 
 func get(t *testing.T, h http.Handler, path string) (int, string) {
@@ -37,14 +39,68 @@ func post(t *testing.T, h http.Handler, path, body string) int {
 	return rec.Code
 }
 
-func newTestApp(t *testing.T, mutate ...func(*config)) (*app, config) {
+// seedAdmin gives a new state file an admin, "admin" with the password
+// testPassword, and creates the folder layout setup would, so a server
+// starts outside setup mode and creates nothing at start-up.
+func seedAdmin(t *testing.T, statePath, root string) state.User {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := state.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	hash, _ := auth.NewHasher(auth.Params{Memory: 64, Time: 1, Threads: 1}, 1, time.Second).Hash(context.Background(), testPassword)
+	now := time.Now().UTC()
+	admin := state.User{ID: state.NewUserID(), Username: "admin", Role: state.RoleAdmin, Hash: hash, CreatedAt: now, CreatedBy: events.ConsoleID, PasswordChangedAt: now}
+	err = db.Update(func(tx *state.Tx) error {
+		if err := tx.CreateUser(admin); err != nil {
+			return err
+		}
+		if err := tx.PutBinding(state.Binding{ID: state.NewID(), Subject: admin.ID, Folder: "users/admin", Role: state.RoleContributor, Kind: state.KindHome, CreatedAt: now}); err != nil {
+			return err
+		}
+		return tx.PutBinding(state.Binding{ID: state.NewID(), Subject: state.Everyone, Folder: "public", Role: state.RoleContributor, Kind: state.KindPublic, CreatedAt: now})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"users/admin", "public"} {
+		if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(d)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return admin
+}
+
+const testPassword = "test password of some length"
+
+// testConfig is a configuration with its own audit log and state file, and
+// no admin yet.
+func testConfig(t *testing.T) config {
 	t.Helper()
 	base := t.TempDir()
 	root := filepath.Join(base, "root")
 	if err := os.Mkdir(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config{RootDir: root, AuditLog: filepath.Join(base, "audit", "audit.jsonl")}
+	return config{RootDir: root, AuditLog: filepath.Join(base, "audit", "audit.jsonl"), StateFile: filepath.Join(base, "state", "state.db")}
+}
+
+// seeded gives cfg a new state file with an admin.
+func seeded(t *testing.T, cfg config) config {
+	t.Helper()
+	cfg.StateFile = filepath.Join(t.TempDir(), "state.db")
+	seedAdmin(t, cfg.StateFile, cfg.RootDir)
+	return cfg
+}
+
+func newTestApp(t *testing.T, mutate ...func(*config)) (*app, config) {
+	t.Helper()
+	cfg := testConfig(t)
+	seedAdmin(t, cfg.StateFile, cfg.RootDir)
 	for _, m := range mutate {
 		m(&cfg)
 	}
