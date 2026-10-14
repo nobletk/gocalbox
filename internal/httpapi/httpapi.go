@@ -44,6 +44,10 @@ type Options struct {
 
 	// CACert, if set, is served at /ca.crt for devices to install.
 	CACert []byte
+
+	// Accounts, if set, serves setup and holds back every other API request
+	// and every file until the first admin exists.
+	Accounts AccountService
 }
 
 type ClientFileInfo struct {
@@ -84,13 +88,14 @@ type ErrorBody struct {
 
 type api struct {
 	files     FileService
+	accounts  AccountService
 	maxUpload int64
 	ready     func() error
 	tracker   *Tracker
 }
 
 func New(files FileService, webFS fs.FS, opts Options) http.Handler {
-	a := &api{files: files, maxUpload: opts.MaxUploadBytes, ready: opts.Ready, tracker: opts.Tracker}
+	a := &api{files: files, accounts: opts.Accounts, maxUpload: opts.MaxUploadBytes, ready: opts.Ready, tracker: opts.Tracker}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(webFS)))
@@ -101,6 +106,10 @@ func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 	mux.Handle("/api/fs/rename", a.gate(http.HandlerFunc(a.handleMove)))
 	mux.Handle("/api/fs/move", a.gate(http.HandlerFunc(a.handleMove)))
 	mux.Handle("/api/fs/mkdir", a.gate(http.HandlerFunc(a.handleCreateFolder)))
+	if a.accounts != nil {
+		mux.Handle("/api/setup", a.gate(http.HandlerFunc(a.handleSetup)))
+		mux.HandleFunc("/api/status", a.handleStatus)
+	}
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeErrorJSON(w, r, http.StatusNotFound, "not_found", "Unknown API endpoint")
 	})
@@ -117,7 +126,11 @@ func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 
 	// The body limit is outermost: net/http reads the unread rest of a body
 	// before it replies, so requests refused early must be bounded too.
-	inner := cop.Handler(isolateResources(rejectUnclean(mux)))
+	var routes http.Handler = mux
+	if a.accounts != nil {
+		routes = requireSetupDone(a.accounts, mux)
+	}
+	inner := cop.Handler(isolateResources(rejectUnclean(routes)))
 	if opts.RequireTLS {
 		inner = redirectPlain(inner)
 	}

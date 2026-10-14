@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/nobletk/gocalbox/internal/auth"
 	"github.com/nobletk/gocalbox/internal/events"
 	"github.com/nobletk/gocalbox/internal/fsops"
 	"github.com/nobletk/gocalbox/internal/sandbox"
@@ -41,6 +42,8 @@ func writeErrorJSON(w http.ResponseWriter, r *http.Request, status int, code, me
 
 func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var tooBig *http.MaxBytesError
+	var weak *auth.WeakPasswordError
+	var layout *auth.LayoutExistsError
 
 	switch {
 	case errors.Is(err, sandbox.ErrTraversal):
@@ -69,6 +72,27 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, fsops.ErrInsufficientStorage):
 		log.Printf("Refused for lack of space: %v", err)
 		writeErrorJSON(w, r, http.StatusInsufficientStorage, "insufficient_storage", "Not enough free space on the server")
+
+	case errors.Is(err, auth.ErrSetupCodeInvalid):
+		log.Printf("SECURITY ALERT: Wrong setup code from %s", r.RemoteAddr)
+		writeErrorJSON(w, r, http.StatusForbidden, "setup_code_invalid", "Wrong setup code")
+	case errors.Is(err, auth.ErrSetupDone):
+		writeErrorJSON(w, r, http.StatusConflict, "setup_done", "Setup is already complete")
+	case errors.As(err, &layout):
+		writeErrorJSON(w, r, http.StatusConflict, "layout_exists", fmt.Sprintf(
+			"These folders already exist: %s. Move them aside, or repeat the request with useExisting set to true "+
+				"to keep them; /public then becomes readable by every user", strings.Join(layout.Paths, ", ")))
+	case errors.Is(err, auth.ErrHomeExists):
+		writeErrorJSON(w, r, http.StatusConflict, "home_exists", "A folder with this username already exists in /users; choose another username")
+	case errors.Is(err, auth.ErrInvalidUsername):
+		writeErrorJSON(w, r, http.StatusBadRequest, "invalid_username",
+			"Usernames have 3 to 32 characters from a-z, 0-9, '.', '_' and '-', and start and end with a letter or digit")
+	case errors.Is(err, auth.ErrUsernameTaken):
+		writeErrorJSON(w, r, http.StatusConflict, "username_taken", "This username is taken")
+	case errors.As(err, &weak):
+		writeErrorJSON(w, r, http.StatusBadRequest, "weak_password", "Password refused: "+weak.Message)
+	case errors.Is(err, auth.ErrBusy):
+		writeErrorJSON(w, r, http.StatusServiceUnavailable, "busy", "The server is busy; try again in a moment")
 
 	case errors.As(err, &tooBig):
 		log.Printf("Request body rejected: larger than %d bytes", tooBig.Limit)
