@@ -12,6 +12,9 @@ func LogHandler(ev Event) {
 	if ev.Actor.Name != "" {
 		fmt.Fprintf(&b, "(%s)", ev.Actor.Name)
 	}
+	if ev.Actor.Session != "" {
+		fmt.Fprintf(&b, "[%s]", ev.Actor.Session)
+	}
 	if ev.Actor.RemoteAddr != "" {
 		fmt.Fprintf(&b, "@%s", ev.Actor.RemoteAddr)
 	}

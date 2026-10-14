@@ -16,9 +16,13 @@ const (
 	FileDeleted     Type = "file.deleted"
 	FileReadSummary Type = "file.read_summary"
 
-	AuthSetupCompleted  Type = "auth.setup_completed"
-	AuthPasswordChanged Type = "auth.password_changed"
-	UserCreated         Type = "user.created"
+	AuthSetupCompleted   Type = "auth.setup_completed"
+	AuthLogin            Type = "auth.login"
+	AuthLogout           Type = "auth.logout"
+	AuthPasswordChanged  Type = "auth.password_changed"
+	AuthPasswordDisabled Type = "auth.password_disabled"
+	SessionRevoked       Type = "session.revoked"
+	UserCreated          Type = "user.created"
 )
 
 type Outcome string
@@ -46,6 +50,7 @@ type Actor struct {
 	Name       string `json:"name,omitempty"` // username at the time of the event
 	Role       string `json:"role,omitempty"`
 	RemoteAddr string `json:"remote_addr,omitempty"`
+	Session    string `json:"session,omitempty"` // the session's ID, which stays the same when its token is renewed
 }
 
 type Event struct {
