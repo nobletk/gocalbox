@@ -266,3 +266,56 @@ func TestOpenRefusesAFileOthersCanRead(t *testing.T) {
 	}
 	again.Close()
 }
+
+func TestSessions(t *testing.T) {
+	d, _ := openTemp(t)
+	now := time.Now().UTC()
+	a := Session{ID: "aaaa", User: "u-1", Created: now, LastSeen: now, AuthTime: now, Epoch: 2, UserAgent: "ua", IP: "192.0.2.1"}
+	b := Session{ID: "bbbb", User: "u-2", Created: now}
+	err := d.Update(func(tx *Tx) error {
+		if err := tx.PutSession([]byte("key-a"), a); err != nil {
+			return err
+		}
+		return tx.PutSession([]byte("key-b"), b)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Update(func(tx *Tx) error { return tx.PutSession(nil, a) }); err == nil {
+		t.Error("a session without a key was stored")
+	}
+	all := map[string]Session{}
+	d.View(func(tx *Tx) error {
+		return tx.Sessions(func(k []byte, s Session) error { all[string(k)] = s; return nil })
+	})
+	if len(all) != 2 || !all["key-a"].Created.Equal(a.Created) || all["key-a"].IP != a.IP || all["key-b"].User != "u-2" {
+		t.Errorf("sessions = %+v", all)
+	}
+
+	renewed := a
+	if err := d.Update(func(tx *Tx) error {
+		if err := tx.DeleteSession([]byte("key-a")); err != nil {
+			return err
+		}
+		return tx.PutSession([]byte("key-a2"), renewed)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	d.Update(func(tx *Tx) error { return tx.DeleteSession([]byte("missing")) })
+	d.View(func(tx *Tx) error {
+		if got := string(tx.tx.Bucket(bucketSessionIDs).Get([]byte("aaaa"))); got != "key-a2" {
+			t.Errorf("index after renewal = %q", got)
+		}
+		if tx.tx.Bucket(bucketSessions).Get([]byte("key-a")) != nil {
+			t.Error("the old key survived")
+		}
+		return nil
+	})
+	d.Update(func(tx *Tx) error { return tx.DeleteSession([]byte("key-b")) })
+	d.View(func(tx *Tx) error {
+		if tx.tx.Bucket(bucketSessionIDs).Get([]byte("bbbb")) != nil || tx.tx.Bucket(bucketSessions).Get([]byte("key-b")) != nil {
+			t.Error("a deleted session left a record or an index entry")
+		}
+		return nil
+	})
+}
