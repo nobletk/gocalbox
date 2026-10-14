@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -28,6 +27,7 @@ var (
 	ErrTampered = errors.New("audit log is corrupt or has been tampered with")
 	ErrTornTail = errors.New("audit log ends with an incomplete record")
 	ErrBroken   = errors.New("audit log could not be repaired after a failed write; recording stopped")
+	ErrLocked   = errors.New("the audit log is in use by another process")
 )
 
 type TamperError struct {
@@ -119,6 +119,7 @@ func Verify(path string) (Report, error) {
 
 type logFile interface {
 	io.Writer
+	io.Seeker
 	Sync() error
 	Truncate(size int64) error
 	Close() error
@@ -127,6 +128,7 @@ type logFile interface {
 type Writer struct {
 	mu      sync.Mutex
 	f       logFile
+	locked  *os.File
 	path    string
 	prev    string
 	records int
@@ -135,27 +137,49 @@ type Writer struct {
 	broken  bool
 }
 
+// Open takes an exclusive lock on the log, failing with ErrLocked while
+// another process holds it, then verifies it. Locking comes first, so an
+// incomplete last record is a crash's, not another writer's record in
+// progress.
 func Open(path string) (*Writer, error) {
+	// Not O_APPEND: on Windows an append-only handle can be neither locked
+	// nor truncated. Where the lock holds, this writer is the only one, so it
+	// keeps its own position at the end.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open audit log: %w", err)
+	}
+	if err := lockFile(f); err != nil {
+		f.Close()
+		if errors.Is(err, ErrLocked) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("lock audit log: %w", err)
+	}
 	rep, err := Verify(path)
 	var torn *TornTailError
 	switch {
 	case err == nil:
-	case errors.Is(err, fs.ErrNotExist):
-		rep = Report{LastHash: GenesisHash}
 	case errors.As(err, &torn):
 		log.Printf("audit: removing incomplete last record of %s (byte %d onwards), probably left by a crash", path, torn.Offset)
-		if err := os.Truncate(path, torn.Offset); err != nil {
+		if err := f.Truncate(torn.Offset); err != nil {
+			release(f)
 			return nil, fmt.Errorf("repair audit log: %w", err)
 		}
 	default:
+		release(f)
 		return nil, fmt.Errorf("existing audit log %s failed verification (investigate it, or move it aside to start a new log): %w", path, err)
 	}
-
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
-	if err != nil {
+	if _, err := f.Seek(rep.Size, io.SeekStart); err != nil {
+		release(f)
 		return nil, fmt.Errorf("open audit log: %w", err)
 	}
-	return &Writer{f: f, path: path, prev: rep.LastHash, records: rep.Records, size: rep.Size}, nil
+	return &Writer{f: f, locked: f, path: path, prev: rep.LastHash, records: rep.Records, size: rep.Size}, nil
+}
+
+func release(f *os.File) {
+	unlockFile(f)
+	f.Close()
 }
 
 func (w *Writer) Path() string { return w.path }
@@ -210,7 +234,7 @@ func (w *Writer) append(evs []events.Event) error {
 	n, err := w.f.Write(buf.Bytes())
 	if err != nil {
 		if n > 0 {
-			if terr := w.f.Truncate(w.size); terr != nil {
+			if terr := w.rewind(); terr != nil {
 				w.broken = true
 				return fmt.Errorf("%w: write: %v; truncate: %v", ErrBroken, err, terr)
 			}
@@ -218,7 +242,7 @@ func (w *Writer) append(evs []events.Event) error {
 		return fmt.Errorf("write: %w", err)
 	}
 	if err := w.f.Sync(); err != nil {
-		terr := w.f.Truncate(w.size)
+		terr := w.rewind()
 		if terr == nil {
 			terr = w.f.Sync()
 		}
@@ -234,6 +258,14 @@ func (w *Writer) append(evs []events.Event) error {
 	return nil
 }
 
+func (w *Writer) rewind() error {
+	if err := w.f.Truncate(w.size); err != nil {
+		return err
+	}
+	_, err := w.f.Seek(w.size, io.SeekStart)
+	return err
+}
+
 func (w *Writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -241,6 +273,11 @@ func (w *Writer) Close() error {
 		return nil
 	}
 	err := w.f.Sync()
+	// Windows releases the lock of a closed handle only after a delay, which
+	// would refuse a users command run right after the server stops.
+	if uerr := unlockFile(w.locked); err == nil {
+		err = uerr
+	}
 	if cerr := w.f.Close(); err == nil {
 		err = cerr
 	}
@@ -259,6 +296,11 @@ func EnsureOutside(root, path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
+	}
+	// Checked before creating the folder too, so a refused start leaves
+	// nothing in the served directory.
+	if pre, err := sandbox.ResolveExisting(abs); err == nil && (sandbox.Within(root, abs) || sandbox.Within(root, pre)) {
+		return "", fmt.Errorf("audit log %s is inside the served directory %s; choose a location outside it with -audit-log", pre, root)
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return "", fmt.Errorf("create audit log folder: %w", err)

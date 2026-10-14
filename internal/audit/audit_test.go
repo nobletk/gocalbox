@@ -544,3 +544,23 @@ func FuzzAuditTamper(f *testing.F) {
 		}
 	})
 }
+
+func TestOpenRefusesALogInUse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	w, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second Open = %v, want ErrLocked", err)
+	}
+	if _, err := Verify(path); err != nil {
+		t.Errorf("Verify while the log is open: %v", err)
+	}
+	w.Close()
+	again, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open after Close: %v", err)
+	}
+	again.Close()
+}

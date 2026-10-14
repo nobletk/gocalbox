@@ -282,3 +282,23 @@ func TestOverlongPathsAreInvalid(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveExisting(t *testing.T) {
+	base, _ := filepath.EvalSymlinks(t.TempDir())
+	real := filepath.Join(base, "real")
+	os.Mkdir(real, 0o755)
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	for in, want := range map[string]string{
+		filepath.Join(link, "a", "b"): filepath.Join(real, "a", "b"),
+		filepath.Join(real, "a"):      filepath.Join(real, "a"),
+		link:                          real,
+		filepath.Join(base, "x", "y"): filepath.Join(base, "x", "y"),
+	} {
+		if got, err := ResolveExisting(in); err != nil || got != want {
+			t.Errorf("ResolveExisting(%s) = %s, %v; want %s", in, got, err, want)
+		}
+	}
+}

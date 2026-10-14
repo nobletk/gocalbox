@@ -122,6 +122,29 @@ func FromRoot(err error) error {
 	return err
 }
 
+// ResolveExisting resolves the symlinks in the longest prefix of the
+// absolute path that exists, and appends the rest unchanged. Checking it
+// against the root before creating the missing folders keeps a path that
+// reaches the root through a symlink from creating anything there.
+func ResolveExisting(path string) (string, error) {
+	var rest []string
+	for p := path; ; {
+		if _, err := os.Lstat(p); err == nil {
+			resolved, err := filepath.EvalSymlinks(p)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Join(append([]string{resolved}, rest...)...), nil
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return path, nil
+		}
+		rest = append([]string{filepath.Base(p)}, rest...)
+		p = parent
+	}
+}
+
 func Within(base, target string) bool {
 	rel, err := filepath.Rel(base, target)
 	if err != nil {
