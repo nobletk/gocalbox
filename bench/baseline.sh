@@ -79,6 +79,13 @@ if [ "$LOG_EVENTS" != 1 ]; then
   esac
 fi
 case $FLAGS in
+  *-state*)
+    # Without an admin the server starts in setup mode and refuses every file request.
+    STATE="$WORK/state.db"; rm -f "$STATE"
+    head -c 24 /dev/urandom | base64 | "$WORK/gocalbox" users add -username bench -role admin -state "$STATE" -audit-log "$AUDIT" > /dev/null
+    SERVER_CMD+=(-state "$STATE") ;;
+esac
+case $FLAGS in
   *-tls-dir*)
     if [ "$SCHEME" = https ]; then SERVER_CMD+=(-tls-dir "$TLS_DIR"); CURL+=(--cacert "$TLS_DIR/ca.crt")
     else SERVER_CMD+=(-insecure-http); fi ;;
