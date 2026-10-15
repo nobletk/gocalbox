@@ -472,15 +472,21 @@ func (a *Accounts) endWhere(match func(state.Session) bool) ([]state.Session, er
 	return recs, a.changeSessions(keys, nil)
 }
 
-func (a *Accounts) publishEnded(ctx context.Context, ended []endedSession) {
+// recordEnded records the sessions a change ended as a side effect.
+func (a *Accounts) recordEnded(ctx context.Context, ended []endedSession) error {
+	if len(ended) == 0 {
+		return nil
+	}
 	users := a.users()
+	evs := make([]events.Event, 0, len(ended))
 	for _, s := range ended {
 		detail := "id=" + s.rec.ID
 		if s.reason != "" {
 			detail += " reason=" + s.reason
 		}
-		a.publish(ctx, events.Event{Type: events.SessionRevoked, Path: users[s.rec.User].Username, Detail: detail})
+		evs = append(evs, events.Event{Type: events.SessionRevoked, Path: users[s.rec.User].Username, Detail: detail})
 	}
+	return a.record(ctx, true, evs...)
 }
 
 // Logout ends the session by its ID, so a renewal of its token racing the
@@ -524,25 +530,29 @@ func (a *Accounts) RevokeSession(ctx context.Context, id Identity, sessionID str
 	if len(ended) == 0 {
 		return ErrNoSuchSession
 	}
-	a.publish(ctx, events.Event{Type: events.SessionRevoked, Path: id.User.Username, Detail: "id=" + sessionID})
-	return nil
+	return a.record(ctx, true, events.Event{Type: events.SessionRevoked, Path: id.User.Username, Detail: "id=" + sessionID})
 }
 
 // RevokeOtherSessions ends every session of the user but the current one;
 // only the ones still valid get an audit record. The returned list names the
-// links revoked with them; it is empty while the server has no links.
+// links revoked with them; it is empty while the server has no links. With
+// an error for which events.IsUnrecorded holds, the sessions were ended.
 func (a *Accounts) RevokeOtherSessions(ctx context.Context, id Identity) ([]RevokedLink, error) {
 	now := a.wallNow()
 	ended, err := a.endWhere(func(s state.Session) bool { return s.User == id.User.ID && s.ID != id.Session.ID })
 	if err != nil {
 		return nil, err
 	}
+	var evs []events.Event
 	for _, s := range ended {
 		if a.valid(s, now) {
-			a.publish(ctx, events.Event{Type: events.SessionRevoked, Path: id.User.Username, Detail: "id=" + s.ID})
+			evs = append(evs, events.Event{Type: events.SessionRevoked, Path: id.User.Username, Detail: "id=" + s.ID})
 		}
 	}
-	return []RevokedLink{}, nil
+	if len(evs) == 0 {
+		return []RevokedLink{}, nil
+	}
+	return []RevokedLink{}, a.record(ctx, true, evs...)
 }
 
 // RevokedLink names a link revoked as a side effect.

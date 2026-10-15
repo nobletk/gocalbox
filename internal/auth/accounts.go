@@ -55,6 +55,7 @@ type Config struct {
 	Policy   Policy
 	Folders  Folders // nil where no folders are created, as in the users command
 	Events   Publisher
+	Audit    events.Auditor // nil where changes are neither refused nor wait for their records
 	Now      func() time.Time
 	Sessions SessionConfig // zero fields take DefaultSessions' values
 
@@ -72,6 +73,7 @@ type Accounts struct {
 	policy       Policy
 	folders      Folders
 	events       Publisher
+	audit        events.Auditor
 	now          func() time.Time
 	sessionCfg   SessionConfig
 	failureDelay func(int) time.Duration
@@ -98,7 +100,7 @@ func New(c Config) *Accounts {
 		now = time.Now
 	}
 	a := &Accounts{
-		db: c.DB, hasher: c.Hasher, policy: c.Policy, folders: c.Folders, events: c.Events, now: now,
+		db: c.DB, hasher: c.Hasher, policy: c.Policy, folders: c.Folders, events: c.Events, audit: c.Audit, now: now,
 		sessionCfg: SessionConfig{
 			Idle:   cmp.Or(c.Sessions.Idle, DefaultSessions.Idle),
 			Max:    cmp.Or(c.Sessions.Max, DefaultSessions.Max),
@@ -199,10 +201,15 @@ func (a *Accounts) StartSetup() (string, error) {
 func (a *Accounts) SetupRequired() bool { return a.setup.Load() != nil }
 
 // CompleteSetup creates the first admin, the folder layout and its bindings,
-// and logs the admin in. The code is checked before anything else, under the
-// address's back-off for codes and tokens, so a wrong one costs no hashing.
-// A request that fails leaves the code valid.
+// and logs the admin in. After the audit policy, the code is checked before
+// anything else, under the address's back-off for codes and tokens, so a
+// wrong one costs no hashing. A request that fails leaves the code valid.
+// With an error for which events.IsUnrecorded holds, the admin was created
+// and the grant is valid.
 func (a *Accounts) CompleteSetup(ctx context.Context, req SetupRequest, c Client) (Grant, error) {
+	if err := a.allow(); err != nil {
+		return Grant{}, err
+	}
 	code := a.setup.Load()
 	if code == nil {
 		return Grant{}, ErrSetupDone
@@ -271,12 +278,16 @@ func (a *Accounts) CompleteSetup(ctx context.Context, req SetupRequest, c Client
 			return tx.PutBinding(publicBinding(user.ID, now))
 		})
 	})
+	var unrecorded error
+	if events.IsUnrecorded(err) {
+		unrecorded, err = err, nil
+	}
 	if err != nil {
 		return Grant{}, folderError(err, home)
 	}
 	a.setup.Store(nil)
 	a.throttle.reset(codeKey(addr))
-	a.publish(ctx, events.Event{Type: events.AuthSetupCompleted, Path: name, Detail: "id=" + user.ID})
+	unrecorded = cmp.Or(unrecorded, a.record(ctx, false, events.Event{Type: events.AuthSetupCompleted, Path: name, Detail: "id=" + user.ID}))
 
 	for _, w := range a.ensureLayout(events.WithActor(ctx, events.Actor{ID: events.SystemID})) {
 		log.Printf("WARNING: %s", w)
@@ -288,9 +299,8 @@ func (a *Accounts) CompleteSetup(ctx context.Context, req SetupRequest, c Client
 	actor := events.ActorFrom(ctx)
 	actor.Session = e.rec.ID
 	ctx = events.WithActor(ctx, actor)
-	a.publish(ctx, events.Event{Type: events.AuthLogin, Path: name, Detail: "setup"})
-	a.publishEnded(ctx, ended)
-	return grant, nil
+	a.publish(ctx, events.Event{Type: events.AuthLogin, Path: name, Resolved: user.ID, Detail: "setup"})
+	return grant, cmp.Or(unrecorded, a.recordEnded(ctx, ended))
 }
 
 func orElse(err, otherwise error) error {
@@ -345,7 +355,11 @@ func (a *Accounts) ensureLayout(ctx context.Context) []string {
 
 	hasAdmin := slices.ContainsFunc(users, func(u state.User) bool { return u.Role == state.RoleAdmin && !u.Disabled })
 	if i := slices.IndexFunc(bindings, func(b state.Binding) bool { return b.Kind == state.KindPublic }); i >= 0 {
-		if err := a.folders.Provision(ctx, []fsops.Folder{{Path: bindings[i].Folder, Detail: "layout", IfExists: fsops.Reuse}}, nil); err != nil {
+		err := a.folders.Provision(ctx, []fsops.Folder{{Path: bindings[i].Folder, Detail: "layout", IfExists: fsops.Reuse}}, nil)
+		switch {
+		case events.IsUnrecorded(err):
+			warnings = append(warnings, fmt.Sprintf("recreated /%s, but: %v", bindings[i].Folder, err))
+		case err != nil:
 			warnings = append(warnings, fmt.Sprintf("cannot recreate /%s: %v", bindings[i].Folder, err))
 		}
 	} else if hasAdmin {
@@ -357,6 +371,8 @@ func (a *Accounts) ensureLayout(ctx context.Context) []string {
 		case errors.As(err, &ce):
 			warnings = append(warnings, "the folder /public existed before any account and is not shared; it stays admin-only. "+
 				"Move it aside and restart to have an empty /public created and shared with every user")
+		case events.IsUnrecorded(err):
+			warnings = append(warnings, fmt.Sprintf("created /public, but: %v", err))
 		case err != nil:
 			warnings = append(warnings, fmt.Sprintf("cannot create /public: %v", err))
 		}
@@ -396,6 +412,8 @@ func (a *Accounts) ensureLayout(ctx context.Context) []string {
 		case errors.As(err, &ce):
 			warnings = append(warnings, fmt.Sprintf("%s has no home folder: %s is in the way (a file, a link, or a folder that is not empty); "+
 				"move it aside and restart", u.Username, strings.Join(ce.Paths, ", ")))
+		case events.IsUnrecorded(err):
+			warnings = append(warnings, fmt.Sprintf("created the home folder of %s, but: %v", u.Username, err))
 		case err != nil:
 			warnings = append(warnings, fmt.Sprintf("%s has no home folder: %v", u.Username, err))
 		}
@@ -428,8 +446,7 @@ func (a *Accounts) CreateUser(ctx context.Context, username string, role state.R
 	if err := a.update(func(tx *state.Tx) error { return tx.CreateUser(u) }); err != nil {
 		return state.User{}, err
 	}
-	a.publish(ctx, events.Event{Type: events.UserCreated, Path: name, Detail: fmt.Sprintf("id=%s role=%s", u.ID, role)})
-	return u, nil
+	return u, a.record(ctx, false, events.Event{Type: events.UserCreated, Path: name, Detail: fmt.Sprintf("id=%s role=%s", u.ID, role)})
 }
 
 // SetPassword replaces a user's password. The higher epoch ends every
@@ -466,8 +483,7 @@ func (a *Accounts) SetPassword(ctx context.Context, username, password string) (
 	if err != nil {
 		return u, err
 	}
-	a.publish(ctx, events.Event{Type: events.AuthPasswordChanged, Path: u.Username, Detail: "id=" + u.ID})
-	return u, nil
+	return u, a.record(ctx, false, events.Event{Type: events.AuthPasswordChanged, Path: u.Username, Detail: "id=" + u.ID})
 }
 
 // MeFor describes the user of a session, with the end of its window for
@@ -535,11 +551,43 @@ func asUser(ctx context.Context, u state.User) context.Context {
 }
 
 func (a *Accounts) publish(ctx context.Context, ev events.Event) {
-	if a.events == nil {
-		return
+	if a.events != nil {
+		a.events.Publish(fill(ctx, ev))
 	}
+}
+
+// record publishes the events of a change that was made and returns once
+// their records are on disk, or with the error saying they aren't. A
+// protective change only takes access away; while changes are paused it
+// doesn't wait.
+func (a *Accounts) record(ctx context.Context, protective bool, evs ...events.Event) error {
+	for i := range evs {
+		evs[i] = fill(ctx, evs[i])
+	}
+	switch {
+	case a.audit == nil:
+		if a.events != nil {
+			for _, ev := range evs {
+				a.events.Publish(ev)
+			}
+		}
+		return nil
+	case protective:
+		return a.audit.RecordProtective(ctx, evs...)
+	}
+	return a.audit.Record(ctx, evs...)
+}
+
+func (a *Accounts) allow() error {
+	if a.audit == nil {
+		return nil
+	}
+	return a.audit.Allow()
+}
+
+func fill(ctx context.Context, ev events.Event) events.Event {
 	ev.Actor = events.ActorFrom(ctx)
 	ev.RequestID = events.RequestIDFrom(ctx)
 	ev.Outcome = cmp.Or(ev.Outcome, events.OutcomeOK)
-	a.events.Publish(ev)
+	return ev
 }

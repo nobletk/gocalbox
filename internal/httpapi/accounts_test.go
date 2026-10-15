@@ -147,7 +147,7 @@ func TestSetupModeHoldsBackFilesAndAPI(t *testing.T) {
 	if code, _ := e.do("GET", "/", nil, ""); code != 200 {
 		t.Errorf("UI shell = %d", code)
 	}
-	if code, body := e.do("GET", "/api/status", nil, ""); code != 200 || strings.TrimSpace(body) != `{"setupRequired":true}` {
+	if code, body := e.do("GET", "/api/status", nil, ""); code != 200 || strings.TrimSpace(body) != `{"setupRequired":true,"changesPaused":false}` {
 		t.Errorf("status = %d %s", code, body)
 	}
 	for _, tc := range []struct{ method, path string }{
@@ -172,7 +172,7 @@ func TestSetupModeHoldsBackFilesAndAPI(t *testing.T) {
 	if code, body := e.do("GET", "/files/secret.txt", nil, ""); code != 200 || body != "data" {
 		t.Errorf("after setup: %d %s", code, body)
 	}
-	if code, body := e.do("GET", "/api/status", nil, ""); code != 200 || strings.TrimSpace(body) != `{"setupRequired":false}` {
+	if code, body := e.do("GET", "/api/status", nil, ""); code != 200 || strings.TrimSpace(body) != `{"setupRequired":false,"changesPaused":false}` {
 		t.Errorf("status after setup = %d %s", code, body)
 	}
 }

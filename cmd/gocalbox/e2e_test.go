@@ -674,6 +674,20 @@ func TestE2EStartupFailures(t *testing.T) {
 		}
 	})
 
+	t.Run("the removed -audit-fail-closed", func(t *testing.T) {
+		out, code := runToCompletion(t, "-audit-fail-closed", "-port=0", "-root="+root, "-audit-log="+good)
+		if code == 0 || !strings.Contains(out, "flag provided but not defined: -audit-fail-closed") {
+			t.Errorf("exit %d\n%s", code, out)
+		}
+	})
+
+	t.Run("audit wait of zero", func(t *testing.T) {
+		out, code := runToCompletion(t, "-audit-wait-timeout=0", "-port=0", "-root="+root, "-audit-log="+good)
+		if code == 0 || !strings.Contains(out, "-audit-wait-timeout") {
+			t.Errorf("exit %d\n%s", code, out)
+		}
+	})
+
 	t.Run("session lifetime of zero", func(t *testing.T) {
 		out, code := runToCompletion(t, "-session-idle=0", "-port=0", "-root="+root, "-audit-log="+good)
 		if code == 0 || !strings.Contains(out, "-session-idle") {

@@ -48,7 +48,9 @@ func loginName(s string) (string, bool) {
 
 // Login checks a username and password and starts a session. The throttle
 // is checked before any hashing; an unknown username is checked against a
-// dummy hash, so its answer and timing match a wrong password's.
+// dummy hash, so its answer and timing match a wrong password's. With an
+// error for which events.IsUnrecorded holds, the user is logged in and the
+// grant is valid; only the record of a session it ended is missing.
 func (a *Accounts) Login(ctx context.Context, username, password string, c Client) (Grant, error) {
 	start := time.Now()
 	name, valid := loginName(username)
@@ -66,10 +68,8 @@ func (a *Accounts) Login(ctx context.Context, username, password string, c Clien
 	}
 	trusted := known && a.trustedDevice(c.Device, u)
 	at, err := a.admit(name, c.Addr, acct, !trusted)
-	if errors.Is(err, ErrPasswordDisabled) {
-		a.publishLogin(ctx, name, events.OutcomeDenied, "password_disabled")
-	}
 	if err != nil {
+		a.publishRefused(ctx, name, u.ID, err, "")
 		return Grant{}, err
 	}
 
@@ -81,6 +81,7 @@ func (a *Accounts) Login(ctx context.Context, username, password string, c Clien
 		}
 		if ok, rehash, err = a.hasher.Verify(ctx, hash, password); err != nil {
 			a.giveBack(at)
+			a.publishRefused(ctx, name, u.ID, err, "")
 			return Grant{}, err
 		}
 	}
@@ -91,7 +92,7 @@ func (a *Accounts) Login(ctx context.Context, username, password string, c Clien
 	}
 	if u.Disabled {
 		a.giveBack(at)
-		a.publishLogin(ctx, name, events.OutcomeDenied, "account_disabled")
+		a.publishLogin(ctx, name, u.ID, events.OutcomeDenied, "account_disabled")
 		return Grant{}, ErrAccountDisabled
 	}
 	update, err := a.afterRightPassword(ctx, u, password, rehash, at)
@@ -107,9 +108,8 @@ func (a *Accounts) Login(ctx context.Context, username, password string, c Clien
 	actor := events.ActorFrom(asUser(ctx, u))
 	actor.Session = e.rec.ID
 	ctx = events.WithActor(ctx, actor)
-	a.publish(ctx, events.Event{Type: events.AuthLogin, Path: name})
-	a.publishEnded(ctx, ended)
-	return grant, nil
+	a.publish(ctx, events.Event{Type: events.AuthLogin, Path: name, Resolved: u.ID})
+	return grant, a.recordEnded(ctx, ended)
 }
 
 func accountOf(u state.User) account {
@@ -186,7 +186,7 @@ func (a *Accounts) afterRightPassword(ctx context.Context, u state.User, passwor
 // disableAt the password is disabled. Nothing is written once a success or a
 // new password has reset the count since the attempt was admitted.
 func (a *Accounts) recordFailure(ctx context.Context, name string, u state.User, at attempt, detail string) {
-	a.publishLogin(ctx, name, events.OutcomeDenied, detail)
+	a.publishLogin(ctx, name, u.ID, events.OutcomeDenied, detail)
 	if !at.acct.known || at.n%10 != 0 {
 		return
 	}
@@ -226,8 +226,30 @@ func (a *Accounts) waitFailure(ctx context.Context, start time.Time, n int) {
 	}
 }
 
-func (a *Accounts) publishLogin(ctx context.Context, name string, outcome events.Outcome, detail string) {
-	a.publish(ctx, events.Event{Type: events.AuthLogin, Outcome: outcome, Path: name, Detail: detail})
+// publishLogin records an attempt to log in as name; userID names the
+// account it is, empty for a name no account has.
+func (a *Accounts) publishLogin(ctx context.Context, name, userID string, outcome events.Outcome, detail string) {
+	a.publish(ctx, events.Event{Type: events.AuthLogin, Outcome: outcome, Path: name, Resolved: userID, Detail: detail})
+}
+
+// publishRefused records an attempt refused before its password was
+// checked. Such attempts cost nothing, so only the audit log's coalescing
+// of failed logins keeps a flood of them from filling the log. suffix tells
+// a check inside a session apart from a login.
+func (a *Accounts) publishRefused(ctx context.Context, name, userID string, err error, suffix string) {
+	var tooMany *TooManyAttemptsError
+	var reason string
+	switch {
+	case errors.Is(err, ErrPasswordDisabled):
+		reason = "password_disabled"
+	case errors.As(err, &tooMany):
+		reason = "too_many_attempts"
+	case errors.Is(err, ErrBusy):
+		reason = "busy"
+	default:
+		return
+	}
+	a.publishLogin(ctx, name, userID, events.OutcomeDenied, reason+suffix)
 }
 
 type checkOutcome int
@@ -288,13 +310,16 @@ func (a *Accounts) checkSessionPassword(ctx context.Context, id Identity, passwo
 	if !known || u.ID != id.User.ID {
 		return state.User{}, attempt{}, false, ErrSessionEnded
 	}
+	inSession := "_in_session id=" + id.Session.ID
 	e, err := a.startCheck(id)
 	if err != nil {
+		a.publishRefused(ctx, name, u.ID, err, inSession)
 		return state.User{}, attempt{}, false, err
 	}
 	at, err := a.admit(name, c.Addr, accountOf(u), false)
 	if err != nil {
 		a.finishCheck(id, e, checkSkipped)
+		a.publishRefused(ctx, name, u.ID, err, inSession)
 		return state.User{}, attempt{}, false, err
 	}
 	ok, rehash := false, false
@@ -302,6 +327,7 @@ func (a *Accounts) checkSessionPassword(ctx context.Context, id Identity, passwo
 		if ok, rehash, err = a.hasher.Verify(ctx, u.Hash, password); err != nil {
 			a.giveBack(at)
 			a.finishCheck(id, e, checkSkipped)
+			a.publishRefused(ctx, name, u.ID, err, inSession)
 			return state.User{}, attempt{}, false, err
 		}
 	}
@@ -320,12 +346,13 @@ func (a *Accounts) checkSessionPassword(ctx context.Context, id Identity, passwo
 		a.waitFailure(ctx, start, at.n)
 		return state.User{}, attempt{}, false, ErrSessionEnded
 	}
-	a.recordFailure(ctx, name, u, at, "wrong_password_in_session id="+id.Session.ID)
+	a.recordFailure(ctx, name, u, at, "wrong_password"+inSession)
 	if ends {
 		if _, err := a.endWhere(func(s state.Session) bool { return s.ID == id.Session.ID }); err != nil {
 			return state.User{}, attempt{}, false, err
 		}
-		a.publishEnded(ctx, []endedSession{{id.Session, "wrong_passwords"}})
+		// The answer is an error already; a record that fails pauses changes.
+		_ = a.recordEnded(ctx, []endedSession{{id.Session, "wrong_passwords"}})
 	}
 	a.waitFailure(ctx, start, at.n)
 	switch {
@@ -360,7 +387,9 @@ func (a *Accounts) Confirm(ctx context.Context, id Identity, password string, c 
 // the current one. The higher epoch ends every other session of the account
 // and invalidates the device cookies of other browsers; this session gets a
 // new token. The returned list names the links revoked with the sessions;
-// it is empty while the server has no links.
+// it is empty while the server has no links. With an error for which
+// events.IsUnrecorded holds, the password was changed and the grant is
+// valid.
 func (a *Accounts) ChangePassword(ctx context.Context, id Identity, current, next string, c Client) (Grant, []RevokedLink, error) {
 	if err := a.policy.Check(id.User.Username, next); err != nil {
 		return Grant{}, nil, err
@@ -394,6 +423,5 @@ func (a *Accounts) ChangePassword(ctx context.Context, id Identity, current, nex
 		a.giveBack(at)
 		return Grant{}, nil, err
 	}
-	a.publish(ctx, events.Event{Type: events.AuthPasswordChanged, Path: u.Username, Detail: "id=" + u.ID})
-	return grant, []RevokedLink{}, nil
+	return grant, []RevokedLink{}, a.record(ctx, true, events.Event{Type: events.AuthPasswordChanged, Path: u.Username, Detail: "id=" + u.ID})
 }

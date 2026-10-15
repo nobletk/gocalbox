@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"path"
+
+	"github.com/nobletk/gocalbox/internal/events"
 )
 
 func (a *api) handleListFiles(w http.ResponseWriter, r *http.Request) {
@@ -68,11 +70,11 @@ func (a *api) handleUpload(w http.ResponseWriter, r *http.Request) {
 			sizeHint = a.maxUpload
 		}
 		stored, size, err := a.files.Create(r.Context(), r.URL.Query().Get("path"), part.FileName(), part, sizeHint)
-		if err != nil {
+		if err != nil && !events.IsUnrecorded(err) {
 			writeError(w, r, err)
 			return
 		}
-		writeJSON(w, http.StatusCreated, PathResponse{Path: stored, Name: path.Base(stored), Size: size})
+		reply(w, r, http.StatusCreated, PathResponse{Path: stored, Name: path.Base(stored), Size: size}, err)
 		return
 	}
 
@@ -88,11 +90,11 @@ func (a *api) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deleted, err := a.files.Delete(r.Context(), req.Path)
-	if err != nil {
+	if err != nil && !events.IsUnrecorded(err) {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, PathResponse{Path: deleted})
+	reply(w, r, http.StatusOK, PathResponse{Path: deleted}, err)
 }
 
 func (a *api) handleMove(w http.ResponseWriter, r *http.Request) {
@@ -104,11 +106,11 @@ func (a *api) handleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	moved, err := a.files.Move(r.Context(), req.OldPath, req.NewPath)
-	if err != nil {
+	if err != nil && !events.IsUnrecorded(err) {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, PathResponse{Path: moved})
+	reply(w, r, http.StatusOK, PathResponse{Path: moved}, err)
 }
 
 func (a *api) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
@@ -120,9 +122,9 @@ func (a *api) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	created, err := a.files.Mkdir(r.Context(), req.TargetPath, req.Name)
-	if err != nil {
+	if err != nil && !events.IsUnrecorded(err) {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, PathResponse{Path: created})
+	reply(w, r, http.StatusCreated, PathResponse{Path: created}, err)
 }

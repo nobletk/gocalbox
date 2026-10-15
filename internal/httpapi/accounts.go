@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/nobletk/gocalbox/internal/auth"
+	"github.com/nobletk/gocalbox/internal/events"
 )
 
 type AccountService interface {
@@ -55,6 +56,8 @@ type RevokedLinksResponse struct {
 
 type StatusResponse struct {
 	SetupRequired bool `json:"setupRequired"`
+	// ChangesPaused is told only to a logged-in user.
+	ChangesPaused *bool `json:"changesPaused,omitempty"`
 }
 
 // Reachable without a session, and while the server has no admin yet.
@@ -97,19 +100,24 @@ func (a *api) handleSetup(w http.ResponseWriter, r *http.Request) {
 	g, err := a.accounts.CompleteSetup(r.Context(), auth.SetupRequest{
 		Code: req.Code, Username: req.Username, Password: req.Password, UseExisting: req.UseExisting,
 	}, a.client(r))
-	if err != nil {
+	if err != nil && !events.IsUnrecorded(err) {
 		writeError(w, r, err)
 		return
 	}
 	setSessionCookies(w, g)
-	writeJSON(w, http.StatusCreated, g.Me)
+	reply(w, r, http.StatusCreated, g.Me, err)
 }
 
 func (a *api) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet, http.MethodHead) {
 		return
 	}
-	writeJSON(w, http.StatusOK, StatusResponse{SetupRequired: a.accounts.SetupRequired()})
+	res := StatusResponse{SetupRequired: a.accounts.SetupRequired()}
+	if _, ok := identityFrom(r.Context()); ok {
+		paused := a.changesPaused != nil && a.changesPaused()
+		res.ChangesPaused = &paused
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (a *api) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -121,12 +129,12 @@ func (a *api) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g, err := a.accounts.Login(r.Context(), req.Username, req.Password, a.client(r))
-	if err != nil {
+	if err != nil && !events.IsUnrecorded(err) {
 		writeError(w, r, err)
 		return
 	}
 	setSessionCookies(w, g)
-	writeJSON(w, http.StatusOK, g.Me)
+	reply(w, r, http.StatusOK, g.Me, err)
 }
 
 func (a *api) handleLogout(w http.ResponseWriter, r *http.Request, id auth.Identity) {
@@ -175,12 +183,12 @@ func (a *api) handlePassword(w http.ResponseWriter, r *http.Request, id auth.Ide
 		return
 	}
 	g, links, err := a.accounts.ChangePassword(r.Context(), id, req.Current, req.New, a.client(r))
-	if err != nil {
+	if err != nil && !events.IsUnrecorded(err) {
 		writeSessionError(w, r, err)
 		return
 	}
 	setSessionCookies(w, g)
-	writeJSON(w, http.StatusOK, RevokedLinksResponse{RevokedLinks: links})
+	reply(w, r, http.StatusOK, RevokedLinksResponse{RevokedLinks: links}, err)
 }
 
 func (a *api) handleSessions(w http.ResponseWriter, r *http.Request, id auth.Identity) {
@@ -198,12 +206,17 @@ func (a *api) handleRevokeSession(w http.ResponseWriter, r *http.Request, id aut
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if err := a.accounts.RevokeSession(r.Context(), id, req.ID); err != nil {
+	err := a.accounts.RevokeSession(r.Context(), id, req.ID)
+	if err != nil && !events.IsUnrecorded(err) {
 		writeError(w, r, err)
 		return
 	}
 	if req.ID == id.Session.ID {
 		clearSessionCookie(w)
+	}
+	if err != nil {
+		writeError(w, r, err)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -213,9 +226,9 @@ func (a *api) handleRevokeOthers(w http.ResponseWriter, r *http.Request, id auth
 		return
 	}
 	links, err := a.accounts.RevokeOtherSessions(r.Context(), id)
-	if err != nil {
+	if err != nil && !events.IsUnrecorded(err) {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, RevokedLinksResponse{RevokedLinks: links})
+	reply(w, r, http.StatusOK, RevokedLinksResponse{RevokedLinks: links}, err)
 }

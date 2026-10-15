@@ -267,6 +267,7 @@ func TestCloseReturnsAtDeadlineWhilePublishersAreBlocked(t *testing.T) {
 }
 
 func TestPublishConcurrentWithCloseIsSafe(t *testing.T) {
+	captureLost(t)
 	for i := 0; i < 50; i++ {
 		b := New()
 		var c collector
@@ -348,6 +349,7 @@ func TestStats(t *testing.T) {
 }
 
 func TestPublishAndSubscribeAfterCloseAreNoOps(t *testing.T) {
+	captureLost(t)
 	b := New()
 	var c collector
 	b.Subscribe("c", c.handle, Options{})

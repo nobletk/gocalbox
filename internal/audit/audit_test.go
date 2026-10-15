@@ -139,6 +139,7 @@ func reopen(path string) error {
 }
 
 func TestFailedWriteIsRolledBackAndTheChainContinues(t *testing.T) {
+	captureLost(t)
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 	w, _ := Open(path)
 	w.Handle(ev(1))
@@ -161,6 +162,7 @@ func TestFailedWriteIsRolledBackAndTheChainContinues(t *testing.T) {
 }
 
 func TestWriterStopsWhenRollbackFails(t *testing.T) {
+	captureLost(t)
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 	w, _ := Open(path)
 	w.Handle(ev(1))
@@ -182,6 +184,7 @@ func TestWriterStopsWhenRollbackFails(t *testing.T) {
 }
 
 func TestFailedSyncRollsTheBatchBackAndTheChainContinues(t *testing.T) {
+	captureLost(t)
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 	w, _ := Open(path)
 	w.Handle(ev(1))
@@ -211,6 +214,7 @@ func TestFailedSyncRollsTheBatchBackAndTheChainContinues(t *testing.T) {
 }
 
 func TestWriterStopsWhenSyncRollbackFails(t *testing.T) {
+	captureLost(t)
 	path := filepath.Join(t.TempDir(), "audit.jsonl")
 	w, _ := Open(path)
 	w.Handle(ev(1))

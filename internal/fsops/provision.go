@@ -47,6 +47,8 @@ func (e *ConflictError) Unwrap() error { return ErrExists }
 // are removed again. A symlink or a file in a folder's place is always a
 // conflict, and so is a folder that a case-insensitive volume finds under
 // another spelling, since bindings name the spelling the directory stores.
+// The caller asks the audit policy first; an error for which
+// events.IsUnrecorded holds means everything was made.
 func (s *Service) Provision(ctx context.Context, folders []Folder, commit func() error) error {
 	for _, f := range folders {
 		if !validLayoutPath(f.Path) {
@@ -56,10 +58,22 @@ func (s *Service) Provision(ctx context.Context, folders []Folder, commit func()
 	s.mu.Lock()
 	created, err := s.provision(folders, commit)
 	s.mu.Unlock()
-	for _, f := range created {
-		s.publish(ctx, events.Event{Type: events.FolderCreated, Path: f.Path, Resolved: f.Path, Detail: f.Detail}, nil)
+	if err != nil || len(created) == 0 {
+		return err
 	}
-	return err
+	evs := make([]events.Event, 0, len(created))
+	for _, f := range created {
+		evs = append(evs, fill(ctx, events.Event{Type: events.FolderCreated, Path: f.Path, Resolved: f.Path, Detail: f.Detail}, nil))
+	}
+	if s.audit != nil {
+		return s.audit.Record(ctx, evs...)
+	}
+	if s.pub != nil {
+		for _, ev := range evs {
+			s.pub.Publish(ev)
+		}
+	}
+	return nil
 }
 
 func (s *Service) provision(folders []Folder, commit func() error) ([]Folder, error) {

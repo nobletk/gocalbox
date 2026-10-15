@@ -18,6 +18,7 @@ const (
 
 	AuthSetupCompleted   Type = "auth.setup_completed"
 	AuthLogin            Type = "auth.login"
+	AuthLoginSummary     Type = "auth.login_summary"
 	AuthLogout           Type = "auth.logout"
 	AuthPasswordChanged  Type = "auth.password_changed"
 	AuthPasswordDisabled Type = "auth.password_disabled"
@@ -75,4 +76,7 @@ type Event struct {
 	Since   time.Time `json:"since,omitzero"`
 
 	Detail string `json:"detail,omitempty"`
+
+	// Ack, when set, is told whether the event's record reached the disk.
+	Ack *Ack `json:"-"`
 }

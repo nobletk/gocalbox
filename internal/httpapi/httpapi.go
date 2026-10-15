@@ -34,7 +34,9 @@ type Options struct {
 
 	AllowedHosts []string
 
-	Ready func() error
+	// ChangesPaused reports whether the audit log's failure pauses changes,
+	// for /api/status.
+	ChangesPaused func() bool
 
 	BodyTimeout time.Duration
 
@@ -83,6 +85,9 @@ type PathResponse struct {
 type ErrorResponse struct {
 	Error     ErrorBody `json:"error"`
 	RequestID string    `json:"requestId,omitempty"`
+	// Result is what a change that was made would have answered, when its
+	// record is missing from the audit log.
+	Result any `json:"result,omitempty"`
 }
 
 type ErrorBody struct {
@@ -91,15 +96,15 @@ type ErrorBody struct {
 }
 
 type api struct {
-	files     FileService
-	accounts  AccountService
-	maxUpload int64
-	ready     func() error
-	tracker   *Tracker
+	files         FileService
+	accounts      AccountService
+	maxUpload     int64
+	changesPaused func() bool
+	tracker       *Tracker
 }
 
 func New(files FileService, webFS fs.FS, opts Options) http.Handler {
-	a := &api{files: files, accounts: opts.Accounts, maxUpload: opts.MaxUploadBytes, ready: opts.Ready, tracker: opts.Tracker}
+	a := &api{files: files, accounts: opts.Accounts, maxUpload: opts.MaxUploadBytes, changesPaused: opts.ChangesPaused, tracker: opts.Tracker}
 
 	mux := http.NewServeMux()
 	for _, rt := range a.routes(webFS, opts) {
@@ -146,20 +151,20 @@ type route struct {
 func (a *api) routes(webFS fs.FS, opts Options) []route {
 	rs := []route{
 		{"/", accessPublic, http.FileServer(http.FS(webFS))},
-		{"/files/", accessFiles, a.gate(http.StripPrefix("/files/", http.HandlerFunc(a.handleFile)))},
-		{"/api/files", accessFiles, a.gate(http.HandlerFunc(a.handleListFiles))},
-		{"/api/upload", accessFiles, a.gate(http.HandlerFunc(a.handleUpload))},
-		{"/api/fs/delete", accessFiles, a.gate(http.HandlerFunc(a.handleDelete))},
-		{"/api/fs/rename", accessFiles, a.gate(http.HandlerFunc(a.handleMove))},
-		{"/api/fs/move", accessFiles, a.gate(http.HandlerFunc(a.handleMove))},
-		{"/api/fs/mkdir", accessFiles, a.gate(http.HandlerFunc(a.handleCreateFolder))},
+		{"/files/", accessFiles, a.track(http.StripPrefix("/files/", http.HandlerFunc(a.handleFile)))},
+		{"/api/files", accessFiles, a.track(http.HandlerFunc(a.handleListFiles))},
+		{"/api/upload", accessFiles, a.track(http.HandlerFunc(a.handleUpload))},
+		{"/api/fs/delete", accessFiles, a.track(http.HandlerFunc(a.handleDelete))},
+		{"/api/fs/rename", accessFiles, a.track(http.HandlerFunc(a.handleMove))},
+		{"/api/fs/move", accessFiles, a.track(http.HandlerFunc(a.handleMove))},
+		{"/api/fs/mkdir", accessFiles, a.track(http.HandlerFunc(a.handleCreateFolder))},
 		{"/api/", accessSession, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			writeErrorJSON(w, r, http.StatusNotFound, "not_found", "Unknown API endpoint")
 		})},
 	}
 	if a.accounts != nil {
 		rs = append(rs,
-			route{"/api/setup", accessPublic, a.gate(http.HandlerFunc(a.handleSetup))},
+			route{"/api/setup", accessPublic, a.track(http.HandlerFunc(a.handleSetup))},
 			route{"/api/status", accessPublic, http.HandlerFunc(a.handleStatus)},
 			route{"/api/auth/login", accessPublic, a.track(http.HandlerFunc(a.handleLogin))},
 		)
@@ -201,25 +206,8 @@ func rejectUnclean(next http.Handler) http.Handler {
 	})
 }
 
-func (a *api) gate(next http.Handler) http.Handler {
-	h := next
-	if a.ready != nil {
-		inner := h
-		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if err := a.ready(); err != nil {
-				log.Printf("Refusing %s %s: %v", r.Method, r.URL.Path, err)
-				writeErrorJSON(w, r, http.StatusServiceUnavailable, "unavailable", "File operations are suspended because they cannot be audited")
-				return
-			}
-			inner.ServeHTTP(w, r)
-		})
-	}
-	return a.track(h)
-}
-
-// track counts the request among the operations in progress, without the
-// audit gate: logins, logouts and password changes go on when the audit log
-// fails.
+// track counts the request among the operations in progress, which a
+// shutdown waits for.
 func (a *api) track(h http.Handler) http.Handler {
 	if a.tracker != nil {
 		return a.tracker.track(h)
@@ -232,7 +220,7 @@ func requestContext(next http.Handler) http.Handler {
 		id := newRequestID()
 		w.Header().Set("X-Request-ID", id)
 
-		ctx := events.WithRequestID(r.Context(), id)
+		ctx := events.WithWaitBudget(events.WithRequestID(r.Context(), id))
 		// X-Forwarded-For is ignored because any client can forge it.
 		ctx = events.WithActor(ctx, events.Actor{ID: events.AnonymousID, RemoteAddr: r.RemoteAddr})
 		next.ServeHTTP(w, r.WithContext(ctx))

@@ -33,13 +33,36 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeErrorJSON(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	writeErrorResult(w, r, status, code, message, nil)
+}
+
+func writeErrorResult(w http.ResponseWriter, r *http.Request, status int, code, message string, result any) {
 	for _, h := range []string{"Content-Disposition", "Content-Security-Policy", "Content-Encoding", "Content-Length"} {
 		w.Header().Del(h)
 	}
 	writeJSON(w, status, ErrorResponse{
 		Error:     ErrorBody{Code: code, Message: message},
 		RequestID: events.RequestIDFrom(r.Context()),
+		Result:    result,
 	})
+}
+
+// reply answers a change with v, or, if the change was made but its record
+// is missing (err), with the error and v as its result, so the client knows
+// the change exists and doesn't repeat it.
+func reply(w http.ResponseWriter, r *http.Request, status int, v any, err error) {
+	if err == nil {
+		writeJSON(w, status, v)
+		return
+	}
+	log.Printf("AUDIT ERROR: %s %s: %v", r.Method, r.URL.Path, err)
+	if errors.Is(err, events.ErrNotConfirmed) {
+		writeErrorResult(w, r, http.StatusInternalServerError, "not_confirmed",
+			"The change was made, but its record in the audit log was not confirmed in time", v)
+		return
+	}
+	writeErrorResult(w, r, http.StatusInternalServerError, "not_recorded",
+		"The change was made, but it could not be recorded in the audit log", v)
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, err error) {
@@ -49,6 +72,11 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var tooMany *auth.TooManyAttemptsError
 
 	switch {
+	case events.IsUnrecorded(err):
+		reply(w, r, 0, nil, err)
+	case errors.Is(err, events.ErrChangesPaused):
+		writeErrorJSON(w, r, http.StatusServiceUnavailable, "changes_paused",
+			"Changes are paused because the audit log failed; reading still works. The server's operator has to look at it and restart the server")
 	case errors.Is(err, sandbox.ErrReserved):
 		writeErrorJSON(w, r, http.StatusForbidden, "reserved_path", "This name is reserved for the server")
 	case errors.Is(err, fsops.ErrForbidden):

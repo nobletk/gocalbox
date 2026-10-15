@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/nobletk/gocalbox/internal/events"
 	"github.com/nobletk/gocalbox/internal/sandbox"
@@ -28,6 +30,7 @@ var (
 	ErrTornTail = errors.New("audit log ends with an incomplete record")
 	ErrBroken   = errors.New("audit log could not be repaired after a failed write; recording stopped")
 	ErrLocked   = errors.New("the audit log is in use by another process")
+	ErrClosed   = errors.New("the audit log is closed")
 )
 
 type TamperError struct {
@@ -133,8 +136,11 @@ type Writer struct {
 	prev    string
 	records int
 	size    int64
-	err     error
 	broken  bool
+
+	// failed holds the first error apart from mu, which a write holds
+	// through its fsync, so that asking never waits for the disk.
+	failed atomic.Pointer[error]
 }
 
 // Open takes an exclusive lock on the log, failing with ErrLocked while
@@ -192,24 +198,46 @@ func (w *Writer) Records() int {
 }
 
 func (w *Writer) Err() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.err
+	if p := w.failed.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 func (w *Writer) Handle(ev events.Event) { w.HandleBatch([]events.Event{ev}) }
 
+// HandleBatch writes evs and answers their Acks once they are on disk. Events
+// it cannot write are printed on the console, their only copy, and their
+// Acks get the error.
 func (w *Writer) HandleBatch(evs []events.Event) {
+	if len(evs) == 0 {
+		return
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.f == nil || w.broken || len(evs) == 0 {
+	switch {
+	case w.f == nil:
+		lose(evs, ErrClosed)
+		return
+	case w.broken:
+		lose(evs, ErrBroken)
 		return
 	}
 	if err := w.append(evs); err != nil {
-		if w.err == nil {
-			w.err = err
-		}
+		w.failed.CompareAndSwap(nil, &err)
 		log.Printf("AUDIT ERROR: could not record %d event(s) starting at %s seq=%d: %v", len(evs), evs[0].Type, evs[0].Seq, err)
+		lose(evs, err)
+		return
+	}
+	for _, ev := range evs {
+		ev.Ack.Done(nil)
+	}
+}
+
+func lose(evs []events.Event, cause error) {
+	for _, ev := range evs {
+		events.PrintLost(ev, events.LostNotRecorded, cause)
+		ev.Ack.Done(cause)
 	}
 }
 
@@ -285,8 +313,26 @@ func (w *Writer) Close() error {
 	return err
 }
 
+// Subscribe makes c the bus's audit subscriber. A log that takes no event
+// for stallAfter pauses changes through g; from then on, the events it has
+// no room for are printed instead of waited for.
+func Subscribe(bus *events.Bus, c *Coalescer, g *Guard, metadata bool, stallAfter time.Duration) {
+	bus.SubscribeBatch("audit", c.HandleBatch, events.Options{
+		Mode:       events.Block,
+		Buffer:     1024,
+		Filter:     Filter(metadata),
+		StallAfter: stallAfter,
+		OnStall:    g.Trip,
+	})
+}
+
+// Filter passes every event the log keeps: all but successful listings and
+// file checks, which only metadata keeps. An event with an Ack always passes.
 func Filter(metadata bool) func(events.Event) bool {
 	return func(ev events.Event) bool {
+		if ev.Ack != nil {
+			return true
+		}
 		isMetadata := ev.Type == events.FileListed || ev.Type == events.FileChecked
 		return metadata || !isMetadata || ev.Outcome != events.OutcomeOK
 	}

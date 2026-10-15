@@ -54,7 +54,9 @@ func run() error {
 	auditLog := flag.String("audit-log", defaultAuditPath(), "Audit log file; must be outside the served directory")
 	auditListings := flag.Bool("audit-listings", false, "Also record successful directory listings and file checks (HEAD requests, 304 revalidations) in the audit log")
 	auditRangeWindow := flag.Duration("audit-range-window", 5*time.Minute, "Collapse ranged downloads of a file by one client within this window into one summary record (0 = record every request)")
-	auditFailClosed := flag.Bool("audit-fail-closed", false, "Refuse file operations with 503 once the audit log cannot be written")
+	auditWait := flag.Bool("audit-wait", true, "Reply to a change only once its audit record is on disk (false only for measurements)")
+	auditWaitTimeout := flag.Duration("audit-wait-timeout", 10*time.Second, "Longest a change waits for its audit record; a record not confirmed by then pauses changes")
+	auditFailOpen := flag.Bool("audit-fail-open", false, "Keep accepting changes after the audit log failed (only for measurements)")
 	logEvents := flag.Bool("log-events", true, "Print every file event to the console (the audit log is not affected)")
 	bodyTimeout := flag.Duration("body-timeout", 30*time.Second, "Abort an upload or other request whose body delivers less than 64 KiB in this long (0 = never)")
 	tlsDir := flag.String("tls-dir", defaultTLSDir(), "Folder of the local CA that issues the HTTPS certificate when -tls-cert is not given; must be outside the served directory")
@@ -85,6 +87,9 @@ func run() error {
 	if err := checkSessions(sessions); err != nil {
 		return err
 	}
+	if *auditWaitTimeout <= 0 {
+		return errors.New("-audit-wait-timeout must be longer than 0")
+	}
 	if *minFreeMB < 0 || *minFreeMB > math.MaxInt64>>20 {
 		return fmt.Errorf("-min-free-mb must be between 0 and %d, got %d", int64(math.MaxInt64>>20), *minFreeMB)
 	}
@@ -98,7 +103,9 @@ func run() error {
 		AuditLog:         *auditLog,
 		AuditListings:    *auditListings,
 		AuditRangeWindow: *auditRangeWindow,
-		AuditFailClosed:  *auditFailClosed,
+		AuditNoWait:      !*auditWait,
+		AuditWaitTimeout: *auditWaitTimeout,
+		AuditFailOpen:    *auditFailOpen,
 		LogEvents:        *logEvents,
 		BodyTimeout:      *bodyTimeout,
 		TLSCert:          *tlsCert,
@@ -186,7 +193,9 @@ type config struct {
 	AuditLog         string
 	AuditListings    bool
 	AuditRangeWindow time.Duration
-	AuditFailClosed  bool
+	AuditNoWait      bool          // changes reply without waiting for their records
+	AuditWaitTimeout time.Duration // 10 s when 0
+	AuditFailOpen    bool
 	LogEvents        bool
 	BodyTimeout      time.Duration
 
@@ -278,21 +287,15 @@ func newApp(cfg config) (_ *app, err error) {
 		ledger = space.NewLedger(func() (int64, error) { return space.Free(volume) }, cfg.MinFreeBytes)
 	}
 
-	auditHandler := auditWriter.HandleBatch
-	var coalescer *audit.Coalescer
-	if cfg.AuditRangeWindow > 0 {
-		coalescer = audit.NewCoalescer(auditWriter, cfg.AuditRangeWindow)
-		auditHandler = coalescer.HandleBatch
-		undo = append(undo, func() error { coalescer.Close(); return nil })
-	}
+	coalescer := audit.NewCoalescer(auditWriter, cfg.AuditRangeWindow, audit.LoginWindow)
+	undo = append(undo, func() error { coalescer.Close(); return nil })
+	waitTimeout := cmp.Or(cfg.AuditWaitTimeout, 10*time.Second)
+
+	guard := audit.NewGuard(auditWriter.Err)
 
 	bus := events.New()
 	undo = append(undo, func() error { return bus.Close(context.Background()) })
-	bus.SubscribeBatch("audit", auditHandler, events.Options{
-		Mode:   events.Block,
-		Buffer: 1024,
-		Filter: audit.Filter(cfg.AuditListings),
-	})
+	audit.Subscribe(bus, coalescer, guard, cfg.AuditListings, waitTimeout)
 	if cfg.LogEvents {
 		bus.Subscribe("console", events.LogHandler, events.Options{Mode: events.Drop, Buffer: 1024})
 	}
@@ -308,9 +311,6 @@ func newApp(cfg config) (_ *app, err error) {
 		BodyTimeout:    cfg.BodyTimeout,
 		Tracker:        inflight,
 	}
-	if cfg.AuditFailClosed {
-		opts.Ready = auditWriter.Err
-	}
 	if tlsSetup != nil {
 		opts.RequireTLS = true
 		if tlsSetup.CA != nil {
@@ -318,8 +318,15 @@ func newApp(cfg config) (_ *app, err error) {
 		}
 	}
 
+	recorder := audit.NewRecorder(bus, guard, audit.RecorderOptions{
+		Wait:     !cfg.AuditNoWait,
+		Timeout:  waitTimeout,
+		FailOpen: cfg.AuditFailOpen,
+	})
+	opts.ChangesPaused = recorder.Paused
+
 	minPwLen := cmp.Or(cfg.MinPasswordLen, auth.DefaultMinPasswordLength)
-	files := fsops.New(sb, bus, fsops.WithSpace(ledger), fsops.WithRecords(db))
+	files := fsops.New(sb, bus, fsops.WithSpace(ledger), fsops.WithRecords(db), fsops.WithAudit(recorder))
 	if err := files.EmptyTrash(); err != nil {
 		log.Printf("WARNING: cannot empty the trash of deleted folders: %v", err)
 	}
@@ -329,6 +336,7 @@ func newApp(cfg config) (_ *app, err error) {
 		Policy:   auth.Policy{MinLength: minPwLen},
 		Folders:  files,
 		Events:   bus,
+		Audit:    recorder,
 		Sessions: cfg.Sessions,
 	})
 	files.SetPolicy(accounts)
@@ -384,9 +392,7 @@ func (a *app) Close(ctx context.Context) error {
 	flushCtx, cancel := context.WithTimeout(context.Background(), flushTimeout)
 	defer cancel()
 	err := a.bus.Close(flushCtx)
-	if a.coalescer != nil {
-		a.coalescer.Close()
-	}
+	a.coalescer.Close()
 	if cerr := a.audit.Close(); err == nil {
 		err = cerr
 	}

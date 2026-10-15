@@ -75,6 +75,7 @@ type Service struct {
 	space  *space.Ledger
 	policy Policy
 	db     *state.DB
+	audit  events.Auditor
 
 	// mu serializes check-then-act sequences (unique names, no-overwrite
 	// moves, the decision and the uploader records of every change) within
@@ -91,6 +92,10 @@ func WithSpace(l *space.Ledger) Option { return func(s *Service) { s.space = l }
 // WithRecords keeps uploader records in db. Without it no file has an
 // uploader, so only admins and home owners can change files.
 func WithRecords(db *state.DB) Option { return func(s *Service) { s.db = db } }
+
+// WithAudit applies the audit log's policies: a change is refused once the
+// log has failed, and replies only once its record is on disk.
+func WithAudit(a events.Auditor) Option { return func(s *Service) { s.audit = a } }
 
 func New(sb *sandbox.Sandbox, pub Publisher, opts ...Option) *Service {
 	s := &Service{sb: sb, root: sb.OSRoot(), pub: pub}
@@ -371,8 +376,7 @@ func (s *Service) Create(ctx context.Context, dir, name string, r io.Reader, siz
 		ev.Path = logicalJoin(dir, path.Base(stored))
 		ev.Resolved = stored
 	}
-	s.publish(ctx, ev, err)
-	return stored, size, err
+	return stored, size, s.publishChange(ctx, ev, err)
 }
 
 func (s *Service) mayUpload(ctx context.Context, p sandbox.Path) (Subject, error) {
@@ -391,6 +395,9 @@ func (s *Service) mayUpload(ctx context.Context, p sandbox.Path) (Subject, error
 }
 
 func (s *Service) create(ctx context.Context, dir, name string, r io.Reader, sizeHint int64) (string, int64, error) {
+	if err := s.allow(); err != nil {
+		return "", 0, err
+	}
 	sub, ok := s.subject(ctx)
 	if !ok {
 		return "", 0, hide(ErrParentNotFound)
@@ -448,6 +455,9 @@ func (s *Service) create(ctx context.Context, dir, name string, r io.Reader, siz
 	case !here:
 		err = ErrUploadMoved
 	default:
+		if err = s.allow(); err != nil {
+			break
+		}
 		if err = s.finishUpload(up); err != nil {
 			err = fmt.Errorf("write file: %w", err)
 		}
@@ -476,6 +486,9 @@ type upload struct {
 // name and records its uploader without identity, which the end of the
 // upload adds. The caller holds s.mu.
 func (s *Service) createRecorded(ctx context.Context, p sandbox.Path, name string) (*upload, error) {
+	if err := s.allow(); err != nil {
+		return nil, err
+	}
 	sub, err := s.mayUpload(ctx, p)
 	if err != nil {
 		return nil, err
@@ -587,11 +600,13 @@ func numbered(base, ext string, i int) (string, bool) {
 func (s *Service) Mkdir(ctx context.Context, parent, name string) (string, error) {
 	p, err := s.mkdir(ctx, parent, name)
 	err = osErr(sandbox.FromRoot(err))
-	s.publish(ctx, events.Event{Type: events.FolderCreated, Path: logicalJoin(parent, name), Resolved: p.Rel}, err)
-	return p.Rel, err
+	return p.Rel, s.publishChange(ctx, events.Event{Type: events.FolderCreated, Path: logicalJoin(parent, name), Resolved: p.Rel}, err)
 }
 
 func (s *Service) mkdir(ctx context.Context, parent, name string) (sandbox.Path, error) {
+	if err := s.allow(); err != nil {
+		return sandbox.Path{}, err
+	}
 	sub, ok := s.subject(ctx)
 	if !ok {
 		return sandbox.Path{}, hide(ErrParentNotFound)
@@ -607,6 +622,9 @@ func (s *Service) mkdir(ctx context.Context, parent, name string) (sandbox.Path,
 	// so a concurrent Move could overwrite the new folder.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.allow(); err != nil {
+		return p, err
+	}
 	if sub, ok = s.subject(ctx); !ok {
 		return p, hide(ErrParentNotFound)
 	}
@@ -643,11 +661,13 @@ func (s *Service) mkdir(ctx context.Context, parent, name string) (sandbox.Path,
 func (s *Service) Delete(ctx context.Context, userPath string) (string, error) {
 	p, err := s.delete(ctx, userPath)
 	err = osErr(sandbox.FromRoot(err))
-	s.publish(ctx, events.Event{Type: events.FileDeleted, Path: userPath, Resolved: p.Rel}, err)
-	return p.Rel, err
+	return p.Rel, s.publishChange(ctx, events.Event{Type: events.FileDeleted, Path: userPath, Resolved: p.Rel}, err)
 }
 
 func (s *Service) delete(ctx context.Context, userPath string) (sandbox.Path, error) {
+	if err := s.allow(); err != nil {
+		return sandbox.Path{}, err
+	}
 	sub, ok := s.subject(ctx)
 	if !ok {
 		return sandbox.Path{}, hide(ErrNotFound)
@@ -669,6 +689,9 @@ func (s *Service) delete(ctx context.Context, userPath string) (sandbox.Path, er
 // deleteLocked removes the entry p, or moves it into the trash if it is a
 // folder, and returns its name there. The caller holds s.mu.
 func (s *Service) deleteLocked(ctx context.Context, p sandbox.Path) (string, error) {
+	if err := s.allow(); err != nil {
+		return "", err
+	}
 	sub, ok := s.subject(ctx)
 	if !ok {
 		return "", hide(ErrNotFound)
@@ -716,14 +739,16 @@ func (s *Service) deleteLocked(ctx context.Context, p sandbox.Path) (string, err
 func (s *Service) Move(ctx context.Context, oldPath, newPath string) (string, error) {
 	from, to, err := s.move(ctx, oldPath, newPath)
 	err = osErr(sandbox.FromRoot(err))
-	s.publish(ctx, events.Event{
+	return to.Rel, s.publishChange(ctx, events.Event{
 		Type: events.FileMoved, Path: oldPath, Target: newPath,
 		Resolved: from.Rel, ResolvedTarget: to.Rel,
 	}, err)
-	return to.Rel, err
 }
 
 func (s *Service) move(ctx context.Context, oldPath, newPath string) (from, to sandbox.Path, err error) {
+	if err := s.allow(); err != nil {
+		return sandbox.Path{}, sandbox.Path{}, err
+	}
 	sub, ok := s.subject(ctx)
 	if !ok {
 		return sandbox.Path{}, sandbox.Path{}, hide(ErrNotFound)
@@ -758,6 +783,9 @@ func (s *Service) move(ctx context.Context, oldPath, newPath string) (from, to s
 // checks that compare the two paths, which could otherwise tell how
 // symlinks in an unreadable folder resolve. The caller holds s.mu.
 func (s *Service) moveLocked(ctx context.Context, from, to sandbox.Path) error {
+	if err := s.allow(); err != nil {
+		return err
+	}
 	sub, ok := s.subject(ctx)
 	if !ok {
 		return hide(ErrNotFound)
@@ -880,9 +908,29 @@ func (s *Service) isDir(name string) bool {
 }
 
 func (s *Service) publish(ctx context.Context, ev events.Event, err error) {
-	if s.pub == nil {
-		return
+	if s.pub != nil {
+		s.pub.Publish(fill(ctx, ev, err))
 	}
+}
+
+// publishChange publishes the event of a change. A change that was made
+// returns only once its record is on disk, or with the error saying it isn't.
+func (s *Service) publishChange(ctx context.Context, ev events.Event, err error) error {
+	if err != nil || s.audit == nil {
+		s.publish(ctx, ev, err)
+		return err
+	}
+	return s.audit.Record(ctx, fill(ctx, ev, nil))
+}
+
+func (s *Service) allow() error {
+	if s.audit == nil {
+		return nil
+	}
+	return s.audit.Allow()
+}
+
+func fill(ctx context.Context, ev events.Event, err error) events.Event {
 	ev.Actor = events.ActorFrom(ctx)
 	ev.RequestID = events.RequestIDFrom(ctx)
 	ev.Outcome = outcomeOf(err)
@@ -891,7 +939,7 @@ func (s *Service) publish(ctx context.Context, ev events.Event, err error) {
 	if err != nil {
 		ev.Detail = truncate(err.Error())
 	}
-	s.pub.Publish(ev)
+	return ev
 }
 
 func outcomeOf(err error) events.Outcome {
@@ -901,6 +949,7 @@ func outcomeOf(err error) events.Outcome {
 	case isHidden(err),
 		errors.Is(err, ErrForbidden),
 		errors.Is(err, ErrBoundFolder),
+		errors.Is(err, events.ErrChangesPaused),
 		errors.Is(err, sandbox.ErrReserved),
 		errors.Is(err, sandbox.ErrTraversal),
 		errors.Is(err, sandbox.ErrRootTarget),

@@ -2,11 +2,9 @@ package httpapi
 
 import (
 	"bytes"
-	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -229,32 +227,6 @@ func TestDownloadEventsReportBytesSent(t *testing.T) {
 		if ev.Type != tc.typ || ev.Outcome != tc.outcome || ev.Size != tc.size || ev.Range != tc.headers["Range"] || ev.Resolved != "movie.bin" {
 			t.Errorf("%s: event = %+v", tc.name, ev)
 		}
-	}
-}
-
-func TestReadyGateSuspendsFileOperations(t *testing.T) {
-	var auditErr error
-	e := newEnvOpts(t, Options{Ready: func() error { return auditErr }})
-	e.write("a.txt", "x")
-
-	if code, _, _ := e.list(""); code != 200 {
-		t.Fatalf("healthy list = %d", code)
-	}
-	auditErr = errors.New("disk full")
-	for _, p := range []string{"/api/files", "/files/a.txt"} {
-		resp := e.request("GET", p, nil, nil)
-		want(t, resp.StatusCode, 503, p)
-		if er := readErr(t, resp); er.Error.Code != "unavailable" {
-			t.Errorf("%s: code %q", p, er.Error.Code)
-		}
-	}
-	code, _ := e.postJSON("/api/fs/delete", DeleteRequest{Path: "a.txt"})
-	want(t, code, 503, "delete while unhealthy")
-	if _, err := os.Stat(filepath.Join(e.root, "a.txt")); err != nil {
-		t.Error("file deleted while operations were suspended")
-	}
-	if code, _ := e.do("GET", "/", nil, ""); code != 200 {
-		t.Errorf("UI not served while suspended: %d", code)
 	}
 }
 

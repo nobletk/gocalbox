@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,15 @@ type Options struct {
 	// state without locking.
 	Filter   func(Event) bool
 	MaxBatch int // 256 default
+	// StallAfter, for the Block subscriber that answers Acks, is how long it
+	// may take no event before it counts as stalled. Until it takes one
+	// again, the events it has no room for are printed on the console and
+	// their Acks answered with ErrStalled, so that publishers don't wait for
+	// it. 0 waits for ever.
+	StallAfter time.Duration
+	// OnStall is called each time the subscriber stalls. It runs on the
+	// dispatcher, so it must neither block nor publish.
+	OnStall func(error)
 }
 
 type Bus struct {
@@ -58,6 +68,9 @@ type subscriber struct {
 	mode      Mode
 	filter    func(Event) bool
 	maxBatch  int
+	stall     time.Duration
+	onStall   func(error)
+	stalled   bool // used by the dispatcher only
 	delivered atomic.Uint64
 	dropped   atomic.Uint64
 	done      chan struct{}
@@ -108,6 +121,8 @@ func (b *Bus) add(name string, h BatchHandler, opts Options) {
 		mode:     opts.Mode,
 		filter:   opts.Filter,
 		maxBatch: opts.MaxBatch,
+		stall:    opts.StallAfter,
+		onStall:  opts.OnStall,
 		done:     make(chan struct{}),
 	}
 
@@ -122,22 +137,26 @@ func (b *Bus) add(name string, h BatchHandler, opts Options) {
 	go s.run()
 }
 
+// Publish queues ev for every subscriber. An event published after Close
+// reaches none of them: it is printed on the console and its Ack answered.
 func (b *Bus) Publish(ev Event) {
+	if ev.Time.IsZero() {
+		ev.Time = b.now()
+	}
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
+		lose(ev, ErrClosed)
 		return
 	}
 	b.publishers.Add(1)
 	b.mu.Unlock()
 	defer b.publishers.Done()
 
-	if ev.Time.IsZero() {
-		ev.Time = b.now()
-	}
 	select {
 	case b.in <- ev:
 	case <-b.abort:
+		lose(ev, ErrClosed)
 	}
 }
 
@@ -146,6 +165,13 @@ func (b *Bus) dispatch() {
 	defer func() {
 		for _, s := range *b.subs.Load() {
 			close(s.ch)
+		}
+	}()
+	defer func() {
+		select {
+		case <-b.abort:
+			b.loseQueued()
+		default:
 		}
 	}()
 
@@ -176,11 +202,67 @@ func (b *Bus) dispatch() {
 				}
 				continue
 			}
-			select {
-			case s.ch <- ev:
-			case <-b.abort:
+			if !b.offer(s, ev) {
+				if s.stall > 0 {
+					lose(ev, ErrClosed)
+				}
 				return
 			}
+		}
+	}
+}
+
+// offer hands ev to the Block subscriber s, waiting for room unless s has
+// stalled. It returns false once the bus gives up.
+func (b *Bus) offer(s *subscriber, ev Event) bool {
+	if s.stall == 0 {
+		select {
+		case s.ch <- ev:
+			return true
+		case <-b.abort:
+			return false
+		}
+	}
+	select {
+	case s.ch <- ev:
+		s.stalled = false
+		return true
+	default:
+	}
+	if s.stalled {
+		s.dropped.Add(1)
+		lose(ev, ErrStalled)
+		return true
+	}
+	t := time.NewTimer(s.stall)
+	defer t.Stop()
+	select {
+	case s.ch <- ev:
+	case <-t.C:
+		s.stalled = true
+		s.dropped.Add(1)
+		log.Printf("events: subscriber %q took no event for %s; until it takes one, events it has no room for are printed instead", s.name, s.stall)
+		if s.onStall != nil {
+			s.onStall(fmt.Errorf("%w for %s", ErrStalled, s.stall))
+		}
+		lose(ev, ErrStalled)
+	case <-b.abort:
+		return false
+	}
+	return true
+}
+
+// loseQueued prints the events left in the queue when the bus gives up.
+func (b *Bus) loseQueued() {
+	for {
+		select {
+		case ev, ok := <-b.in:
+			if !ok {
+				return
+			}
+			lose(ev, ErrClosed)
+		default:
+			return
 		}
 	}
 }
