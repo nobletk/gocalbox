@@ -54,7 +54,7 @@ func newObservedEnv(t *testing.T) (*env, *recorder) {
 	t.Helper()
 	e := newEnv(t)
 	rec := &recorder{}
-	e.svc = New(e.sb, rec)
+	e.svc = asAdmin(New(e.sb, rec))
 	return e, rec
 }
 

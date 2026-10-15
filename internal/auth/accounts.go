@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nobletk/gocalbox/internal/authz"
 	"github.com/nobletk/gocalbox/internal/events"
 	"github.com/nobletk/gocalbox/internal/fsops"
 	"github.com/nobletk/gocalbox/internal/state"
@@ -78,11 +79,11 @@ type Accounts struct {
 	mu    sync.Mutex // serializes setup and layout changes
 	setup atomic.Pointer[SetupCode]
 
-	// users is rebuilt after every change, so each request reads the
-	// account without a transaction. usersMu holds a change and its rebuild
-	// together, so an older rebuild cannot replace a newer one.
+	// snap is rebuilt after every change, so each request reads the account
+	// and the bindings without a transaction. usersMu holds a change and its
+	// rebuild together, so an older rebuild cannot replace a newer one.
 	usersMu   sync.Mutex
-	users     atomic.Pointer[map[string]state.User]
+	snap      atomic.Pointer[snapshot]
 	sessions  *sessionStore
 	throttle  *throttle
 	deviceKey []byte
@@ -112,26 +113,39 @@ func New(c Config) *Accounts {
 	if c.Hasher != nil {
 		a.dummyHash = c.Hasher.dummy()
 	}
-	a.users.Store(&map[string]state.User{})
+	a.snap.Store(&snapshot{users: map[string]state.User{}, bindings: authz.NewBindings(nil)})
 	return a
 }
 
-// update runs fn in a write transaction and then rebuilds the users snapshot.
+// snapshot holds the users and the bindings of one committed state, so that
+// no request combines the role of one state with the bindings of another.
+type snapshot struct {
+	users    map[string]state.User
+	bindings *authz.Bindings
+}
+
+func (a *Accounts) users() map[string]state.User { return a.snap.Load().users }
+
+// update runs fn in a write transaction and then rebuilds the snapshots.
 func (a *Accounts) update(fn func(*state.Tx) error) error {
 	a.usersMu.Lock()
 	defer a.usersMu.Unlock()
 	if err := a.db.Update(fn); err != nil {
 		return err
 	}
-	if err := a.reloadUsers(); err != nil {
-		log.Printf("accounts: cannot reload the users after a change: %v", err)
+	if err := a.reload(); err != nil {
+		log.Printf("accounts: cannot reload the users and bindings after a change: %v", err)
 	}
 	return nil
 }
 
-func (a *Accounts) reloadUsers() error {
+func (a *Accounts) reload() error {
 	return a.db.View(func(tx *state.Tx) error {
 		list, err := tx.Users()
+		if err != nil {
+			return err
+		}
+		bindings, err := tx.Bindings()
 		if err != nil {
 			return err
 		}
@@ -139,7 +153,7 @@ func (a *Accounts) reloadUsers() error {
 		for _, u := range list {
 			m[u.ID] = u
 		}
-		a.users.Store(&m)
+		a.snap.Store(&snapshot{users: m, bindings: authzBindings(bindings)})
 		return nil
 	})
 }

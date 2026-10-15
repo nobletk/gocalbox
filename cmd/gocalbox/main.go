@@ -319,7 +319,10 @@ func newApp(cfg config) (_ *app, err error) {
 	}
 
 	minPwLen := cmp.Or(cfg.MinPasswordLen, auth.DefaultMinPasswordLength)
-	files := fsops.New(sb, bus, fsops.WithSpace(ledger))
+	files := fsops.New(sb, bus, fsops.WithSpace(ledger), fsops.WithRecords(db))
+	if err := files.EmptyTrash(); err != nil {
+		log.Printf("WARNING: cannot empty the trash of deleted folders: %v", err)
+	}
 	accounts := auth.New(auth.Config{
 		DB:       db,
 		Hasher:   auth.NewHasher(auth.DefaultParams, hashSlots, hashWait),
@@ -328,6 +331,7 @@ func newApp(cfg config) (_ *app, err error) {
 		Events:   bus,
 		Sessions: cfg.Sessions,
 	})
+	files.SetPolicy(accounts)
 	opts.Accounts = accounts
 	setupCode, err := accounts.StartSetup()
 	if err != nil {

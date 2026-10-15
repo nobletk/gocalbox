@@ -559,3 +559,15 @@ func TestUploadsKeepTheFreeSpaceReserve(t *testing.T) {
 		}
 	}
 }
+
+func TestStartingEmptiesTheTrash(t *testing.T) {
+	a, cfg := newTestApp(t, func(cfg *config) {
+		left := filepath.Join(cfg.RootDir, ".gocalbox", "trash", "0123", "deleted.txt")
+		os.MkdirAll(filepath.Dir(left), 0o700)
+		os.WriteFile(left, []byte("x"), 0o644)
+	})
+	defer closeApp(t, a)
+	if _, err := os.Stat(filepath.Join(cfg.RootDir, ".gocalbox", "trash")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the trash after starting: %v", err)
+	}
+}

@@ -45,7 +45,7 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { sb.Close() })
-	return &env{t: t, svc: New(sb, nil), sb: sb, root: sb.Root(), outside: outside}
+	return &env{t: t, svc: asAdmin(New(sb, nil)), sb: sb, root: sb.Root(), outside: outside}
 }
 
 func (e *env) write(rel, content string) {

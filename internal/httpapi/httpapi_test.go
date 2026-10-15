@@ -16,7 +16,6 @@ import (
 	"testing/fstest"
 
 	"github.com/nobletk/gocalbox/internal/events"
-	"github.com/nobletk/gocalbox/internal/fsops"
 	"github.com/nobletk/gocalbox/internal/sandbox"
 )
 
@@ -69,7 +68,7 @@ func newEnvOpts(t *testing.T, opts Options) *env {
 	t.Cleanup(func() { sb.Close() })
 	web := fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}
 	rec := &recorder{}
-	srv := httptest.NewServer(newTestHandler(fsops.New(sb, rec), web, opts))
+	srv := httptest.NewServer(newTestHandler(adminFiles(sb, rec), web, opts))
 	t.Cleanup(srv.Close)
 	return &env{t: t, root: sb.Root(), outside: outside, srv: srv, rec: rec}
 }

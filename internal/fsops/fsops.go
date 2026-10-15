@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -19,9 +20,11 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/nobletk/gocalbox/internal/authz"
 	"github.com/nobletk/gocalbox/internal/events"
 	"github.com/nobletk/gocalbox/internal/sandbox"
 	"github.com/nobletk/gocalbox/internal/space"
+	"github.com/nobletk/gocalbox/internal/state"
 )
 
 var (
@@ -34,6 +37,7 @@ var (
 	ErrInvalidRange       = errors.New("requested range not satisfiable")
 	ErrPreconditionFailed = errors.New("precondition failed")
 	ErrAborted            = errors.New("transfer aborted")
+	ErrUploadMoved        = errors.New("the file was moved or deleted while it was uploaded")
 
 	ErrInsufficientStorage = space.ErrInsufficient
 	ErrCrossDevice         = errors.New("source and destination are on different file systems")
@@ -44,6 +48,14 @@ type Entry struct {
 	Name  string
 	Size  int64
 	IsDir bool
+
+	// Uploader names who created the entry: nil when no record matches it,
+	// DeletedUser for a user who no longer exists.
+	Uploader *string
+	// Actions lists what the user may do with the entry: ActionRename,
+	// ActionMove and ActionDelete. For a folder it reflects the folder's own
+	// record only; the request itself also checks everything below.
+	Actions []string
 }
 
 type Publisher interface {
@@ -57,13 +69,16 @@ const maxNameBytes = 255
 var maxAutoRename = 10000
 
 type Service struct {
-	sb    *sandbox.Sandbox
-	root  *os.Root
-	pub   Publisher
-	space *space.Ledger
+	sb     *sandbox.Sandbox
+	root   *os.Root
+	pub    Publisher
+	space  *space.Ledger
+	policy Policy
+	db     *state.DB
 
 	// mu serializes check-then-act sequences (unique names, no-overwrite
-	// moves) within this process only; other processes are not covered.
+	// moves, the decision and the uploader records of every change) within
+	// this process only; other processes are not covered.
 	mu sync.Mutex
 }
 
@@ -72,6 +87,10 @@ type Option func(*Service)
 // WithSpace makes Create reserve room in l before writing. Without it,
 // uploads are limited only by the disk filling up.
 func WithSpace(l *space.Ledger) Option { return func(s *Service) { s.space = l } }
+
+// WithRecords keeps uploader records in db. Without it no file has an
+// uploader, so only admins and home owners can change files.
+func WithRecords(db *state.DB) Option { return func(s *Service) { s.db = db } }
 
 func New(sb *sandbox.Sandbox, pub Publisher, opts ...Option) *Service {
 	s := &Service{sb: sb, root: sb.OSRoot(), pub: pub}
@@ -97,16 +116,24 @@ func ValidName(name string) bool {
 }
 
 func (s *Service) List(ctx context.Context, dir string) ([]Entry, error) {
-	p, entries, err := s.list(dir)
+	p, entries, err := s.list(ctx, dir)
 	err = sandbox.FromRoot(err)
 	s.publish(ctx, events.Event{Type: events.FileListed, Path: dir, Resolved: p.Rel}, err)
 	return entries, err
 }
 
-func (s *Service) list(dir string) (sandbox.Path, []Entry, error) {
-	p, err := s.sb.Resolve(dir)
+func (s *Service) list(ctx context.Context, dir string) (sandbox.Path, []Entry, error) {
+	sub, ok := s.subject(ctx)
+	if !ok {
+		return sandbox.Path{}, nil, hide(ErrNotFound)
+	}
+	p, err := s.resolve(sub, dir, false, ErrNotFound)
 	if err != nil {
-		return sandbox.Path{}, nil, err
+		return p, nil, err
+	}
+	decision := sub.decide(p.Rel, authz.Unowned, authz.List)
+	if err := refusal(decision, ErrNotFound); err != nil {
+		return p, nil, err
 	}
 	f, _, err := s.openChecked(p, fs.FileInfo.IsDir, ErrNotDir)
 	if err != nil {
@@ -117,29 +144,103 @@ func (s *Service) list(dir string) (sandbox.Path, []Entry, error) {
 	if err != nil {
 		return p, nil, fmt.Errorf("read directory: %w", err)
 	}
+	storedDir, err := s.stored(p.Rel, sub.look())
+	if err != nil {
+		return p, nil, err
+	}
 
-	entries := make([]Entry, 0, len(dirEntries))
+	type listed struct {
+		name        string
+		info, shown fs.FileInfo
+	}
+	var found []listed
 	for _, de := range dirEntries {
-		fi, err := de.Info()
+		if sandbox.IsReserved(de.Name()) {
+			continue
+		}
+		child := path.Join(p.Rel, de.Name())
+		if decision == authz.Filtered && sub.Bindings.Granted(sub.ID, child) == authz.GrantNone {
+			continue
+		}
+		info, err := de.Info()
 		if err != nil {
 			continue
 		}
+		shown := info
 		if de.Type()&fs.ModeSymlink != 0 {
-			target, err := s.sb.Resolve(path.Join(p.Rel, de.Name()))
+			target, err := s.sb.Resolve(child)
 			if err != nil {
 				continue
 			}
-			if fi, err = s.root.Stat(target.Native()); err != nil {
+			if shown, err = s.root.Stat(target.Native()); err != nil || !sub.mayOpen(target.Rel, shown) {
 				continue
 			}
 		}
-		if !fi.IsDir() && !fi.Mode().IsRegular() {
+		if !shown.IsDir() && !shown.Mode().IsRegular() {
 			continue
 		}
-		entries = append(entries, Entry{Name: de.Name(), Size: fi.Size(), IsDir: fi.IsDir()})
+		found = append(found, listed{de.Name(), info, shown})
+	}
+
+	// The records are read only once the directory has been, so that no read
+	// transaction waits on the file system: a writer that must grow the
+	// file's mapping waits for every open one.
+	entries := make([]Entry, 0, len(found))
+	err = s.view(func(tx *state.Tx) error {
+		for _, f := range found {
+			key := path.Join(storedDir, f.name)
+			entries = append(entries, Entry{
+				Name: f.name, Size: f.shown.Size(), IsDir: f.shown.IsDir(),
+				Uploader: s.uploaderName(tx, key, f.info),
+				Actions:  s.actions(sub, tx, key, f.info),
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return p, nil, err
 	}
 	slices.SortFunc(entries, func(a, b Entry) int { return strings.Compare(a.Name, b.Name) })
 	return p, entries, nil
+}
+
+// mayOpen reports whether sub may read what a symlink in a listing points
+// to: a folder sub may list, or a file in a folder sub may read.
+func (sub Subject) mayOpen(target string, info fs.FileInfo) bool {
+	if info.IsDir() {
+		return sub.decide(target, authz.Unowned, authz.List) != authz.Hidden
+	}
+	return sub.canRead(path.Dir(target))
+}
+
+func (s *Service) uploaderName(tx *state.Tx, key string, info fs.FileInfo) *string {
+	rec, matching := record(tx, key, info)
+	if !matching {
+		return nil
+	}
+	name := DeletedUser
+	if s.policy != nil {
+		if n, ok := s.policy.UserName(rec.User); ok {
+			name = n
+		}
+	}
+	return &name
+}
+
+func (s *Service) actions(sub Subject, tx *state.Tx, key string, info fs.FileInfo) []string {
+	out := []string{}
+	if sub.Bindings.Bound(key) {
+		return out
+	}
+	folder := path.Dir(key)
+	rel := sub.relation(tx, key, info)
+	if sub.decide(folder, rel, authz.MoveSource) == authz.Allow {
+		out = append(out, ActionRename, ActionMove)
+	}
+	if sub.decide(folder, rel, authz.Delete) == authz.Allow {
+		out = append(out, ActionDelete)
+	}
+	return out
 }
 
 func isRegular(fi fs.FileInfo) bool { return fi.Mode().IsRegular() }
@@ -177,7 +278,7 @@ func (s *Service) openChecked(p sandbox.Path, kind func(fs.FileInfo) bool, wrong
 }
 
 func (s *Service) Open(ctx context.Context, userPath string) (*File, error) {
-	p, f, info, err := s.open(userPath)
+	p, f, info, err := s.open(ctx, userPath)
 	err = sandbox.FromRoot(err)
 	ev := events.Event{Type: events.FileDownloaded, Path: userPath, Resolved: p.Rel}
 	if err != nil {
@@ -187,10 +288,17 @@ func (s *Service) Open(ctx context.Context, userPath string) (*File, error) {
 	return &File{f: f, info: info, svc: s, ctx: ctx, ev: ev}, nil
 }
 
-func (s *Service) open(userPath string) (sandbox.Path, *os.File, fs.FileInfo, error) {
-	p, err := s.sb.Resolve(userPath)
+func (s *Service) open(ctx context.Context, userPath string) (sandbox.Path, *os.File, fs.FileInfo, error) {
+	sub, ok := s.subject(ctx)
+	if !ok {
+		return sandbox.Path{}, nil, nil, hide(ErrNotFound)
+	}
+	p, err := s.resolve(sub, userPath, false, ErrNotFound)
 	if err != nil {
-		return sandbox.Path{}, nil, nil, err
+		return p, nil, nil, err
+	}
+	if !sub.canRead(path.Dir(p.Rel)) {
+		return p, nil, nil, hide(ErrNotFound)
 	}
 	f, info, err := s.openChecked(p, isRegular, ErrNotFound)
 	return p, f, info, err
@@ -253,12 +361,13 @@ func (f *File) Close() error {
 }
 
 // sizeHint is an upper bound on the length of r, or negative when unknown;
-// room is reserved for it before anything is written.
+// room is reserved for it before anything is written. With ErrUploadMoved,
+// the name the upload was made under is returned too.
 func (s *Service) Create(ctx context.Context, dir, name string, r io.Reader, sizeHint int64) (string, int64, error) {
-	stored, size, err := s.create(dir, name, r, sizeHint)
+	stored, size, err := s.create(ctx, dir, name, r, sizeHint)
 	err = osErr(sandbox.FromRoot(err))
 	ev := events.Event{Type: events.FileUploaded, Path: logicalJoin(dir, name), Size: size}
-	if err == nil {
+	if stored != "" {
 		ev.Path = logicalJoin(dir, path.Base(stored))
 		ev.Resolved = stored
 	}
@@ -266,13 +375,42 @@ func (s *Service) Create(ctx context.Context, dir, name string, r io.Reader, siz
 	return stored, size, err
 }
 
-func (s *Service) create(dir, name string, r io.Reader, sizeHint int64) (string, int64, error) {
-	p, err := s.sb.Resolve(dir)
+func (s *Service) mayUpload(ctx context.Context, p sandbox.Path) (Subject, error) {
+	sub, ok := s.subject(ctx)
+	if !ok {
+		return sub, hide(ErrParentNotFound)
+	}
+	dir, err := s.storedFor(sub, p.Rel, ErrParentNotFound)
 	if err != nil {
+		return sub, err
+	}
+	if sandbox.HasReserved(dir) {
+		return sub, sandbox.ErrReserved
+	}
+	return sub, refusal(sub.decide(dir, authz.Unowned, authz.Upload), ErrParentNotFound)
+}
+
+func (s *Service) create(ctx context.Context, dir, name string, r io.Reader, sizeHint int64) (string, int64, error) {
+	sub, ok := s.subject(ctx)
+	if !ok {
+		return "", 0, hide(ErrParentNotFound)
+	}
+	if _, err := sandbox.Clean(dir); err != nil {
 		return "", 0, err
 	}
 	if !ValidName(name) {
 		return "", 0, ErrInvalidName
+	}
+	if sandbox.IsReserved(name) {
+		return "", 0, sandbox.ErrReserved
+	}
+	p, err := s.resolve(sub, dir, false, ErrParentNotFound)
+	if err != nil {
+		return "", 0, err
+	}
+	// Decided before the space is reserved, and again under mu with the file.
+	if _, err := s.mayUpload(ctx, p); err != nil {
+		return "", 0, err
 	}
 	if !s.isDir(p.Native()) {
 		return "", 0, ErrParentNotFound
@@ -287,25 +425,122 @@ func (s *Service) create(dir, name string, r io.Reader, sizeHint int64) (string,
 	}
 
 	s.mu.Lock()
-	f, rel, err := s.createUnique(p.Rel, name)
+	up, err := s.createRecorded(ctx, p, name)
 	s.mu.Unlock()
 	if err != nil {
-		return "", 0, fmt.Errorf("create file: %w", err)
+		return "", 0, err
 	}
 
-	var w io.Writer = f
+	var w io.Writer = up.f
 	if res != nil {
-		w = res.Writer(f)
+		w = res.Writer(up.f)
 	}
 	size, err := io.Copy(w, r)
-	if cerr := f.Close(); err == nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	here := s.stillAt(up)
+	if cerr := up.f.Close(); err == nil {
 		err = cerr
 	}
-	if err != nil {
-		s.root.Remove(filepath.FromSlash(rel))
-		return "", size, fmt.Errorf("write file: %w", err)
+	switch {
+	case err != nil:
+		err = fmt.Errorf("write file: %w", err)
+	case !here:
+		err = ErrUploadMoved
+	default:
+		if err = s.finishUpload(up); err != nil {
+			err = fmt.Errorf("write file: %w", err)
+		}
 	}
-	return rel, size, nil
+	if err != nil {
+		s.discardUpload(up, here)
+		if errors.Is(err, ErrUploadMoved) {
+			return up.rel, size, err
+		}
+		return "", size, err
+	}
+	return up.rel, size, nil
+}
+
+// An upload is a file being written, with the record made for it. The file
+// is no longer at rel if its uploader or an admin moved or deleted it
+// meanwhile, and another upload may have taken the name.
+type upload struct {
+	f    *os.File
+	rel  string
+	key  string
+	made state.Uploader
+}
+
+// createRecorded decides the upload again, creates the file under a free
+// name and records its uploader without identity, which the end of the
+// upload adds. The caller holds s.mu.
+func (s *Service) createRecorded(ctx context.Context, p sandbox.Path, name string) (*upload, error) {
+	sub, err := s.mayUpload(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	f, rel, err := s.createUnique(p.Rel, name)
+	if err != nil {
+		return nil, fmt.Errorf("create file: %w", err)
+	}
+	up := &upload{f: f, rel: rel, made: newRecord(sub.ID, false)}
+	up.key, err = s.stored(rel, sub.look())
+	if err == nil {
+		err = s.update(func(tx *state.Tx) error { return tx.PutUploader(up.key, up.made) })
+	}
+	if err != nil {
+		f.Close()
+		s.root.Remove(filepath.FromSlash(rel))
+		return nil, fmt.Errorf("record uploader: %w", err)
+	}
+	return up, nil
+}
+
+// stillAt reports whether the upload's file is still at its name. It is
+// asked while the file is open: FAT and some network file systems give a
+// file another identity each time it is opened. The caller holds s.mu.
+func (s *Service) stillAt(up *upload) bool {
+	open, err := up.f.Stat()
+	if err != nil {
+		return false
+	}
+	at, err := s.root.Lstat(filepath.FromSlash(up.rel))
+	return err == nil && os.SameFile(open, at)
+}
+
+// finishUpload adds the finished file's size and modification time to its
+// record, read after the file was closed, which is when some file systems
+// settle the time. The caller holds s.mu, which it held since stillAt.
+func (s *Service) finishUpload(up *upload) error {
+	info, err := s.root.Lstat(filepath.FromSlash(up.rel))
+	if err != nil {
+		return err
+	}
+	return s.updateOwn(up, func(tx *state.Tx) error { return tx.PutUploader(up.key, withIdentity(up.made, info)) })
+}
+
+// discardUpload removes what a failed upload left at its name, unless the
+// name now holds something else. The caller holds s.mu.
+func (s *Service) discardUpload(up *upload, here bool) {
+	if here {
+		s.root.Remove(filepath.FromSlash(up.rel))
+	}
+	if err := s.updateOwn(up, func(tx *state.Tx) error { return tx.DeleteUploader(up.key) }); err != nil {
+		log.Printf("Cannot remove the uploader record of a failed upload, %s: %v", up.key, err)
+	}
+}
+
+// updateOwn runs fn only while the record at the upload's key is still the
+// one the upload made. The caller holds s.mu.
+func (s *Service) updateOwn(up *upload, fn func(*state.Tx) error) error {
+	return s.update(func(tx *state.Tx) error {
+		rec, ok, err := tx.Uploader(up.key)
+		if err != nil || !ok || rec.User != up.made.User || !rec.Created.Equal(up.made.Created) {
+			return err
+		}
+		return fn(tx)
+	})
 }
 
 func (s *Service) createUnique(dir, name string) (*os.File, string, error) {
@@ -350,63 +585,136 @@ func numbered(base, ext string, i int) (string, bool) {
 }
 
 func (s *Service) Mkdir(ctx context.Context, parent, name string) (string, error) {
-	p, err := s.mkdir(parent, name)
+	p, err := s.mkdir(ctx, parent, name)
 	err = osErr(sandbox.FromRoot(err))
 	s.publish(ctx, events.Event{Type: events.FolderCreated, Path: logicalJoin(parent, name), Resolved: p.Rel}, err)
 	return p.Rel, err
 }
 
-func (s *Service) mkdir(parent, name string) (sandbox.Path, error) {
+func (s *Service) mkdir(ctx context.Context, parent, name string) (sandbox.Path, error) {
+	sub, ok := s.subject(ctx)
+	if !ok {
+		return sandbox.Path{}, hide(ErrParentNotFound)
+	}
 	if !ValidName(name) {
 		return sandbox.Path{}, ErrInvalidName
 	}
-	p, err := s.sb.ResolveEntry(path.Join(parent, name))
+	p, err := s.resolve(sub, path.Join(parent, name), true, ErrParentNotFound)
 	if err != nil {
-		return sandbox.Path{}, err
+		return p, err
+	}
+	// Under mu also because rename(2) silently replaces an empty directory,
+	// so a concurrent Move could overwrite the new folder.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sub, ok = s.subject(ctx); !ok {
+		return p, hide(ErrParentNotFound)
+	}
+	dir, err := s.storedFor(sub, path.Dir(p.Rel), ErrParentNotFound)
+	if err != nil {
+		return p, err
+	}
+	if sandbox.HasReserved(dir) {
+		return p, sandbox.ErrReserved
+	}
+	if err := refusal(sub.decide(dir, authz.Unowned, authz.Mkdir), ErrParentNotFound); err != nil {
+		return p, err
 	}
 	if !s.isDir(filepath.Dir(p.Native())) {
 		return p, ErrParentNotFound
 	}
-	// Under mu because rename(2) silently replaces an empty directory, so a
-	// concurrent Move could overwrite the new folder.
-	s.mu.Lock()
-	err = s.root.Mkdir(p.Native(), 0o755)
-	s.mu.Unlock()
-	if err != nil {
+	if err := s.root.Mkdir(p.Native(), 0o755); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return p, ErrExists
 		}
 		return p, fmt.Errorf("create folder: %w", nameErr(err))
 	}
+	key, err := s.stored(p.Rel, sub.look())
+	if err == nil {
+		err = s.update(func(tx *state.Tx) error { return tx.PutUploader(key, newRecord(sub.ID, true)) })
+	}
+	if err != nil {
+		s.root.Remove(p.Native())
+		return p, fmt.Errorf("record uploader: %w", err)
+	}
 	return p, nil
 }
 
 func (s *Service) Delete(ctx context.Context, userPath string) (string, error) {
-	p, err := s.delete(userPath)
+	p, err := s.delete(ctx, userPath)
 	err = osErr(sandbox.FromRoot(err))
 	s.publish(ctx, events.Event{Type: events.FileDeleted, Path: userPath, Resolved: p.Rel}, err)
 	return p.Rel, err
 }
 
-func (s *Service) delete(userPath string) (sandbox.Path, error) {
-	p, err := s.sb.ResolveEntry(userPath)
+func (s *Service) delete(ctx context.Context, userPath string) (sandbox.Path, error) {
+	sub, ok := s.subject(ctx)
+	if !ok {
+		return sandbox.Path{}, hide(ErrNotFound)
+	}
+	p, err := s.resolve(sub, userPath, true, ErrNotFound)
 	if err != nil {
-		return sandbox.Path{}, err
+		return p, err
 	}
-	if _, err := s.root.Lstat(p.Native()); err != nil {
-		if notExist(err) {
-			return p, ErrNotFound
-		}
-		return p, fmt.Errorf("stat entry: %w", err)
+	s.mu.Lock()
+	trash, err := s.deleteLocked(ctx, p)
+	s.mu.Unlock()
+	if err != nil {
+		return p, err
 	}
-	if err := s.root.RemoveAll(p.Native()); err != nil {
-		return p, fmt.Errorf("delete entry: %w", err)
-	}
+	s.removeTrash(trash)
 	return p, nil
 }
 
+// deleteLocked removes the entry p, or moves it into the trash if it is a
+// folder, and returns its name there. The caller holds s.mu.
+func (s *Service) deleteLocked(ctx context.Context, p sandbox.Path) (string, error) {
+	sub, ok := s.subject(ctx)
+	if !ok {
+		return "", hide(ErrNotFound)
+	}
+	key, err := s.storedFor(sub, p.Rel, ErrNotFound)
+	if err != nil {
+		return "", err
+	}
+	if !sub.sees(key) {
+		return "", hide(ErrNotFound)
+	}
+	if sandbox.HasReserved(key) {
+		return "", sandbox.ErrReserved
+	}
+	info, err := s.root.Lstat(p.Native())
+	if err != nil {
+		if notExist(err) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("stat entry: %w", err)
+	}
+	if sub.Bindings.Bound(key) {
+		return "", ErrBoundFolder
+	}
+	if !sub.admin() {
+		if err := s.mayChange(sub, key, info, authz.Delete); err != nil {
+			return "", err
+		}
+	}
+	var trash string
+	if info.IsDir() {
+		trash, err = s.toTrash(p.Native())
+	} else {
+		err = s.root.Remove(p.Native())
+	}
+	if err != nil {
+		return "", fmt.Errorf("delete entry: %w", err)
+	}
+	if err := s.update(func(tx *state.Tx) error { return tx.DeleteUploaders(key) }); err != nil {
+		log.Printf("Cannot remove the uploader records of a deleted entry, %s: %v", key, err)
+	}
+	return trash, nil
+}
+
 func (s *Service) Move(ctx context.Context, oldPath, newPath string) (string, error) {
-	from, to, err := s.move(oldPath, newPath)
+	from, to, err := s.move(ctx, oldPath, newPath)
 	err = osErr(sandbox.FromRoot(err))
 	s.publish(ctx, events.Event{
 		Type: events.FileMoved, Path: oldPath, Target: newPath,
@@ -415,11 +723,21 @@ func (s *Service) Move(ctx context.Context, oldPath, newPath string) (string, er
 	return to.Rel, err
 }
 
-func (s *Service) move(oldPath, newPath string) (from, to sandbox.Path, err error) {
-	if from, err = s.sb.ResolveEntry(oldPath); err != nil {
-		return sandbox.Path{}, sandbox.Path{}, err
+func (s *Service) move(ctx context.Context, oldPath, newPath string) (from, to sandbox.Path, err error) {
+	sub, ok := s.subject(ctx)
+	if !ok {
+		return sandbox.Path{}, sandbox.Path{}, hide(ErrNotFound)
 	}
-	if to, err = s.sb.ResolveEntry(newPath); err != nil {
+	if _, err := sandbox.Clean(oldPath); err != nil {
+		return from, sandbox.Path{}, err
+	}
+	if clean, err := sandbox.Clean(newPath); err == nil && clean != "." && !ValidName(path.Base(clean)) {
+		return from, sandbox.Path{}, ErrInvalidName
+	}
+	if from, err = s.resolve(sub, oldPath, true, ErrNotFound); err != nil {
+		return from, sandbox.Path{}, err
+	}
+	if to, err = s.resolve(sub, newPath, true, ErrParentNotFound); err != nil {
 		// A new name holding a backslash is an invalid name on every system,
 		// also where the path is refused for using it as a separator.
 		if errors.Is(err, sandbox.ErrInvalidPath) && strings.ContainsRune(path.Base(newPath), '\\') {
@@ -430,34 +748,84 @@ func (s *Service) move(oldPath, newPath string) (from, to sandbox.Path, err erro
 	if !ValidName(path.Base(to.Rel)) {
 		return from, to, ErrInvalidName
 	}
-	if from.Rel == to.Rel {
-		return from, to, ErrExists
-	}
-	if from.Contains(to) {
-		return from, to, ErrMoveIntoSelf
-	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return from, to, s.moveLocked(ctx, from, to)
+}
 
-	if _, err := s.root.Lstat(from.Native()); err != nil {
+// moveLocked decides and makes the move. The decisions come before the
+// checks that compare the two paths, which could otherwise tell how
+// symlinks in an unreadable folder resolve. The caller holds s.mu.
+func (s *Service) moveLocked(ctx context.Context, from, to sandbox.Path) error {
+	sub, ok := s.subject(ctx)
+	if !ok {
+		return hide(ErrNotFound)
+	}
+	fromKey, err := s.storedFor(sub, from.Rel, ErrNotFound)
+	if err != nil {
+		return err
+	}
+	if !sub.sees(fromKey) {
+		return hide(ErrNotFound)
+	}
+	if sandbox.HasReserved(fromKey) {
+		return sandbox.ErrReserved
+	}
+	info, err := s.root.Lstat(from.Native())
+	if err != nil {
 		if notExist(err) {
-			return from, to, ErrNotFound
+			return ErrNotFound
 		}
-		return from, to, fmt.Errorf("stat source: %w", err)
+		return fmt.Errorf("stat source: %w", err)
+	}
+	if sub.Bindings.Bound(fromKey) {
+		return ErrBoundFolder
+	}
+	toDir, err := s.storedFor(sub, path.Dir(to.Rel), ErrParentNotFound)
+	if err != nil {
+		return err
+	}
+	if sandbox.HasReserved(toDir) {
+		return sandbox.ErrReserved
+	}
+	if err := refusal(sub.decide(toDir, authz.Unowned, authz.MoveTarget), ErrParentNotFound); err != nil {
+		return err
+	}
+	toKey := path.Join(toDir, path.Base(to.Rel))
+	if from.Rel == to.Rel || toKey == fromKey {
+		return ErrExists
+	}
+	if from.Contains(to) || authz.Within(toKey, fromKey) {
+		return ErrMoveIntoSelf
+	}
+	if !sub.admin() {
+		if err := s.mayChange(sub, fromKey, info, authz.MoveSource); err != nil {
+			return err
+		}
 	}
 	if !s.isDir(filepath.Dir(to.Native())) {
-		return from, to, ErrParentNotFound
+		return ErrParentNotFound
 	}
 	if _, err := s.root.Lstat(to.Native()); err == nil {
-		return from, to, ErrExists
+		return ErrExists
 	} else if !notExist(err) {
-		return from, to, fmt.Errorf("stat destination: %w", err)
+		return fmt.Errorf("stat destination: %w", err)
 	}
 	if err := s.root.Rename(from.Native(), to.Native()); err != nil {
-		return from, to, fmt.Errorf("rename: %w", nameErr(err))
+		return fmt.Errorf("rename: %w", nameErr(err))
 	}
-	return from, to, nil
+	toKey, err = s.stored(to.Rel, sub.look())
+	if err == nil {
+		err = s.update(func(tx *state.Tx) error { return tx.MoveUploaders(fromKey, toKey) })
+	}
+	if err != nil {
+		if rerr := s.root.Rename(to.Native(), from.Native()); rerr != nil {
+			log.Printf("Cannot move %s back to %s after failing to move its uploader records: %v", to.Rel, from.Rel, rerr)
+		}
+		return fmt.Errorf("move uploader records: %w", err)
+	}
+	return nil
 }
 
 func notExist(err error) bool {
@@ -530,7 +898,11 @@ func outcomeOf(err error) events.Outcome {
 	switch {
 	case err == nil:
 		return events.OutcomeOK
-	case errors.Is(err, sandbox.ErrTraversal),
+	case isHidden(err),
+		errors.Is(err, ErrForbidden),
+		errors.Is(err, ErrBoundFolder),
+		errors.Is(err, sandbox.ErrReserved),
+		errors.Is(err, sandbox.ErrTraversal),
 		errors.Is(err, sandbox.ErrRootTarget),
 		errors.Is(err, fs.ErrPermission):
 		return events.OutcomeDenied
@@ -538,7 +910,7 @@ func outcomeOf(err error) events.Outcome {
 		return events.OutcomeNotFound
 	case errors.Is(err, ErrExists):
 		return events.OutcomeExists
-	case errors.Is(err, ErrAborted):
+	case errors.Is(err, ErrAborted), errors.Is(err, ErrUploadMoved):
 		return events.OutcomeAborted
 	case errors.Is(err, ErrInsufficientStorage):
 		return events.OutcomeNoSpace

@@ -53,7 +53,7 @@ func newAuthEnv(t *testing.T) *authEnv {
 	}
 	t.Cleanup(func() { db.Close() })
 	rec := &recorder{}
-	files := fsops.New(sb, rec)
+	files := fsops.New(sb, rec, fsops.WithRecords(db))
 	acc := auth.New(auth.Config{
 		DB: db, Hasher: auth.NewHasher(auth.Params{Memory: 64, Time: 1, Threads: 1}, 2, time.Second),
 		Policy: auth.Policy{MinLength: 15}, Folders: files, Events: rec,
@@ -63,6 +63,7 @@ func newAuthEnv(t *testing.T) *authEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { acc.Close() })
+	files.SetPolicy(acc)
 	srv := httptest.NewTLSServer(New(files, fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}, Options{Accounts: acc}))
 	t.Cleanup(srv.Close)
 	return &authEnv{t: t, srv: srv, acc: acc, rec: rec, root: sb.Root()}

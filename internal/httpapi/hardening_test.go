@@ -17,7 +17,6 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/nobletk/gocalbox/internal/fsops"
 	"github.com/nobletk/gocalbox/internal/sandbox"
 )
 
@@ -263,7 +262,7 @@ func newSlowEnv(t *testing.T, opts Options) (*httptest.Server, *slowService, str
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { sb.Close() })
-	svc := &slowService{FileService: fsops.New(sb, nil), started: make(chan struct{}), release: make(chan struct{})}
+	svc := &slowService{FileService: adminFiles(sb, nil), started: make(chan struct{}), release: make(chan struct{})}
 	srv := httptest.NewServer(newTestHandler(svc, fstest.MapFS{}, opts))
 	t.Cleanup(srv.Close)
 	t.Cleanup(svc.free) // runs before srv.Close, which waits for the handler

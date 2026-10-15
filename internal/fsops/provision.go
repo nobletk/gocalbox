@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/nobletk/gocalbox/internal/events"
+	"github.com/nobletk/gocalbox/internal/state"
 )
 
 type IfExists int
@@ -100,11 +101,24 @@ func (s *Service) provision(folders []Folder, commit func() error) ([]Folder, er
 		}
 		created = append(created, f)
 	}
-	if commit != nil {
-		if err := commit(); err != nil {
-			s.removeFolders(created)
-			return nil, err
+	// A folder created or taken over here is the server's, and keeps no
+	// uploader record from an earlier folder at its place.
+	err := s.update(func(tx *state.Tx) error {
+		for i, f := range folders {
+			if missing[i] || f.IfExists == TakeOverEmpty {
+				if err := tx.DeleteUploaders(f.Path); err != nil {
+					return err
+				}
+			}
 		}
+		return nil
+	})
+	if err == nil && commit != nil {
+		err = commit()
+	}
+	if err != nil {
+		s.removeFolders(created)
+		return nil, err
 	}
 	return created, nil
 }

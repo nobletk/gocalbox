@@ -49,6 +49,13 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	var tooMany *auth.TooManyAttemptsError
 
 	switch {
+	case errors.Is(err, sandbox.ErrReserved):
+		writeErrorJSON(w, r, http.StatusForbidden, "reserved_path", "This name is reserved for the server")
+	case errors.Is(err, fsops.ErrForbidden):
+		writeErrorJSON(w, r, http.StatusForbidden, "forbidden", "You may not do this here")
+	case errors.Is(err, fsops.ErrBoundFolder):
+		writeErrorJSON(w, r, http.StatusConflict, "bound_folder",
+			"This folder is shared with users, or holds one that is, so it can't be moved or deleted")
 	case errors.Is(err, sandbox.ErrTraversal):
 		log.Printf("SECURITY ALERT: Blocked path outside the sandbox: %v", err)
 		writeErrorJSON(w, r, http.StatusForbidden, "path_outside_root", "Invalid path")
@@ -70,6 +77,8 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeErrorJSON(w, r, http.StatusBadRequest, "move_into_self", "Cannot move a folder into itself")
 	case errors.Is(err, fsops.ErrExists):
 		writeErrorJSON(w, r, http.StatusConflict, "already_exists", "Already exists")
+	case errors.Is(err, fsops.ErrUploadMoved):
+		writeErrorJSON(w, r, http.StatusConflict, "upload_moved", "The file was moved or deleted while it was uploaded")
 	case errors.Is(err, fsops.ErrCrossDevice):
 		writeErrorJSON(w, r, http.StatusConflict, "cross_device", "Source and destination are on different file systems")
 	case errors.Is(err, fsops.ErrInsufficientStorage):

@@ -53,9 +53,11 @@ type Options struct {
 }
 
 type ClientFileInfo struct {
-	Name  string `json:"name"`
-	Size  int64  `json:"size"`
-	IsDir bool   `json:"isDir"`
+	Name     string   `json:"name"`
+	Size     int64    `json:"size"`
+	IsDir    bool     `json:"isDir"`
+	Uploader *string  `json:"uploader"`
+	Actions  []string `json:"actions"`
 }
 
 type DeleteRequest struct {
@@ -100,35 +102,8 @@ func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 	a := &api{files: files, accounts: opts.Accounts, maxUpload: opts.MaxUploadBytes, ready: opts.Ready, tracker: opts.Tracker}
 
 	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.FS(webFS)))
-	mux.Handle("/files/", a.gate(http.StripPrefix("/files/", http.HandlerFunc(a.handleFile))))
-	mux.Handle("/api/files", a.gate(http.HandlerFunc(a.handleListFiles)))
-	mux.Handle("/api/upload", a.gate(http.HandlerFunc(a.handleUpload)))
-	mux.Handle("/api/fs/delete", a.gate(http.HandlerFunc(a.handleDelete)))
-	mux.Handle("/api/fs/rename", a.gate(http.HandlerFunc(a.handleMove)))
-	mux.Handle("/api/fs/move", a.gate(http.HandlerFunc(a.handleMove)))
-	mux.Handle("/api/fs/mkdir", a.gate(http.HandlerFunc(a.handleCreateFolder)))
-	if a.accounts != nil {
-		mux.Handle("/api/setup", a.gate(http.HandlerFunc(a.handleSetup)))
-		mux.HandleFunc("/api/status", a.handleStatus)
-		mux.Handle("/api/auth/login", a.track(http.HandlerFunc(a.handleLogin)))
-		for p, h := range map[string]func(http.ResponseWriter, *http.Request, auth.Identity){
-			"/api/auth/logout":                 a.handleLogout,
-			"/api/auth/me":                     a.handleMe,
-			"/api/auth/confirm":                a.handleConfirm,
-			"/api/auth/password":               a.handlePassword,
-			"/api/auth/sessions":               a.handleSessions,
-			"/api/auth/sessions/revoke":        a.handleRevokeSession,
-			"/api/auth/sessions/revoke-others": a.handleRevokeOthers,
-		} {
-			mux.Handle(p, a.track(withIdentity(h)))
-		}
-	}
-	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
-		writeErrorJSON(w, r, http.StatusNotFound, "not_found", "Unknown API endpoint")
-	})
-	if opts.CACert != nil {
-		mux.Handle("/ca.crt", serveCACert(opts.CACert))
+	for _, rt := range a.routes(webFS, opts) {
+		mux.Handle(rt.pattern, rt.handler)
 	}
 
 	cop := http.NewCrossOriginProtection()
@@ -150,6 +125,63 @@ func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 	}
 	return requestContext(limitBodyStalls(opts.BodyTimeout,
 		securityHeaders(checkHost(opts.AllowedHosts, inner))))
+}
+
+// access is what a route needs before its handler runs. The deny-all test
+// sends a request to every route that isn't public.
+type access int
+
+const (
+	accessPublic  access = iota // nothing: the UI, /ca.crt, setup and login
+	accessSession               // a session; acts on the session's own account
+	accessFiles                 // a session; fsops decides on every path it touches
+)
+
+type route struct {
+	pattern string
+	access  access
+	handler http.Handler
+}
+
+func (a *api) routes(webFS fs.FS, opts Options) []route {
+	rs := []route{
+		{"/", accessPublic, http.FileServer(http.FS(webFS))},
+		{"/files/", accessFiles, a.gate(http.StripPrefix("/files/", http.HandlerFunc(a.handleFile)))},
+		{"/api/files", accessFiles, a.gate(http.HandlerFunc(a.handleListFiles))},
+		{"/api/upload", accessFiles, a.gate(http.HandlerFunc(a.handleUpload))},
+		{"/api/fs/delete", accessFiles, a.gate(http.HandlerFunc(a.handleDelete))},
+		{"/api/fs/rename", accessFiles, a.gate(http.HandlerFunc(a.handleMove))},
+		{"/api/fs/move", accessFiles, a.gate(http.HandlerFunc(a.handleMove))},
+		{"/api/fs/mkdir", accessFiles, a.gate(http.HandlerFunc(a.handleCreateFolder))},
+		{"/api/", accessSession, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeErrorJSON(w, r, http.StatusNotFound, "not_found", "Unknown API endpoint")
+		})},
+	}
+	if a.accounts != nil {
+		rs = append(rs,
+			route{"/api/setup", accessPublic, a.gate(http.HandlerFunc(a.handleSetup))},
+			route{"/api/status", accessPublic, http.HandlerFunc(a.handleStatus)},
+			route{"/api/auth/login", accessPublic, a.track(http.HandlerFunc(a.handleLogin))},
+		)
+		for _, s := range []struct {
+			pattern string
+			h       func(http.ResponseWriter, *http.Request, auth.Identity)
+		}{
+			{"/api/auth/logout", a.handleLogout},
+			{"/api/auth/me", a.handleMe},
+			{"/api/auth/confirm", a.handleConfirm},
+			{"/api/auth/password", a.handlePassword},
+			{"/api/auth/sessions", a.handleSessions},
+			{"/api/auth/sessions/revoke", a.handleRevokeSession},
+			{"/api/auth/sessions/revoke-others", a.handleRevokeOthers},
+		} {
+			rs = append(rs, route{s.pattern, accessSession, a.track(withIdentity(s.h))})
+		}
+	}
+	if opts.CACert != nil {
+		rs = append(rs, route{"/ca.crt", accessPublic, serveCACert(opts.CACert)})
+	}
+	return rs
 }
 
 func rejectUnclean(next http.Handler) http.Handler {

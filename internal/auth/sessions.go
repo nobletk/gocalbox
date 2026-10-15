@@ -128,7 +128,7 @@ func (a *Accounts) Start() error {
 	if err != nil {
 		return err
 	}
-	if err := a.reloadUsers(); err != nil {
+	if err := a.reload(); err != nil {
 		return err
 	}
 	var stale [][]byte
@@ -199,7 +199,11 @@ func (a *Accounts) maintain() {
 }
 
 func (a *Accounts) valid(s state.Session, now time.Time) bool {
-	u, ok := (*a.users.Load())[s.User]
+	return a.validIn(a.users(), s, now)
+}
+
+func (a *Accounts) validIn(users map[string]state.User, s state.Session, now time.Time) bool {
+	u, ok := users[s.User]
 	return ok && !u.Disabled && u.Epoch == s.Epoch &&
 		now.Before(s.Created.Add(a.sessionCfg.Max)) && now.Before(s.LastSeen.Add(a.sessionCfg.Idle))
 }
@@ -218,14 +222,15 @@ func (a *Accounts) Identify(token string) (Identity, SessionState) {
 		a.sessions.mu.Unlock()
 		return Identity{}, NoSession
 	}
-	if !a.valid(e.rec, now) {
+	users := a.users()
+	if !a.validIn(users, e.rec, now) {
 		a.sessions.mu.Unlock()
 		return Identity{}, a.endInvalid(key, e)
 	}
 	if now.After(e.rec.LastSeen) {
 		e.rec.LastSeen = now
 	}
-	id := Identity{User: (*a.users.Load())[e.rec.User], Session: e.rec, key: key}
+	id := Identity{User: users[e.rec.User], Session: e.rec, key: key}
 	a.sessions.mu.Unlock()
 	return id, ValidSession
 }
@@ -468,7 +473,7 @@ func (a *Accounts) endWhere(match func(state.Session) bool) ([]state.Session, er
 }
 
 func (a *Accounts) publishEnded(ctx context.Context, ended []endedSession) {
-	users := *a.users.Load()
+	users := a.users()
 	for _, s := range ended {
 		detail := "id=" + s.rec.ID
 		if s.reason != "" {

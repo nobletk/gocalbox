@@ -21,7 +21,7 @@ func (a *api) handleListFiles(w http.ResponseWriter, r *http.Request) {
 
 	files := make([]ClientFileInfo, 0, len(entries)) // [] rather than null when empty
 	for _, e := range entries {
-		files = append(files, ClientFileInfo{Name: e.Name, Size: e.Size, IsDir: e.IsDir})
+		files = append(files, ClientFileInfo{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Uploader: e.Uploader, Actions: e.Actions})
 	}
 	writeJSON(w, http.StatusOK, files)
 }

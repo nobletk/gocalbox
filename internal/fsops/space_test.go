@@ -17,7 +17,7 @@ func newSpaceEnv(t *testing.T, free func() (int64, error), minFree int64) (*env,
 	e := newEnv(t)
 	rec := &recorder{}
 	l := space.NewLedger(free, minFree)
-	e.svc = New(e.sb, rec, WithSpace(l))
+	e.svc = asAdmin(New(e.sb, rec, WithSpace(l)))
 	return e, rec, l
 }
 
