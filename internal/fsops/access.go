@@ -45,15 +45,15 @@ type Policy interface {
 // DeletedUser stands for the uploader of a record whose user was deleted.
 const DeletedUser = "(deleted user)"
 
-// Actions offered in a listing (§7.6).
+// Actions offered in a listing.
 const (
 	ActionRename = "rename"
 	ActionMove   = "move"
 	ActionDelete = "delete"
 )
 
-// hiddenError answers a path the user may not see as if it didn't exist
-// (AD14); the audit records it as denied.
+// hiddenError answers a path the user may not see as if it didn't exist;
+// the audit records it as denied.
 type hiddenError struct{ err error }
 
 func (e hiddenError) Error() string { return "no access: " + e.err.Error() }
@@ -113,7 +113,7 @@ func refusal(d authz.Decision, hiddenAs error) error {
 // error from resolving it is reported only if sub may read the deepest
 // folder of the typed path that resolves; otherwise the path is hidden, so
 // that a broken link or a symlink leaving the root in another user's home
-// tells nothing (§7.4).
+// tells nothing.
 func (s *Service) resolve(sub Subject, userPath string, entry bool, hiddenAs error) (sandbox.Path, error) {
 	clean, err := sandbox.Clean(userPath)
 	if err != nil {
@@ -151,10 +151,10 @@ type lookup func(dir string) (names []string, ok bool)
 
 // stored returns the canonical path rel with each existing component in the
 // spelling its directory stores, so that two spellings of one file on a
-// case-insensitive volume give one key, and two files never share one
-// (§7.7). Components that don't exist keep the spelling typed. Folders are
-// read only as look allows: a folder read only when the name in it exists
-// would tell, by the time it takes, whether a name exists there (AD14).
+// case-insensitive volume give one key, and two files never share one.
+// Components that don't exist keep the spelling typed. Folders are read only
+// as look allows: a folder read only when the name in it exists would tell,
+// by the time it takes, whether a name exists there.
 func (s *Service) stored(rel string, look lookup) (string, error) {
 	if rel == "." {
 		return rel, nil
@@ -297,7 +297,7 @@ func (sub Subject) relation(tx *state.Tx, key string, info fs.FileInfo) authz.Re
 
 // mayChange decides a move's source or a delete of the entry at key, stored
 // spelling, for a non-admin. A folder carries everything below it along, so
-// every entry below must pass as well (§7.4).
+// every entry below must pass as well.
 func (s *Service) mayChange(sub Subject, key string, info fs.FileInfo, a authz.Action) error {
 	var rel authz.Relation
 	if err := s.view(func(tx *state.Tx) error { rel = sub.relation(tx, key, info); return nil }); err != nil {

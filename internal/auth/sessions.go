@@ -545,7 +545,7 @@ func (a *Accounts) RevokeOtherSessions(ctx context.Context, id Identity) ([]Revo
 	return []RevokedLink{}, nil
 }
 
-// RevokedLink names a link revoked as a side effect (auth design §5.6).
+// RevokedLink names a link revoked as a side effect.
 type RevokedLink struct {
 	ID       string `json:"id"`
 	Kind     string `json:"kind"`

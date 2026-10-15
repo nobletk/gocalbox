@@ -123,7 +123,7 @@ const Everyone = "*"
 // Binding gives a subject a role on a folder and everything below it.
 type Binding struct {
 	Subject string // a user ID, or Everyone
-	Folder  string // in the spelling the directory stores (§7.7)
+	Folder  string // in the spelling the directory stores
 	Grant   Grant  // GrantViewer or GrantContributor
 	Home    bool
 }

@@ -23,9 +23,9 @@ type Params struct {
 	Threads uint8
 }
 
-// The passes keep one hash well under the 0.5 s a login may take (auth
-// design §5.3); every login and every hashing slot pays that time. Memory and
-// lanes stay at OWASP's minimum.
+// The passes keep one hash well under the 0.5 s a login may take; every
+// login and every hashing slot pays that time. Memory and lanes stay at
+// OWASP's minimum.
 var DefaultParams = Params{Memory: 19 * 1024, Time: 32, Threads: 1}
 
 const (

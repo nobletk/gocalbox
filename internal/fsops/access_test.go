@@ -142,7 +142,7 @@ func (a *accessEnv) canRead(user, p string) error {
 	return err
 }
 
-// hidden checks that err answers as for a path that doesn't exist (AD14).
+// hidden checks that err answers as for a path that doesn't exist.
 func hidden(t *testing.T, err, want error, what string) {
 	t.Helper()
 	if !errors.Is(err, want) || !isHidden(err) {
