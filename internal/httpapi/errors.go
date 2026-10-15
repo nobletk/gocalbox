@@ -113,6 +113,35 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("Refused for lack of space: %v", err)
 		writeErrorJSON(w, r, http.StatusInsufficientStorage, "insufficient_storage", "Not enough free space on the server")
 
+	case errors.Is(err, auth.ErrLinkInvalid):
+		log.Printf("SECURITY ALERT: Unknown, used, expired or revoked link token from %s", r.RemoteAddr)
+		writeErrorJSON(w, r, http.StatusForbidden, "link_invalid", "This link is unknown, used, expired or revoked; ask an admin for a new one")
+	case errors.Is(err, auth.ErrNotAdmin):
+		writeErrorJSON(w, r, http.StatusForbidden, "forbidden", "Only admins may do this")
+	case errors.Is(err, auth.ErrReauthRequired):
+		writeErrorJSON(w, r, http.StatusForbidden, "reauth_required", "Enter your password again to change users and folder access")
+	case errors.Is(err, auth.ErrLastAdmin):
+		writeErrorJSON(w, r, http.StatusConflict, "last_admin", "The last enabled admin can't be deleted, disabled or demoted")
+	case errors.Is(err, auth.ErrTooManyLinks):
+		writeErrorJSON(w, r, http.StatusConflict, "too_many_links", "There are 100 unused links; revoke some first")
+	case errors.Is(err, auth.ErrUserDisabled):
+		writeErrorJSON(w, r, http.StatusConflict, "user_disabled", "The account is disabled; enable it first")
+	case errors.Is(err, auth.ErrHomeBinding):
+		writeErrorJSON(w, r, http.StatusConflict, "home_binding", "A home's binding goes only with its user")
+	case errors.Is(err, auth.ErrCoversHomes):
+		writeErrorJSON(w, r, http.StatusConflict, "covers_homes", "A binding may not cover /users, a home or the root")
+	case errors.Is(err, auth.ErrBindingExists):
+		writeErrorJSON(w, r, http.StatusConflict, "already_exists", "This user already has a binding on this folder")
+	case errors.Is(err, auth.ErrNoSuchUser):
+		writeErrorJSON(w, r, http.StatusNotFound, "not_found", "No such user")
+	case errors.Is(err, auth.ErrNoSuchLink):
+		writeErrorJSON(w, r, http.StatusNotFound, "not_found", "No such unused link")
+	case errors.Is(err, auth.ErrNoSuchBinding):
+		writeErrorJSON(w, r, http.StatusNotFound, "not_found", "No such binding")
+	case errors.Is(err, auth.ErrInvalidRole):
+		writeErrorJSON(w, r, http.StatusBadRequest, "invalid_role", "The role must be admin, contributor or viewer; a binding's viewer or contributor")
+	case errors.Is(err, auth.ErrInvalidNote):
+		writeErrorJSON(w, r, http.StatusBadRequest, "invalid_note", "A note has at most 100 characters and no control characters")
 	case errors.Is(err, auth.ErrSetupCodeInvalid):
 		log.Printf("SECURITY ALERT: Wrong setup code from %s", r.RemoteAddr)
 		writeErrorJSON(w, r, http.StatusForbidden, "setup_code_invalid", "Wrong setup code")

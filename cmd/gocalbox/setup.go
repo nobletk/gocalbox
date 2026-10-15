@@ -11,8 +11,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/nobletk/gocalbox/internal/auth"
+	"github.com/nobletk/gocalbox/internal/httpapi"
 	"github.com/nobletk/gocalbox/internal/sandbox"
 )
 
@@ -56,39 +58,16 @@ func refuseInsideRoot(root, abs, flagName string) error {
 	return nil
 }
 
-// logSetup prints the setup code once. The link for another device comes
-// only after the steps to trust the local CA: opening it before would show a
-// certificate warning, and clicking through that on a hostile network would
-// hand over the code.
+// logSetup prints the setup code once.
 func (a *app) logSetup(listenHost, port string) {
 	code := a.setupCode
 	if code == "" {
 		return
 	}
 	a.setupCode = ""
-	fragment := "/#setup=" + code
-	local, other := setupAddresses(listenHost, port, a.AllowedHosts, a.TLS)
-
-	log.Printf("SETUP: There is no admin account yet. Until there is, files and the API answer 503 setup_required, except setup, status, login and the session routes.")
+	log.Printf("SETUP: There is no admin account yet. Until there is, files and the API answer 503 setup_required, except setup, status, login, links and the session routes.")
 	log.Printf("SETUP: One-time setup code: %s (valid until it is used or the server stops)", auth.FormatCode(code))
-	if local != "" {
-		log.Printf("SETUP: On this machine, open %s%s", local, fragment)
-	}
-	switch {
-	case a.TLS == nil:
-		log.Printf("SETUP: Plain HTTP serves this machine only, so the code works only here.")
-	case other == "" && isLoopback(listenHost):
-		log.Printf("SETUP: The server listens on loopback only, so other devices cannot reach it.")
-	case other == "":
-		log.Printf("SETUP: No address for other devices is known; add the machine's LAN address with -allowed-hosts to have one printed here.")
-	case a.TLS.CA != nil:
-		log.Printf("SETUP: From another device, first install the local CA: open %s and check that the installer shows the fingerprint %s.",
-			caURL(listenHost, port, a.AllowedHosts), a.TLS.CA.Fingerprint())
-		log.Printf("SETUP: Then open %s%s", other, fragment)
-	default:
-		log.Printf("SETUP: From another device, open %s%s", other, fragment)
-	}
-
+	local, other := a.logLink("SETUP", "/#setup="+code, "code", listenHost, port)
 	if lines := setupCommand(runtime.GOOS, local, other, port, a.AllowedHosts, a.TLS, code, a.minPwLen); lines != nil {
 		log.Printf("SETUP: The web UI has no setup page yet; until it does, create the admin with")
 		for _, l := range lines {
@@ -97,9 +76,74 @@ func (a *app) logSetup(listenHost, port string) {
 	}
 }
 
+// logRecovery prints the reset link of -recover-admin once.
+func (a *app) logRecovery(listenHost, port string) {
+	l := a.recovery
+	if l.Token == "" {
+		return
+	}
+	a.recovery = auth.NewLink{}
+	log.Printf("RECOVERY: Reset link for the admin %s, for one use until %s. Use it at once: console output may be kept, such as in a service's journal.",
+		l.Username, l.Expires.Local().Format(time.DateTime))
+	local, other := a.logLink("RECOVERY", "/#reset="+l.Token, "link", listenHost, port)
+	body := fmt.Sprintf(`{"token":"%s","password":"<at least %d characters>"}`, l.Token, a.minPwLen)
+	if lines := apiCommand(runtime.GOOS, local, other, port, a.AllowedHosts, a.TLS, "/api/reset/accept", body); lines != nil {
+		log.Printf("RECOVERY: The web UI has no reset page yet; until it does, set the new password with")
+		for _, l := range lines {
+			log.Printf("RECOVERY: %s", l)
+		}
+	}
+}
+
+// logLink prints where to open a link printed on the console, and returns
+// the base addresses it used. The form for another device comes only after
+// the steps to trust the local CA: opening it before would show a
+// certificate warning, and clicking through that on a hostile network would
+// hand over the link's secret.
+func (a *app) logLink(tag, fragment, what, listenHost, port string) (local, other string) {
+	local, other = setupAddresses(listenHost, port, a.AllowedHosts, a.TLS)
+	if local != "" {
+		log.Printf("%s: On this machine, open %s%s", tag, local, fragment)
+	}
+	switch {
+	case a.TLS == nil:
+		log.Printf("%s: Plain HTTP serves this machine only, so the %s works only here.", tag, what)
+	case other == "" && isLoopback(listenHost):
+		log.Printf("%s: The server listens on loopback only, so other devices cannot reach it.", tag)
+	case other == "":
+		log.Printf("%s: No address for other devices is known; add the machine's LAN address with -allowed-hosts to have one printed here.", tag)
+	case a.TLS.CA != nil:
+		log.Printf("%s: From another device, first install the local CA: open %s and check that the installer shows the fingerprint %s.",
+			tag, caURL(listenHost, port, a.AllowedHosts), a.TLS.CA.Fingerprint())
+		log.Printf("%s: Then open %s%s", tag, other, fragment)
+	default:
+		log.Printf("%s: From another device, open %s%s", tag, other, fragment)
+	}
+	return local, other
+}
+
+// linkTarget is what a new link from the admin page needs: the address
+// other devices use, as the console gives for /ca.crt, and the local CA's
+// fingerprint.
+func (a *app) linkTarget(listenHost, port string) httpapi.LinkTarget {
+	_, other := setupAddresses(listenHost, port, a.AllowedHosts, a.TLS)
+	t := httpapi.LinkTarget{Address: other}
+	if a.TLS != nil && a.TLS.CA != nil {
+		t.CAFingerprint = a.TLS.CA.Fingerprint()
+	}
+	return t
+}
+
 // setupCommand has the JSON typed on standard input, so the password stays
 // out of the command line and the shell's history.
 func setupCommand(goos, local, other, port string, allowed []string, t *tlsSetup, code string, minLen int) []string {
+	body := fmt.Sprintf(`{"code":"%s","username":"admin","password":"<at least %d characters>"}`, code, minLen)
+	return apiCommand(goos, local, other, port, allowed, t, "/api/setup", body)
+}
+
+// apiCommand is a curl command that posts body, typed on standard input,
+// to apiPath.
+func apiCommand(goos, local, other, port string, allowed []string, t *tlsSetup, apiPath, body string) []string {
 	base := cmp.Or(local, other)
 	if base == "" {
 		return nil
@@ -143,10 +187,10 @@ func setupCommand(goos, local, other, port string, allowed []string, t *tlsSetup
 		args = append(args, "--connect-to", arg(net.JoinHostPort(name, port)+":"+net.JoinHostPort("localhost", port)))
 		base = "https://" + net.JoinHostPort(name, port)
 	}
-	args = append(args, "-H", quote("Content-Type: application/json"), "--data", data, arg(base+"/api/setup"))
+	args = append(args, "-H", quote("Content-Type: application/json"), "--data", data, arg(base+apiPath))
 	lines := []string{
 		"  " + strings.Join(args, " "),
-		fmt.Sprintf(`then type {"code":"%s","username":"admin","password":"<at least %d characters>"}, %s.`, code, minLen, end),
+		fmt.Sprintf(`then type %s, %s.`, body, end),
 	}
 	if note != "" {
 		lines = append(lines, note)

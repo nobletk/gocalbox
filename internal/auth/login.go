@@ -100,7 +100,7 @@ func (a *Accounts) Login(ctx context.Context, username, password string, c Clien
 		a.giveBack(at)
 		return Grant{}, err
 	}
-	grant, e, ended, err := a.startSession(u, c, update)
+	grant, e, ended, err := a.startSession(u, c, false, update)
 	if err != nil {
 		a.giveBack(at)
 		return Grant{}, err
@@ -367,6 +367,7 @@ func (a *Accounts) checkSessionPassword(ctx context.Context, id Identity, passwo
 // Confirm checks the password of a logged-in user, which opens the window
 // for admin changes, and renews the session's token.
 func (a *Accounts) Confirm(ctx context.Context, id Identity, password string, c Client) (Grant, error) {
+	start := time.Now()
 	u, at, rehash, err := a.checkSessionPassword(ctx, id, password, c)
 	if err != nil {
 		return Grant{}, err
@@ -379,21 +380,32 @@ func (a *Accounts) Confirm(ctx context.Context, id Identity, password string, c 
 	g, err := a.renew(id, u, false, update)
 	if err != nil {
 		a.giveBack(at)
+		a.endedLate(ctx, err, start, at.n)
 	}
 	return g, err
+}
+
+// endedLate holds the answer for a session that ended after its right
+// password was checked until a wrong password's answer would come, so the
+// timing tells nothing.
+func (a *Accounts) endedLate(ctx context.Context, err error, start time.Time, n int) {
+	if errors.Is(err, ErrSessionEnded) {
+		a.waitFailure(ctx, start, n)
+	}
 }
 
 // ChangePassword replaces the password of a logged-in user after checking
 // the current one. The higher epoch ends every other session of the account
 // and invalidates the device cookies of other browsers; this session gets a
-// new token. The returned list names the links revoked with the sessions;
-// it is empty while the server has no links. With an error for which
-// events.IsUnrecorded holds, the password was changed and the grant is
-// valid.
+// new token. The unused links the account made, and every reset link for
+// it, are revoked with the sessions; the returned list names them. With an
+// error for which events.IsUnrecorded holds, the password was changed and
+// the grant is valid.
 func (a *Accounts) ChangePassword(ctx context.Context, id Identity, current, next string, c Client) (Grant, []RevokedLink, error) {
 	if err := a.policy.Check(id.User.Username, next); err != nil {
 		return Grant{}, nil, err
 	}
+	start := time.Now()
 	u, at, _, err := a.checkSessionPassword(ctx, id, current, c)
 	if err != nil {
 		return Grant{}, nil, err
@@ -404,8 +416,10 @@ func (a *Accounts) ChangePassword(ctx context.Context, id Identity, current, nex
 		return Grant{}, nil, err
 	}
 	changed := u
-	changed.Hash, changed.Epoch, changed.PasswordChangedAt = hash, u.Epoch+1, a.wallNow()
+	now := a.wallNow()
+	changed.Hash, changed.Epoch, changed.PasswordChangedAt = hash, u.Epoch+1, now
 	changed.Failures, changed.PasswordDisabled = 0, false
+	var gone []revoked
 	grant, err := a.renew(id, changed, true, func(tx *state.Tx) error {
 		cur, err := tx.User(u.ID)
 		if err != nil {
@@ -417,11 +431,17 @@ func (a *Accounts) ChangePassword(ctx context.Context, id Identity, current, nex
 		a.throttle.succeed(at.addr, at.pair, at.acct)
 		cur.Hash, cur.Epoch, cur.PasswordChangedAt = changed.Hash, changed.Epoch, changed.PasswordChangedAt
 		cur.Failures, cur.PasswordDisabled = 0, false
-		return tx.UpdateUser(cur)
+		if err := tx.UpdateUser(cur); err != nil {
+			return err
+		}
+		gone, err = revokeWhere(tx, now, revokedPassword, securing(u.ID))
+		return err
 	})
 	if err != nil {
 		a.giveBack(at)
+		a.endedLate(ctx, err, start, at.n)
 		return Grant{}, nil, err
 	}
-	return grant, []RevokedLink{}, a.record(ctx, true, events.Event{Type: events.AuthPasswordChanged, Path: u.Username, Detail: "id=" + u.ID})
+	evs := append([]events.Event{{Type: events.AuthPasswordChanged, Path: u.Username, Detail: "id=" + u.ID}}, revokedEvents(gone)...)
+	return grant, revokedLinks(gone), a.record(ctx, true, evs...)
 }

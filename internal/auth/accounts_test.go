@@ -54,6 +54,7 @@ func (r *recorder) types() []events.Type {
 type fixture struct {
 	acc   *Accounts
 	db    *state.DB
+	files *fsops.Service
 	root  string
 	rec   *recorder
 	clock *clock
@@ -102,17 +103,19 @@ func newFixtureWith(t *testing.T, p Params, delay func(int) time.Duration) *fixt
 	t.Cleanup(func() { db.Close() })
 	rec := &recorder{}
 	clk := &clock{t: time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)}
+	files := fsops.New(sb, rec, fsops.WithRecords(db))
 	acc := New(Config{
 		DB: db, Hasher: NewHasher(p, 2, 5*time.Second), Policy: Policy{MinLength: 15},
-		Folders: fsops.New(sb, rec), Events: rec, Now: clk.now,
+		Folders: files, Events: rec, Now: clk.now,
 		FailureDelay: delay,
 		OwnNetworks:  func() []netip.Prefix { return []netip.Prefix{netip.MustParsePrefix("2001:db8:1:2::/64")} },
 	})
+	files.SetPolicy(acc)
 	if err := acc.Start(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { acc.Close() })
-	return &fixture{acc: acc, db: db, root: sb.Root(), rec: rec, clock: clk}
+	return &fixture{acc: acc, db: db, files: files, root: sb.Root(), rec: rec, clock: clk}
 }
 
 func (f *fixture) exists(rel string) bool {
@@ -400,7 +403,7 @@ func TestCreateUserAndSetPassword(t *testing.T) {
 		v.Failures, v.PasswordDisabled = 100, true
 		return tx.UpdateUser(v)
 	})
-	changed, err := f.acc.SetPassword(cctx, "bench", "another long passphrase")
+	changed, _, err := f.acc.SetPassword(cctx, "bench", "another long passphrase")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +414,7 @@ func TestCreateUserAndSetPassword(t *testing.T) {
 	if !ok {
 		t.Error("the new password does not verify")
 	}
-	if _, err := f.acc.SetPassword(cctx, "nobody", goodPassword); !errors.Is(err, state.ErrNotFound) {
+	if _, _, err := f.acc.SetPassword(cctx, "nobody", goodPassword); !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("unknown user: %v", err)
 	}
 	if got := f.rec.types(); !slices.Equal(got, []events.Type{events.UserCreated, events.AuthPasswordChanged}) {

@@ -165,7 +165,7 @@ func TestSessionsEndWithTheAccountsEpochOrDisabling(t *testing.T) {
 	f := newFixture(t)
 	f.addUser(t, "alice", state.RoleAdmin)
 	g := f.login(t, "alice", browser)
-	if _, err := f.acc.SetPassword(events.WithActor(ctx, events.Actor{ID: events.ConsoleID}), "alice", "another long passphrase"); err != nil {
+	if _, _, err := f.acc.SetPassword(events.WithActor(ctx, events.Actor{ID: events.ConsoleID}), "alice", "another long passphrase"); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := f.acc.Authenticate(g.Token); ok {

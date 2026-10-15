@@ -36,8 +36,9 @@ type authEnv struct {
 }
 
 // newAuthEnv serves real accounts over HTTPS, so clients keep the Secure
-// cookies in a jar as a browser does.
-func newAuthEnv(t *testing.T) *authEnv {
+// cookies in a jar as a browser does. Each of mods may change the
+// configuration first.
+func newAuthEnv(t *testing.T, mods ...func(*auth.Config, *Options)) *authEnv {
 	t.Helper()
 	base := t.TempDir()
 	root := filepath.Join(base, "root")
@@ -54,17 +55,23 @@ func newAuthEnv(t *testing.T) *authEnv {
 	t.Cleanup(func() { db.Close() })
 	rec := &recorder{}
 	files := fsops.New(sb, rec, fsops.WithRecords(db))
-	acc := auth.New(auth.Config{
+	cfg := auth.Config{
 		DB: db, Hasher: auth.NewHasher(auth.Params{Memory: 64, Time: 1, Threads: 1}, 2, time.Second),
 		Policy: auth.Policy{MinLength: 15}, Folders: files, Events: rec,
 		FailureDelay: func(int) time.Duration { return 0 },
-	})
+	}
+	var opts Options
+	for _, mod := range mods {
+		mod(&cfg, &opts)
+	}
+	acc := auth.New(cfg)
 	if err := acc.Start(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { acc.Close() })
 	files.SetPolicy(acc)
-	srv := httptest.NewTLSServer(New(files, fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}, Options{Accounts: acc}))
+	opts.Accounts = acc
+	srv := httptest.NewTLSServer(New(files, fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}, opts))
 	t.Cleanup(srv.Close)
 	return &authEnv{t: t, srv: srv, acc: acc, rec: rec, root: sb.Root()}
 }
@@ -241,7 +248,7 @@ func TestOnlyAnEndedSessionsCookieIsCleared(t *testing.T) {
 	}
 
 	ctx := events.WithActor(context.Background(), events.Actor{ID: events.ConsoleID})
-	if _, err := e.acc.SetPassword(ctx, "alice", "another long passphrase"); err != nil {
+	if _, _, err := e.acc.SetPassword(ctx, "alice", "another long passphrase"); err != nil {
 		t.Fatal(err)
 	}
 	if resp, _ := e.call(c, "GET", "/api/files?path=", nil); resp.StatusCode != 401 || !isCleared(resp) {

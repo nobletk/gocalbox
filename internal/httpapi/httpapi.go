@@ -38,6 +38,10 @@ type Options struct {
 	// for /api/status.
 	ChangesPaused func() bool
 
+	// LinkTarget tells the address and CA fingerprint a new link's
+	// recipient needs; it may change once the server listens.
+	LinkTarget func() LinkTarget
+
 	BodyTimeout time.Duration
 
 	Tracker *Tracker
@@ -100,11 +104,15 @@ type api struct {
 	accounts      AccountService
 	maxUpload     int64
 	changesPaused func() bool
+	linkTarget    func() LinkTarget
 	tracker       *Tracker
 }
 
 func New(files FileService, webFS fs.FS, opts Options) http.Handler {
-	a := &api{files: files, accounts: opts.Accounts, maxUpload: opts.MaxUploadBytes, changesPaused: opts.ChangesPaused, tracker: opts.Tracker}
+	a := &api{
+		files: files, accounts: opts.Accounts, maxUpload: opts.MaxUploadBytes,
+		changesPaused: opts.ChangesPaused, linkTarget: opts.LinkTarget, tracker: opts.Tracker,
+	}
 
 	mux := http.NewServeMux()
 	for _, rt := range a.routes(webFS, opts) {
@@ -137,9 +145,10 @@ func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 type access int
 
 const (
-	accessPublic  access = iota // nothing: the UI, /ca.crt, setup and login
+	accessPublic  access = iota // nothing: the UI, /ca.crt, setup, login and links
 	accessSession               // a session; acts on the session's own account
 	accessFiles                 // a session; fsops decides on every path it touches
+	accessAdmin                 // a session; the accounts check it is an admin's, and the reauth window for changes
 )
 
 type route struct {
@@ -167,6 +176,10 @@ func (a *api) routes(webFS fs.FS, opts Options) []route {
 			route{"/api/setup", accessPublic, a.track(http.HandlerFunc(a.handleSetup))},
 			route{"/api/status", accessPublic, http.HandlerFunc(a.handleStatus)},
 			route{"/api/auth/login", accessPublic, a.track(http.HandlerFunc(a.handleLogin))},
+			route{"/api/invite/inspect", accessPublic, a.track(http.HandlerFunc(a.handleInviteInspect))},
+			route{"/api/invite/accept", accessPublic, a.track(http.HandlerFunc(a.handleInviteAccept))},
+			route{"/api/reset/inspect", accessPublic, a.track(http.HandlerFunc(a.handleResetInspect))},
+			route{"/api/reset/accept", accessPublic, a.track(http.HandlerFunc(a.handleResetAccept))},
 		)
 		for _, s := range []struct {
 			pattern string
@@ -181,6 +194,25 @@ func (a *api) routes(webFS fs.FS, opts Options) []route {
 			{"/api/auth/sessions/revoke-others", a.handleRevokeOthers},
 		} {
 			rs = append(rs, route{s.pattern, accessSession, a.track(withIdentity(s.h))})
+		}
+		for _, s := range []struct {
+			pattern string
+			h       func(http.ResponseWriter, *http.Request, auth.Identity)
+		}{
+			{"/api/admin/users/list", a.handleAdminUsers},
+			{"/api/admin/users/update", a.handleAdminUserUpdate},
+			{"/api/admin/users/reset-link", a.handleAdminResetLink},
+			{"/api/admin/users/delete", a.handleAdminUserDelete},
+			{"/api/admin/invites/create", a.handleAdminInvite},
+			{"/api/admin/links/list", a.handleAdminLinks},
+			{"/api/admin/links/revoke", a.handleAdminLinkRevoke},
+			{"/api/admin/bindings/list", a.handleAdminBindings},
+			{"/api/admin/bindings/create", a.handleAdminBindingCreate},
+			{"/api/admin/bindings/delete", a.handleAdminBindingDelete},
+			{"/api/admin/sessions/list", a.handleAdminSessions},
+			{"/api/admin/sessions/revoke", a.handleAdminSessionRevoke},
+		} {
+			rs = append(rs, route{s.pattern, accessAdmin, a.track(withIdentity(s.h))})
 		}
 	}
 	if opts.CACert != nil {

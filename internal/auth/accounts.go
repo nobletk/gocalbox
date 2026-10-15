@@ -43,6 +43,8 @@ func (e *LayoutExistsError) Error() string {
 
 type Folders interface {
 	Provision(ctx context.Context, folders []fsops.Folder, commit func() error) error
+	MoveHome(ctx context.Context, from, to, detail string) error
+	BindFolder(ctx context.Context, folder string, commit func(stored string) error) error
 }
 
 type Publisher interface {
@@ -58,6 +60,7 @@ type Config struct {
 	Audit    events.Auditor // nil where changes are neither refused nor wait for their records
 	Now      func() time.Time
 	Sessions SessionConfig // zero fields take DefaultSessions' values
+	Links    LinkConfig    // zero fields take DefaultLinks' values
 
 	// FailureDelay is how long the answer to the nth consecutive failed
 	// password of an account waits; up to 5 s when nil.
@@ -76,9 +79,13 @@ type Accounts struct {
 	audit        events.Auditor
 	now          func() time.Time
 	sessionCfg   SessionConfig
+	linkCfg      LinkConfig
 	failureDelay func(int) time.Duration
 
-	mu    sync.Mutex // serializes setup and layout changes
+	// mu serializes setup, layout changes, and updates and deletions of
+	// users, so a user read before such a change is still current when it
+	// commits.
+	mu    sync.Mutex
 	setup atomic.Pointer[SetupCode]
 
 	// snap is rebuilt after every change, so each request reads the account
@@ -105,6 +112,10 @@ func New(c Config) *Accounts {
 			Idle:   cmp.Or(c.Sessions.Idle, DefaultSessions.Idle),
 			Max:    cmp.Or(c.Sessions.Max, DefaultSessions.Max),
 			Reauth: cmp.Or(c.Sessions.Reauth, DefaultSessions.Reauth),
+		},
+		linkCfg: LinkConfig{
+			InviteTTL: cmp.Or(c.Links.InviteTTL, DefaultLinks.InviteTTL),
+			ResetTTL:  cmp.Or(c.Links.ResetTTL, DefaultLinks.ResetTTL),
 		},
 		failureDelay: c.FailureDelay, sessions: newSessionStore(),
 	}
@@ -292,7 +303,7 @@ func (a *Accounts) CompleteSetup(ctx context.Context, req SetupRequest, c Client
 	for _, w := range a.ensureLayout(events.WithActor(ctx, events.Actor{ID: events.SystemID})) {
 		log.Printf("WARNING: %s", w)
 	}
-	grant, e, ended, err := a.startSession(user, c)
+	grant, e, ended, err := a.startSession(user, c, false)
 	if err != nil {
 		return Grant{}, fmt.Errorf("the admin %s was created, but logging in failed: %w", name, err)
 	}
@@ -443,7 +454,17 @@ func (a *Accounts) CreateUser(ctx context.Context, username string, role state.R
 		ID: state.NewUserID(), Username: name, Role: role, Hash: hash,
 		CreatedAt: now, CreatedBy: events.ActorFrom(ctx).ID, PasswordChangedAt: now,
 	}
-	if err := a.update(func(tx *state.Tx) error { return tx.CreateUser(u) }); err != nil {
+	err = a.update(func(tx *state.Tx) error {
+		fixed, err := fixedByInvite(tx, now, name, "")
+		if err == nil && fixed {
+			err = ErrUsernameTaken
+		}
+		if err != nil {
+			return err
+		}
+		return tx.CreateUser(u)
+	})
+	if err != nil {
 		return state.User{}, err
 	}
 	return u, a.record(ctx, false, events.Event{Type: events.UserCreated, Path: name, Detail: fmt.Sprintf("id=%s role=%s", u.ID, role)})
@@ -451,8 +472,9 @@ func (a *Accounts) CreateUser(ctx context.Context, username string, role state.R
 
 // SetPassword replaces a user's password. The higher epoch ends every
 // session of the account, and a password disabled by failed attempts works
-// again.
-func (a *Accounts) SetPassword(ctx context.Context, username, password string) (state.User, error) {
+// again. The unused links the account made, and every reset link for it,
+// are revoked with it.
+func (a *Accounts) SetPassword(ctx context.Context, username, password string) (state.User, []RevokedLink, error) {
 	var u state.User
 	err := a.db.View(func(tx *state.Tx) error {
 		var err error
@@ -460,30 +482,37 @@ func (a *Accounts) SetPassword(ctx context.Context, username, password string) (
 		return err
 	})
 	if err != nil {
-		return u, err
+		return u, nil, err
 	}
 	if err := a.policy.Check(u.Username, password); err != nil {
-		return u, err
+		return u, nil, err
 	}
 	hash, err := a.hasher.Hash(ctx, password)
 	if err != nil {
-		return u, err
+		return u, nil, err
 	}
+	now := a.wallNow()
+	var gone []revoked
 	err = a.update(func(tx *state.Tx) error {
 		current, err := tx.User(u.ID)
 		if err != nil {
 			return err
 		}
 		u = current
-		u.Hash, u.Epoch, u.PasswordChangedAt = hash, u.Epoch+1, a.now().UTC()
+		u.Hash, u.Epoch, u.PasswordChangedAt = hash, u.Epoch+1, now
 		u.Failures, u.PasswordDisabled = 0, false
 		a.throttle.resetAccount(u.ID)
-		return tx.UpdateUser(u)
+		if err := tx.UpdateUser(u); err != nil {
+			return err
+		}
+		gone, err = revokeWhere(tx, now, revokedPassword, securing(u.ID))
+		return err
 	})
 	if err != nil {
-		return u, err
+		return u, nil, err
 	}
-	return u, a.record(ctx, false, events.Event{Type: events.AuthPasswordChanged, Path: u.Username, Detail: "id=" + u.ID})
+	evs := append([]events.Event{{Type: events.AuthPasswordChanged, Path: u.Username, Detail: "id=" + u.ID}}, revokedEvents(gone)...)
+	return u, revokedLinks(gone), a.record(ctx, false, evs...)
 }
 
 // MeFor describes the user of a session, with the end of its window for

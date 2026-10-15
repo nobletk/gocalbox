@@ -77,6 +77,9 @@ func TestSetupIsRefusedWhileChangesArePaused(t *testing.T) {
 	if !f.acc.SetupRequired() || f.exists("users") || f.exists("public") {
 		t.Error("setup changed something while changes are paused")
 	}
+	if len(f.rec.evs) != 0 {
+		t.Errorf("an anonymous request refused while paused was recorded: %+v", f.rec.evs)
+	}
 	a.paused = false
 	for range freeFailures {
 		if _, err := f.acc.CompleteSetup(ctx, SetupRequest{Code: "wrong"}, browser); !errors.Is(err, ErrSetupCodeInvalid) {

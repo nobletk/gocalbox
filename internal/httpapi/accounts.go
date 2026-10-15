@@ -7,6 +7,7 @@ import (
 
 	"github.com/nobletk/gocalbox/internal/auth"
 	"github.com/nobletk/gocalbox/internal/events"
+	"github.com/nobletk/gocalbox/internal/state"
 )
 
 type AccountService interface {
@@ -23,6 +24,24 @@ type AccountService interface {
 	Sessions(id auth.Identity) []auth.SessionInfo
 	RevokeSession(ctx context.Context, id auth.Identity, sessionID string) error
 	RevokeOtherSessions(ctx context.Context, id auth.Identity) ([]auth.RevokedLink, error)
+
+	InspectInvite(token string, c auth.Client) (auth.InviteInfo, error)
+	AcceptInvite(ctx context.Context, token, username, password string, c auth.Client) (auth.Grant, error)
+	InspectReset(token string, c auth.Client) (auth.ResetInfo, error)
+	AcceptReset(ctx context.Context, token, password string, c auth.Client) (auth.Grant, []auth.RevokedLink, error)
+
+	Users(id auth.Identity) ([]auth.UserInfo, error)
+	CreateInvite(ctx context.Context, id auth.Identity, req auth.InviteRequest) (auth.NewLink, error)
+	UpdateUser(ctx context.Context, id auth.Identity, userID string, upd auth.UserUpdate) (auth.UserInfo, error)
+	CreateResetLink(ctx context.Context, id auth.Identity, userID string) (auth.NewLink, error)
+	Links(id auth.Identity) ([]auth.LinkInfo, error)
+	RevokeLink(ctx context.Context, id auth.Identity, linkID string) error
+	DeleteUser(ctx context.Context, id auth.Identity, userID string) (string, error)
+	Bindings(id auth.Identity) ([]auth.BindingInfo, error)
+	CreateBinding(ctx context.Context, id auth.Identity, subject, folder string, role state.Role) (auth.BindingInfo, error)
+	DeleteBinding(ctx context.Context, id auth.Identity, bindingID string) error
+	AllSessions(id auth.Identity, userID string) ([]auth.AdminSessionInfo, error)
+	EndSession(ctx context.Context, id auth.Identity, sessionID string) error
 }
 
 type SetupRequest struct {
@@ -61,7 +80,10 @@ type StatusResponse struct {
 }
 
 // Reachable without a session, and while the server has no admin yet.
-var publicRoutes = map[string]bool{"/api/auth/login": true, "/api/setup": true, "/api/status": true}
+var publicRoutes = map[string]bool{
+	"/api/auth/login": true, "/api/setup": true, "/api/status": true,
+	"/api/invite/inspect": true, "/api/invite/accept": true, "/api/reset/inspect": true, "/api/reset/accept": true,
+}
 
 func isPublic(p string) bool { return !isResourcePath(p) || publicRoutes[p] }
 

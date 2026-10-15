@@ -161,6 +161,9 @@ func (a *Accounts) Start() error {
 			return err
 		}
 	}
+	if err := a.dropOldLinks(context.Background(), true); err != nil && !events.IsUnrecorded(err) {
+		return err
+	}
 	a.stop, a.stopped = make(chan struct{}), make(chan struct{})
 	go a.maintain()
 	return nil
@@ -191,6 +194,9 @@ func (a *Accounts) maintain() {
 		case <-cleanup.C:
 			if err := a.dropExpired(); err != nil {
 				log.Printf("sessions: cannot remove expired sessions: %v", err)
+			}
+			if err := a.dropOldLinks(context.Background(), false); err != nil {
+				log.Printf("accounts: cannot remove used and expired links: %v", err)
 			}
 		case <-a.stop:
 			return
@@ -321,13 +327,19 @@ func (a *Accounts) endSessions(keys ...[sha256.Size]byte) error {
 }
 
 // changeSessions deletes and adds sessions in one transaction, with also run
-// in it, then applies the same to memory. The caller holds sessions.write.
+// in it first, while the sessions to drop still exist, then applies the same
+// to memory. The caller holds sessions.write.
 func (a *Accounts) changeSessions(drop [][sha256.Size]byte, add []*sessionEntry, also ...func(*state.Tx) error) error {
 	run := a.db.Update
 	if len(also) > 0 {
 		run = a.update
 	}
 	err := run(func(tx *state.Tx) error {
+		for _, f := range also {
+			if err := f(tx); err != nil {
+				return err
+			}
+		}
 		for _, k := range drop {
 			if err := tx.DeleteSession(k[:]); err != nil {
 				return err
@@ -335,11 +347,6 @@ func (a *Accounts) changeSessions(drop [][sha256.Size]byte, add []*sessionEntry,
 		}
 		for _, e := range add {
 			if err := tx.PutSession(e.key[:], e.rec); err != nil {
-				return err
-			}
-		}
-		for _, f := range also {
-			if err := f(tx); err != nil {
 				return err
 			}
 		}
@@ -362,9 +369,10 @@ func (a *Accounts) changeSessions(drop [][sha256.Size]byte, add []*sessionEntry,
 
 // startSession creates a session for u. It replaces the session the browser
 // had, and beyond maxSessionsPerUser the valid one seen least recently;
-// sessions of u that are no longer valid are dropped without a record. It
-// returns the valid sessions it ended, for their audit records.
-func (a *Accounts) startSession(u state.User, c Client, also ...func(*state.Tx) error) (Grant, *sessionEntry, []endedSession, error) {
+// sessions of u that are no longer valid, and with endOwn all of them, are
+// dropped without a record. It returns the valid sessions it ended, for
+// their audit records.
+func (a *Accounts) startSession(u state.User, c Client, endOwn bool, also ...func(*state.Tx) error) (Grant, *sessionEntry, []endedSession, error) {
 	token, key := newToken()
 	now := a.wallNow()
 	e := &sessionEntry{key: key, rec: state.Session{
@@ -390,7 +398,7 @@ func (a *Accounts) startSession(u state.User, c Client, also ...func(*state.Tx) 
 	for k, s := range a.sessions.byKey {
 		switch {
 		case s.rec.User != u.ID || slices.Contains(drop, k):
-		case !a.valid(s.rec, now):
+		case endOwn || !a.valid(s.rec, now):
 			drop = append(drop, k)
 		default:
 			own, keys[s.rec.ID] = append(own, endedSession{s.rec, "session_limit"}), k
@@ -451,10 +459,11 @@ func (a *Accounts) grant(u state.User, e *sessionEntry, token string) Grant {
 	}
 }
 
-// endWhere ends the sessions match selects and returns their records. It
-// chooses them while holding sessions.write, so a renewal cannot replace a
-// chosen token before it is deleted.
-func (a *Accounts) endWhere(match func(state.Session) bool) ([]state.Session, error) {
+// endWhere ends the sessions match selects and returns their records, with
+// also run in the same transaction. It chooses them while holding
+// sessions.write, so a renewal cannot replace a chosen token before it is
+// deleted.
+func (a *Accounts) endWhere(match func(state.Session) bool, also ...func(*state.Tx) error) ([]state.Session, error) {
 	a.sessions.write.Lock()
 	defer a.sessions.write.Unlock()
 	var keys [][sha256.Size]byte
@@ -466,10 +475,10 @@ func (a *Accounts) endWhere(match func(state.Session) bool) ([]state.Session, er
 		}
 	}
 	a.sessions.mu.Unlock()
-	if len(keys) == 0 {
+	if len(keys) == 0 && len(also) == 0 {
 		return nil, nil
 	}
-	return recs, a.changeSessions(keys, nil)
+	return recs, a.changeSessions(keys, nil, also...)
 }
 
 // recordEnded records the sessions a change ended as a side effect.
@@ -477,6 +486,10 @@ func (a *Accounts) recordEnded(ctx context.Context, ended []endedSession) error 
 	if len(ended) == 0 {
 		return nil
 	}
+	return a.record(ctx, true, a.endedEvents(ended)...)
+}
+
+func (a *Accounts) endedEvents(ended []endedSession) []events.Event {
 	users := a.users()
 	evs := make([]events.Event, 0, len(ended))
 	for _, s := range ended {
@@ -486,7 +499,7 @@ func (a *Accounts) recordEnded(ctx context.Context, ended []endedSession) error 
 		}
 		evs = append(evs, events.Event{Type: events.SessionRevoked, Path: users[s.rec.User].Username, Detail: detail})
 	}
-	return a.record(ctx, true, evs...)
+	return evs
 }
 
 // Logout ends the session by its ID, so a renewal of its token racing the
@@ -534,12 +547,19 @@ func (a *Accounts) RevokeSession(ctx context.Context, id Identity, sessionID str
 }
 
 // RevokeOtherSessions ends every session of the user but the current one;
-// only the ones still valid get an audit record. The returned list names the
-// links revoked with them; it is empty while the server has no links. With
-// an error for which events.IsUnrecorded holds, the sessions were ended.
+// only the ones still valid get an audit record. The unused links the user
+// made, and every reset link for them, are revoked with the sessions; the
+// returned list names them. With an error for which events.IsUnrecorded
+// holds, the sessions were ended.
 func (a *Accounts) RevokeOtherSessions(ctx context.Context, id Identity) ([]RevokedLink, error) {
 	now := a.wallNow()
-	ended, err := a.endWhere(func(s state.Session) bool { return s.User == id.User.ID && s.ID != id.Session.ID })
+	var gone []revoked
+	ended, err := a.endWhere(func(s state.Session) bool { return s.User == id.User.ID && s.ID != id.Session.ID },
+		func(tx *state.Tx) error {
+			var err error
+			gone, err = revokeWhere(tx, now, revokedSignOut, securing(id.User.ID))
+			return err
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -549,10 +569,11 @@ func (a *Accounts) RevokeOtherSessions(ctx context.Context, id Identity) ([]Revo
 			evs = append(evs, events.Event{Type: events.SessionRevoked, Path: id.User.Username, Detail: "id=" + s.ID})
 		}
 	}
+	evs = append(evs, revokedEvents(gone)...)
 	if len(evs) == 0 {
-		return []RevokedLink{}, nil
+		return revokedLinks(gone), nil
 	}
-	return []RevokedLink{}, a.record(ctx, true, evs...)
+	return revokedLinks(gone), a.record(ctx, true, evs...)
 }
 
 // RevokedLink names a link revoked as a side effect.

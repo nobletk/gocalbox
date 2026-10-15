@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -68,6 +69,9 @@ func run() error {
 	sessionIdle := flag.Duration("session-idle", auth.DefaultSessions.Idle, "Log a browser out after this long without a request")
 	sessionMax := flag.Duration("session-max", auth.DefaultSessions.Max, "Log a browser out this long after it logged in, however active it is")
 	reauthWindow := flag.Duration("reauth-window", auth.DefaultSessions.Reauth, "How long after entering their password an admin may change users and folder access")
+	inviteTTL := flag.Duration("invite-ttl", auth.DefaultLinks.InviteTTL, "How long an invite link stays usable (an admin invite at most 24 hours)")
+	resetTTL := flag.Duration("reset-ttl", auth.DefaultLinks.ResetTTL, "How long a password reset link stays usable (-recover-admin's at most 1 hour)")
+	recoverAdmin := flag.String("recover-admin", "", "Print a one-time password reset link for this admin on the console at start-up")
 	verifyLog := flag.String("verify-audit", "", "Verify the integrity of this audit log file and exit")
 	flag.Parse()
 
@@ -86,6 +90,9 @@ func run() error {
 	sessions := auth.SessionConfig{Idle: *sessionIdle, Max: *sessionMax, Reauth: *reauthWindow}
 	if err := checkSessions(sessions); err != nil {
 		return err
+	}
+	if *inviteTTL <= 0 || *resetTTL <= 0 {
+		return errors.New("-invite-ttl and -reset-ttl must be longer than 0")
 	}
 	if *auditWaitTimeout <= 0 {
 		return errors.New("-audit-wait-timeout must be longer than 0")
@@ -114,6 +121,8 @@ func run() error {
 		StateFile:        *stateFile,
 		MinPasswordLen:   *minPasswordLength,
 		Sessions:         sessions,
+		Links:            auth.LinkConfig{InviteTTL: *inviteTTL, ResetTTL: *resetTTL},
+		RecoverAdmin:     *recoverAdmin,
 	})
 	if err != nil {
 		return err
@@ -136,6 +145,8 @@ func run() error {
 		ln = httpapi.SplitTLS(ln, a.TLS.Config, sniffTimeout)
 	}
 	_, boundPort, _ := net.SplitHostPort(ln.Addr().String())
+	target := a.linkTarget(*host, boundPort)
+	a.target.Store(&target)
 
 	srv := &http.Server{
 		Handler: a.Handler,
@@ -170,6 +181,7 @@ func run() error {
 	a.logSpace()
 	a.logTLS(caURL(*host, boundPort, a.AllowedHosts))
 	a.logSetup(*host, boundPort)
+	a.logRecovery(*host, boundPort)
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server crashed: %w", err)
@@ -207,6 +219,8 @@ type config struct {
 	StateFile      string
 	MinPasswordLen int                // auth.DefaultMinPasswordLength when 0
 	Sessions       auth.SessionConfig // auth.DefaultSessions when zero
+	Links          auth.LinkConfig    // auth.DefaultLinks when zero
+	RecoverAdmin   string             // an admin to print a reset link for
 }
 
 type app struct {
@@ -220,7 +234,9 @@ type app struct {
 	sb        *sandbox.Sandbox
 	state     *state.DB
 	accounts  *auth.Accounts
-	setupCode string // shown once on the console, then cleared
+	setupCode string       // shown once on the console, then cleared
+	recovery  auth.NewLink // -recover-admin's link, shown once, then cleared
+	target    *atomic.Pointer[httpapi.LinkTarget]
 	minPwLen  int
 	bus       *events.Bus
 	coalescer *audit.Coalescer
@@ -311,6 +327,13 @@ func newApp(cfg config) (_ *app, err error) {
 		BodyTimeout:    cfg.BodyTimeout,
 		Tracker:        inflight,
 	}
+	target := &atomic.Pointer[httpapi.LinkTarget]{}
+	opts.LinkTarget = func() httpapi.LinkTarget {
+		if t := target.Load(); t != nil {
+			return *t
+		}
+		return httpapi.LinkTarget{}
+	}
 	if tlsSetup != nil {
 		opts.RequireTLS = true
 		if tlsSetup.CA != nil {
@@ -338,6 +361,7 @@ func newApp(cfg config) (_ *app, err error) {
 		Events:   bus,
 		Audit:    recorder,
 		Sessions: cfg.Sessions,
+		Links:    cfg.Links,
 	})
 	files.SetPolicy(accounts)
 	opts.Accounts = accounts
@@ -354,6 +378,12 @@ func newApp(cfg config) (_ *app, err error) {
 		return nil, fmt.Errorf("read the sessions: %w", err)
 	}
 	undo = append(undo, accounts.Close)
+	var recovery auth.NewLink
+	if cfg.RecoverAdmin != "" {
+		if recovery, err = accounts.ConsoleResetLink(context.Background(), cfg.RecoverAdmin); err != nil && !events.IsUnrecorded(err) {
+			return nil, fmt.Errorf("-recover-admin: %w", err)
+		}
+	}
 
 	return &app{
 		Handler:      httpapi.New(files, webFS, opts),
@@ -366,6 +396,8 @@ func newApp(cfg config) (_ *app, err error) {
 		state:        db,
 		accounts:     accounts,
 		setupCode:    setupCode,
+		recovery:     recovery,
+		target:       target,
 		minPwLen:     minPwLen,
 		bus:          bus,
 		coalescer:    coalescer,

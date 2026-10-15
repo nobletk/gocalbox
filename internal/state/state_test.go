@@ -319,3 +319,158 @@ func TestSessions(t *testing.T) {
 		return nil
 	})
 }
+
+func TestLinks(t *testing.T) {
+	d, _ := openTemp(t)
+	now := time.Now().UTC().Round(0)
+	inv := Link{ID: "a1", Kind: KindInvite, Role: RoleViewer, Username: "carol", Note: "phone", CreatedBy: "u-1", Created: now, Expires: now.Add(time.Hour)}
+	reset := Link{ID: "b2", Kind: KindReset, User: "u-2", CreatedBy: "console", Created: now, Expires: now.Add(time.Hour)}
+	err := d.Update(func(tx *Tx) error {
+		for _, bad := range []Link{
+			{Kind: KindInvite, Role: RoleViewer},
+			{ID: "c3", Kind: "other"},
+			{ID: "c3", Kind: KindInvite},
+		} {
+			if err := tx.PutLink([]byte("k"), bad); err == nil {
+				t.Errorf("stored %+v", bad)
+			}
+		}
+		if err := tx.PutLink(nil, inv); err == nil {
+			t.Error("stored a link without a key")
+		}
+		if err := tx.PutLink([]byte("key-inv"), inv); err != nil {
+			return err
+		}
+		return tx.PutLink([]byte("key-reset"), reset)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.View(func(tx *Tx) error {
+		if l, err := tx.Link([]byte("key-inv")); err != nil || l != inv {
+			t.Errorf("Link = %+v, %v", l, err)
+		}
+		if key, l, err := tx.LinkByID("b2"); err != nil || string(key) != "key-reset" || l != reset {
+			t.Errorf("LinkByID = %q, %+v, %v", key, l, err)
+		}
+		if _, err := tx.Link([]byte("missing")); !errors.Is(err, ErrNotFound) {
+			t.Errorf("missing key: %v", err)
+		}
+		if _, _, err := tx.LinkByID("missing"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("missing ID: %v", err)
+		}
+		return nil
+	})
+
+	if !inv.Unused(now) || inv.Unused(inv.Expires) {
+		t.Error("Unused misjudges the expiry")
+	}
+	used := inv
+	used.Used = now
+	if used.Unused(now) {
+		t.Error("a used link is unused")
+	}
+
+	err = d.Update(func(tx *Tx) error {
+		if err := tx.DeleteLink([]byte("key-inv")); err != nil {
+			return err
+		}
+		if err := tx.DeleteLink([]byte("key-inv")); err != nil {
+			return err
+		}
+		return tx.tx.Bucket(bucketLinks).Put([]byte("broken"), []byte("{"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.View(func(tx *Tx) error {
+		if tx.tx.Bucket(bucketLinkIDs).Get([]byte("a1")) != nil {
+			t.Error("the ID index outlived the link")
+		}
+		var seen []string
+		tx.Links(func(k []byte, l Link) error { seen = append(seen, string(k)+"="+l.ID); return nil })
+		if strings.Join(seen, ",") != "broken=,key-reset=b2" {
+			t.Errorf("Links passed %q", seen)
+		}
+		return nil
+	})
+	if err := d.Update(func(tx *Tx) error { return tx.DeleteLink([]byte("broken")) }); err != nil {
+		t.Errorf("deleting an unreadable record: %v", err)
+	}
+}
+
+func TestDeleteUserFreesTheName(t *testing.T) {
+	d, _ := openTemp(t)
+	bob := newUser("bob", RoleViewer)
+	b := Binding{ID: NewID(), Subject: bob.ID, Folder: "shared", Role: RoleViewer, Kind: KindCustom}
+	err := d.Update(func(tx *Tx) error {
+		if err := tx.CreateUser(bob); err != nil {
+			return err
+		}
+		return tx.PutBinding(b)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = d.Update(func(tx *Tx) error {
+		if got, err := tx.Binding(b.ID); err != nil || got != b {
+			t.Errorf("Binding = %+v, %v", got, err)
+		}
+		if err := tx.DeleteBinding(b.ID); err != nil {
+			return err
+		}
+		if err := tx.DeleteBinding(b.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("deleting a binding twice: %v", err)
+		}
+		if _, err := tx.Binding(b.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("a deleted binding: %v", err)
+		}
+		if err := tx.DeleteUser(bob.ID); err != nil {
+			return err
+		}
+		if err := tx.DeleteUser(bob.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("deleting a user twice: %v", err)
+		}
+		if _, err := tx.UserByName("bob"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("the name still names the user: %v", err)
+		}
+		return tx.CreateUser(newUser("bob", RoleContributor))
+	})
+	if err != nil {
+		t.Errorf("a new bob: %v", err)
+	}
+}
+
+func TestSessionByID(t *testing.T) {
+	d, _ := openTemp(t)
+	now := time.Now().UTC()
+	s := Session{ID: "s1", User: "u-1", Created: now, LastSeen: now, AuthTime: now, Epoch: 3}
+	err := d.Update(func(tx *Tx) error {
+		if err := tx.PutSession([]byte("old"), s); err != nil {
+			return err
+		}
+		if err := tx.DeleteSession([]byte("old")); err != nil {
+			return err
+		}
+		return tx.PutSession([]byte("new"), s)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.View(func(tx *Tx) error {
+		if got, err := tx.SessionByID("s1"); err != nil || got.ID != "s1" || got.Epoch != 3 {
+			t.Errorf("SessionByID = %+v, %v", got, err)
+		}
+		if _, err := tx.SessionByID("s2"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("a missing session: %v", err)
+		}
+		return nil
+	})
+	d.Update(func(tx *Tx) error { return tx.DeleteSession([]byte("new")) })
+	d.View(func(tx *Tx) error {
+		if _, err := tx.SessionByID("s1"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("a deleted session: %v", err)
+		}
+		return nil
+	})
+}

@@ -24,6 +24,15 @@ const (
 	AuthPasswordDisabled Type = "auth.password_disabled"
 	SessionRevoked       Type = "session.revoked"
 	UserCreated          Type = "user.created"
+	UserUpdated          Type = "user.updated"
+	UserDeleted          Type = "user.deleted"
+	InviteCreated        Type = "invite.created"
+	InviteUsed           Type = "invite.used"
+	ResetCreated         Type = "reset.created"
+	ResetUsed            Type = "reset.used"
+	LinkRevoked          Type = "link.revoked"
+	BindingCreated       Type = "binding.created"
+	BindingDeleted       Type = "binding.deleted"
 )
 
 type Outcome string

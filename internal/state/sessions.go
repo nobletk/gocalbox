@@ -55,6 +55,19 @@ func (t *Tx) DeleteSession(key []byte) error {
 	return b.Delete(key)
 }
 
+func (t *Tx) SessionByID(id string) (Session, error) {
+	var s Session
+	key := t.tx.Bucket(bucketSessionIDs).Get([]byte(id))
+	if key == nil {
+		return s, ErrNotFound
+	}
+	v := t.tx.Bucket(bucketSessions).Get(key)
+	if v == nil {
+		return s, ErrNotFound
+	}
+	return s, json.Unmarshal(v, &s)
+}
+
 // Sessions calls fn for every stored session. A record that cannot be read
 // is passed with an empty ID, so the caller can delete it.
 func (t *Tx) Sessions(fn func(key []byte, s Session) error) error {

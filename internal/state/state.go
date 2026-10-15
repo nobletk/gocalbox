@@ -270,6 +270,35 @@ func (t *Tx) UpdateUser(u User) error {
 	return putJSON(t.tx.Bucket(bucketUsers), u.ID, u)
 }
 
+// DeleteUser removes the user's record and username. Their sessions,
+// bindings and links are the caller's to remove in the same transaction.
+func (t *Tx) DeleteUser(id string) error {
+	u, err := t.User(id)
+	if err != nil {
+		return err
+	}
+	if err := t.tx.Bucket(bucketUsernames).Delete([]byte(u.Username)); err != nil {
+		return err
+	}
+	return t.tx.Bucket(bucketUsers).Delete([]byte(id))
+}
+
+func (t *Tx) Binding(id string) (Binding, error) {
+	var b Binding
+	v := t.tx.Bucket(bucketBindings).Get([]byte(id))
+	if v == nil {
+		return b, ErrNotFound
+	}
+	return b, json.Unmarshal(v, &b)
+}
+
+func (t *Tx) DeleteBinding(id string) error {
+	if t.tx.Bucket(bucketBindings).Get([]byte(id)) == nil {
+		return ErrNotFound
+	}
+	return t.tx.Bucket(bucketBindings).Delete([]byte(id))
+}
+
 func (t *Tx) Bindings() ([]Binding, error) {
 	var out []Binding
 	err := t.tx.Bucket(bucketBindings).ForEach(func(k, v []byte) error {

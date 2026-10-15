@@ -182,7 +182,7 @@ func usersPasswd(args []string, stdin io.Reader, stdout, stderr io.Writer) error
 	if err != nil {
 		return err
 	}
-	u, err := c.acc.SetPassword(consoleContext(), name, password)
+	u, revoked, err := c.acc.SetPassword(consoleContext(), name, password)
 	if err != nil {
 		return explain(err)
 	}
@@ -190,7 +190,28 @@ func usersPasswd(args []string, stdin io.Reader, stdout, stderr io.Writer) error
 		return fmt.Errorf("the password of %s was changed, but the audit record could not be written: %w", u.Username, err)
 	}
 	fmt.Fprintf(stdout, "Changed the password of %s; every session of the account has ended.\n", u.Username)
+	if len(revoked) > 0 {
+		fmt.Fprintf(stdout, "Revoked %d unused link(s) the account made or that were for it; make again the ones still wanted:\n", len(revoked))
+		for _, l := range revoked {
+			fmt.Fprintf(stdout, "  %s\n", describeLink(l))
+		}
+	}
 	return nil
+}
+
+func describeLink(l auth.RevokedLink) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s", l.Kind, l.ID)
+	if l.Role != "" {
+		fmt.Fprintf(&b, ", role %s", l.Role)
+	}
+	if l.Username != "" {
+		fmt.Fprintf(&b, ", for %s", l.Username)
+	}
+	if l.Note != "" {
+		fmt.Fprintf(&b, ", note %q", l.Note)
+	}
+	return b.String()
 }
 
 func usersList(args []string, stdout, stderr io.Writer) error {

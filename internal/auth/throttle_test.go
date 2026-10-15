@@ -115,7 +115,7 @@ func TestPasswordIsDisabledAtOneHundredFailures(t *testing.T) {
 	if n := slices.Index(f.rec.types(), events.AuthPasswordDisabled); n < 0 {
 		t.Error("no auth.password_disabled event")
 	}
-	if _, err := f.acc.SetPassword(events.WithActor(ctx, events.Actor{ID: events.ConsoleID}), "alice", "a brand new passphrase"); err != nil {
+	if _, _, err := f.acc.SetPassword(events.WithActor(ctx, events.Actor{ID: events.ConsoleID}), "alice", "a brand new passphrase"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.acc.Login(ctx, "alice", "a brand new passphrase", Client{Addr: "192.0.2.72:1"}); err != nil {
