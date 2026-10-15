@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 )
@@ -17,7 +18,35 @@ var (
 	ErrRootTarget  = errors.New("operation not permitted on the sandbox root")
 	ErrBrokenLink  = errors.New("path goes through a broken symlink")
 	ErrInvalidPath = errors.New("invalid path")
+	ErrReserved    = errors.New("reserved path")
 )
+
+// ReservedName is the server's own folder, at the root for the upload engine
+// and the trash of deleted folders. It is refused at any depth.
+const ReservedName = ".gocalbox"
+
+// IsReserved reports whether a volume may take name for ReservedName: in
+// any letter case; with trailing dots and spaces, which Windows drops (FAT
+// and exFAT drop the dots on Linux too); and as the 8.3 short name FAT and
+// Windows give it, which Linux finds as well. Short names a volume makes
+// after collisions, such as GO3F2A~1, can't be told from the name; changes
+// check the stored spelling of their folders for those.
+func IsReserved(name string) bool {
+	name = strings.TrimRight(name, ". ")
+	if strings.EqualFold(name, ReservedName) {
+		return true
+	}
+	const short = "GOCALB~"
+	if len(name) <= len(short) || !strings.EqualFold(name[:len(short)], short) {
+		return false
+	}
+	return strings.Trim(name[len(short):], "0123456789") == ""
+}
+
+// HasReserved reports whether any component of the path rel is reserved.
+func HasReserved(rel string) bool {
+	return slices.ContainsFunc(strings.Split(filepath.ToSlash(rel), "/"), IsReserved)
+}
 
 type Sandbox struct {
 	root string
@@ -105,6 +134,9 @@ func (s *Sandbox) path(abs string) (Path, error) {
 	if err != nil {
 		return Path{}, ErrTraversal
 	}
+	if HasReserved(rel) {
+		return Path{}, ErrReserved
+	}
 	return Path{Rel: path.Clean(filepath.ToSlash(rel)), Abs: abs}, nil
 }
 
@@ -153,6 +185,14 @@ func Within(base, target string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+// Clean checks a client's path without reading the file system and returns
+// it cleaned and slash-separated. Its errors therefore tell nothing about
+// what exists.
+func Clean(userPath string) (string, error) {
+	rel, err := cleanRel(userPath)
+	return filepath.ToSlash(rel), err
+}
+
 func cleanRel(userPath string) (string, error) {
 	if strings.ContainsRune(userPath, 0) {
 		return "", ErrInvalidPath
@@ -165,6 +205,9 @@ func cleanRel(userPath string) (string, error) {
 	// Client paths are separated by "/" only, on every system.
 	if filepath.Separator == '\\' && strings.ContainsRune(userPath, '\\') {
 		return "", ErrInvalidPath
+	}
+	if HasReserved(rel) {
+		return "", ErrReserved
 	}
 	return rel, nil
 }
