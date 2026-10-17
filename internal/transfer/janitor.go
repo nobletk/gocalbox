@@ -160,10 +160,14 @@ func (e *Engine) remove(s *session) {
 	trashed := native(trashDir, trashName())
 	err := e.root.Rename(sessionDir(id), trashed)
 	moved := err == nil
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		logf("cannot remove upload %s, trying again later: %v", id, err)
-		retry()
-		return
+	if err != nil {
+		// A missing trash folder is reported like a missing session folder,
+		// so only the session folder's absence counts as already moved.
+		if _, serr := e.root.Lstat(sessionDir(id)); !errors.Is(serr, fs.ErrNotExist) {
+			logf("cannot remove upload %s, trying again later: %v", id, err)
+			retry()
+			return
+		}
 	}
 	if err := e.reg.DeleteUpload(id); err != nil {
 		logf("cannot delete the record of upload %s, trying again later: %v", id, err)

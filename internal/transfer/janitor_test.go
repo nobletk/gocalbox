@@ -425,17 +425,37 @@ func TestASessionWithoutPartsGivesBackItsWindow(t *testing.T) {
 }
 
 func TestARemovalKeepsTheRecordUntilTheFolderMoved(t *testing.T) {
-	en := newEnv(t)
-	c := en.create(alice, "public", "a.bin", newFile(10))
-	en.e.Abort(as(alice), c.UploadID)
-	trash := filepath.Join(en.dir, sandbox.ReservedName, trashDir)
-	os.Remove(trash)
-	if err := os.WriteFile(trash, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	en.clock.add(DefaultLimits.TombstoneTTL)
-	en.e.sweep()
-	if !en.reg.has(c.UploadID) || en.e.lookup(c.UploadID) == nil || !exists(en.staged(c.UploadID, "")) {
-		t.Errorf("record %v, session %v", en.reg.has(c.UploadID), en.e.lookup(c.UploadID) != nil)
+	for _, tc := range []struct {
+		name  string
+		trash func(path string) error
+	}{
+		{"the trash is missing", func(string) error { return nil }},
+		{"the trash is a file", func(path string) error { return os.WriteFile(path, nil, 0o600) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			en := newEnv(t)
+			c := en.create(alice, "public", "a.bin", newFile(10))
+			en.e.Abort(as(alice), c.UploadID)
+			trash := filepath.Join(en.dir, sandbox.ReservedName, trashDir)
+			if err := os.Remove(trash); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.trash(trash); err != nil {
+				t.Fatal(err)
+			}
+			en.clock.add(DefaultLimits.TombstoneTTL)
+			en.e.sweep()
+			if !en.reg.has(c.UploadID) || en.e.lookup(c.UploadID) == nil || !exists(en.staged(c.UploadID, "")) {
+				t.Fatalf("record %v, session %v, folder %v", en.reg.has(c.UploadID), en.e.lookup(c.UploadID) != nil, exists(en.staged(c.UploadID, "")))
+			}
+			os.Remove(trash)
+			if err := os.Mkdir(trash, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			en.e.sweep()
+			if en.reg.has(c.UploadID) || en.e.lookup(c.UploadID) != nil || exists(en.staged(c.UploadID, "")) {
+				t.Errorf("once the trash is back: record %v, session %v, folder %v", en.reg.has(c.UploadID), en.e.lookup(c.UploadID) != nil, exists(en.staged(c.UploadID, "")))
+			}
+		})
 	}
 }
