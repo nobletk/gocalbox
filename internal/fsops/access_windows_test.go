@@ -12,7 +12,7 @@ import (
 func TestTheReservedFolderCantBeReachedByItsShortName(t *testing.T) {
 	a := newAccessEnv(t)
 	long := filepath.Join(a.root, sandbox.ReservedName)
-	if err := os.Mkdir(long, 0o700); err != nil {
+	if err := os.MkdirAll(long, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	from, _ := syscall.UTF16PtrFromString(long)

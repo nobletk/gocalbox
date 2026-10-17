@@ -90,11 +90,19 @@ func TestCheckStagingRemovesWhatEarlierRunsLeft(t *testing.T) {
 	tmp := filepath.Join(dir, filepath.FromSlash(TmpDir))
 	os.MkdirAll(tmp, 0o700)
 	ours := []string{"n-0123456789abcdef0123456789abcdef", "s-0123456789abcdef0123456789abcdef"}
-	os.WriteFile(filepath.Join(tmp, ours[0]), []byte("x"), 0o600)
-	os.MkdirAll(filepath.Join(tmp, ours[1], "deep"), 0o700)
-	others := []string{"n-0123", "notes.txt", "S-0123456789ABCDEF0123456789ABCDEF"}
+	if err := os.WriteFile(filepath.Join(tmp, ours[0]), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmp, ours[1], "deep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Each name differs from ours in more than letter case, or a volume that
+	// ignores case would hold it as one of ours.
+	others := []string{"n-0123", "notes.txt", "S-FEDCBA9876543210FEDCBA9876543210"}
 	for _, n := range others {
-		os.WriteFile(filepath.Join(tmp, n), []byte("keep"), 0o600)
+		if err := os.WriteFile(filepath.Join(tmp, n), []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	s := check(t, dir)
