@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/nobletk/gocalbox/internal/events"
+	"github.com/nobletk/gocalbox/internal/filelock"
 	"github.com/nobletk/gocalbox/internal/sandbox"
 )
 
@@ -188,6 +189,16 @@ func release(f *os.File) {
 	f.Close()
 }
 
+func lockFile(f *os.File) error {
+	err := filelock.Lock(f)
+	if errors.Is(err, filelock.ErrLocked) {
+		return ErrLocked
+	}
+	return err
+}
+
+func unlockFile(f *os.File) error { return filelock.Unlock(f) }
+
 func (w *Writer) Path() string { return w.path }
 
 // Records counts the records in the file, including earlier runs.
@@ -313,28 +324,41 @@ func (w *Writer) Close() error {
 	return err
 }
 
+// Keep names the events the log leaves out unless asked to keep them.
+type Keep struct {
+	// Metadata keeps successful listings and file checks.
+	Metadata bool
+	// Parts keeps every accepted part of an upload.
+	Parts bool
+}
+
 // Subscribe makes c the bus's audit subscriber. A log that takes no event
 // for stallAfter pauses changes through g; from then on, the events it has
 // no room for are printed instead of waited for.
-func Subscribe(bus *events.Bus, c *Coalescer, g *Guard, metadata bool, stallAfter time.Duration) {
+func Subscribe(bus *events.Bus, c *Coalescer, g *Guard, keep Keep, stallAfter time.Duration) {
 	bus.SubscribeBatch("audit", c.HandleBatch, events.Options{
 		Mode:       events.Block,
 		Buffer:     1024,
-		Filter:     Filter(metadata),
+		Filter:     Filter(keep),
 		StallAfter: stallAfter,
 		OnStall:    g.Trip,
 	})
 }
 
 // Filter passes every event the log keeps: all but successful listings and
-// file checks, which only metadata keeps. An event with an Ack always passes.
-func Filter(metadata bool) func(events.Event) bool {
+// file checks, and accepted parts of uploads, unless keep asks for them. An
+// event with an Ack always passes.
+func Filter(keep Keep) func(events.Event) bool {
 	return func(ev events.Event) bool {
-		if ev.Ack != nil {
+		switch {
+		case ev.Ack != nil:
 			return true
+		case ev.Progress():
+			return keep.Parts
+		case ev.Type == events.FileListed || ev.Type == events.FileChecked:
+			return keep.Metadata || ev.Outcome != events.OutcomeOK
 		}
-		isMetadata := ev.Type == events.FileListed || ev.Type == events.FileChecked
-		return metadata || !isMetadata || ev.Outcome != events.OutcomeOK
+		return true
 	}
 }
 

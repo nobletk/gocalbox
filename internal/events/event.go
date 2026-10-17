@@ -33,6 +33,14 @@ const (
 	LinkRevoked          Type = "link.revoked"
 	BindingCreated       Type = "binding.created"
 	BindingDeleted       Type = "binding.deleted"
+
+	UploadCreated      Type = "upload.created"
+	UploadPartReceived Type = "upload.part_received"
+	UploadRejected     Type = "upload.rejected"
+	UploadCompleted    Type = "upload.completed"
+	UploadAborted      Type = "upload.aborted"
+	UploadExpired      Type = "upload.expired"
+	UploadFailed       Type = "upload.failed"
 )
 
 type Outcome string
@@ -86,6 +94,32 @@ type Event struct {
 
 	Detail string `json:"detail,omitempty"`
 
+	// Upload is shared by every subscriber, so it must not change once the
+	// event is published.
+	Upload *UploadInfo `json:"upload,omitempty"`
+
 	// Ack, when set, is told whether the event's record reached the disk.
 	Ack *Ack `json:"-"`
 }
+
+// UploadInfo describes the upload session an upload event is about.
+type UploadInfo struct {
+	ID         string    `json:"id"`
+	Owner      string    `json:"owner"`
+	OwnerName  string    `json:"owner_name,omitempty"` // set when the actor is someone else
+	Part       int       `json:"part,omitempty"`       // 0 for the session as a whole
+	PartSize   int64     `json:"part_size,omitempty"`
+	Parts      int       `json:"parts,omitempty"`
+	Received   int       `json:"received,omitempty"`
+	Retries    int       `json:"retries,omitempty"` // duplicate parts answered again
+	Rejected   int       `json:"rejected,omitempty"`
+	Clients    []string  `json:"clients,omitempty"` // distinct client addresses, at most 8
+	Started    time.Time `json:"started,omitzero"`
+	DurationMS int64     `json:"duration_ms,omitempty"`
+	SHA256     string    `json:"sha256,omitempty"` // the part's hash, or the composite on a session's last event
+}
+
+// Progress reports whether ev only tells of progress, an accepted part,
+// which subscribers may miss and which the audit log and the console leave
+// out unless asked to keep it.
+func (ev Event) Progress() bool { return ev.Type == UploadPartReceived && ev.Outcome == OutcomeOK }

@@ -3,6 +3,7 @@ package events
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log"
 	"os"
 	"strings"
@@ -427,6 +428,78 @@ func TestLogHandlerFormat(t *testing.T) {
 	} {
 		if !strings.Contains(line, want) {
 			t.Errorf("log line %q is missing %q", line, want)
+		}
+	}
+
+	logs.Reset()
+	LogHandler(Event{Type: UploadRejected, Outcome: OutcomeInvalid, Upload: &UploadInfo{ID: "3f9a", Part: 7}})
+	if line := logs.String(); !strings.Contains(line, "upload=3f9a part=7") {
+		t.Errorf("log line %q doesn't name the upload and part", line)
+	}
+}
+
+// With a subscriber that holds every event, TryPublish fills the queue and
+// then gives up at once, counting what it skipped, while Publish waits.
+func TestTryPublishNeverWaits(t *testing.T) {
+	out := captureLost(t)
+	b := NewWithQueue(1)
+	release := make(chan struct{})
+	var c collector
+	b.Subscribe("audit", func(ev Event) { <-release; c.handle(ev) }, Options{Buffer: 1})
+
+	queued := 0
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		if b.TryPublish(Event{Type: UploadPartReceived, Outcome: OutcomeOK}) {
+			queued++
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("TryPublish waited")
+	}
+	if queued == 0 || queued >= 20 {
+		t.Fatalf("queued %d of 20 with a stuck subscriber", queued)
+	}
+	if got := b.Stats().Skipped; got != uint64(20-queued) {
+		t.Errorf("Skipped %d, want %d", got, 20-queued)
+	}
+	if n := len(out.lines(t)); n != 0 {
+		t.Errorf("%d skipped events without an Ack were printed", n)
+	}
+
+	ack := NewAck()
+	if b.TryPublish(Event{Type: FileDeleted, Ack: ack}) {
+		t.Fatal("queued into a full queue")
+	}
+	if done, err := ack.Wait(time.Second); !done || !errors.Is(err, ErrQueueFull) {
+		t.Errorf("the skipped event's Ack: %v, %v", done, err)
+	}
+	if l := out.lines(t); len(l) != 1 || l[0].Audit != LostNotRecorded || l[0].Event.Type != FileDeleted {
+		t.Errorf("a skipped event with an Ack was printed as %+v", l)
+	}
+
+	close(release)
+	closeBus(t, b)
+	if n := len(c.events()); n != queued {
+		t.Errorf("delivered %d, want the %d queued", n, queued)
+	}
+	if b.TryPublish(Event{Type: FileDeleted}) {
+		t.Error("TryPublish queued after Close")
+	}
+}
+
+func TestProgress(t *testing.T) {
+	if !(Event{Type: UploadPartReceived, Outcome: OutcomeOK}).Progress() {
+		t.Error("an accepted part isn't progress")
+	}
+	for _, ev := range []Event{
+		{Type: UploadPartReceived, Outcome: OutcomeError},
+		{Type: UploadCompleted, Outcome: OutcomeOK},
+		{Type: FileUploaded, Outcome: OutcomeOK},
+	} {
+		if ev.Progress() {
+			t.Errorf("%s/%s counted as progress", ev.Type, ev.Outcome)
 		}
 	}
 }

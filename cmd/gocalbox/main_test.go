@@ -562,12 +562,59 @@ func TestUploadsKeepTheFreeSpaceReserve(t *testing.T) {
 
 func TestStartingEmptiesTheTrash(t *testing.T) {
 	a, cfg := newTestApp(t, func(cfg *config) {
-		left := filepath.Join(cfg.RootDir, ".gocalbox", "trash", "0123", "deleted.txt")
+		left := filepath.Join(cfg.RootDir, ".gocalbox", "trash", "0123456789abcdef", "deleted.txt")
 		os.MkdirAll(filepath.Dir(left), 0o700)
 		os.WriteFile(left, []byte("x"), 0o644)
 	})
 	defer closeApp(t, a)
-	if _, err := os.Stat(filepath.Join(cfg.RootDir, ".gocalbox", "trash")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the trash after starting: %v", err)
+	if left, err := os.ReadDir(filepath.Join(cfg.RootDir, ".gocalbox", "trash")); err != nil || len(left) != 0 {
+		t.Errorf("the trash after starting: %v, %v", left, err)
+	}
+}
+
+// The server's own folder is checked and locked at start-up: a symlink in
+// its place is never followed, and a second server on the folder is refused.
+func TestStartingChecksTheStagingFolder(t *testing.T) {
+	a, cfg := newTestApp(t)
+	for _, d := range []string{".gocalbox/uploads", ".gocalbox/tmp", ".gocalbox/trash"} {
+		if info, err := os.Lstat(filepath.Join(cfg.RootDir, filepath.FromSlash(d))); err != nil || !info.IsDir() {
+			t.Errorf("%s: %v", d, err)
+		}
+	}
+	second := cfg
+	second.AuditLog = filepath.Join(t.TempDir(), "second.jsonl")
+	second.StateFile = filepath.Join(t.TempDir(), "second.db")
+	if b, err := openTestApp(t, second); err == nil || !strings.Contains(err.Error(), "another gocalbox serves this folder") {
+		if err == nil {
+			closeApp(t, b)
+		}
+		t.Errorf("a second server on the folder: %v", err)
+	}
+	closeApp(t, a)
+
+	root := t.TempDir()
+	victim := filepath.Join(root, "public", "victim")
+	os.MkdirAll(filepath.Join(victim, "trash", "0123456789abcdef"), 0o755)
+	os.WriteFile(filepath.Join(victim, "trash", "0123456789abcdef", "mine.txt"), []byte("mine"), 0o644)
+	before, _ := os.Stat(victim)
+	if err := os.Symlink(filepath.Join("public", "victim"), filepath.Join(root, ".gocalbox")); err != nil {
+		t.Skipf("no symlinks here: %v", err)
+	}
+	cfg.RootDir = root
+	cfg.AuditLog = filepath.Join(t.TempDir(), "third.jsonl")
+	cfg.StateFile = filepath.Join(t.TempDir(), "third.db")
+	c, err := openTestApp(t, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeApp(t, c)
+	if _, err := os.Stat(filepath.Join(victim, "trash", "0123456789abcdef", "mine.txt")); err != nil {
+		t.Errorf("starting followed the symlink into the trash: %v", err)
+	}
+	if entries, _ := os.ReadDir(victim); len(entries) != 1 {
+		t.Errorf("starting made folders in the symlink's target: %v", entries)
+	}
+	if info, _ := os.Stat(victim); info.Mode() != before.Mode() {
+		t.Errorf("starting changed the mode of the symlink's target from %v to %v", before.Mode(), info.Mode())
 	}
 }

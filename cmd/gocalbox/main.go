@@ -232,6 +232,7 @@ type app struct {
 	StatePath    string
 
 	sb        *sandbox.Sandbox
+	staging   *sandbox.Staging
 	state     *state.DB
 	accounts  *auth.Accounts
 	setupCode string       // shown once on the console, then cleared
@@ -292,6 +293,17 @@ func newApp(cfg config) (_ *app, err error) {
 	if err != nil {
 		return nil, err
 	}
+	// After the audit log's and the state file's checks, so a start they
+	// refuse leaves nothing in the served folder.
+	staging, err := sandbox.CheckStaging(sb.OSRoot())
+	if errors.Is(err, sandbox.ErrStagingLocked) {
+		return nil, fmt.Errorf("%s/%s is in use: another gocalbox serves this folder; stop it first", sb.Root(), sandbox.ReservedName)
+	}
+	if err != nil {
+		return nil, err
+	}
+	undo = append(undo, staging.Close)
+	logStaging(staging)
 	volume, err := sb.OSRoot().Open(".")
 	if err != nil {
 		return nil, fmt.Errorf("open root directory: %w", err)
@@ -311,9 +323,12 @@ func newApp(cfg config) (_ *app, err error) {
 
 	bus := events.New()
 	undo = append(undo, func() error { return bus.Close(context.Background()) })
-	audit.Subscribe(bus, coalescer, guard, cfg.AuditListings, waitTimeout)
+	audit.Subscribe(bus, coalescer, guard, audit.Keep{Metadata: cfg.AuditListings}, waitTimeout)
 	if cfg.LogEvents {
-		bus.Subscribe("console", events.LogHandler, events.Options{Mode: events.Drop, Buffer: 1024})
+		bus.Subscribe("console", events.LogHandler, events.Options{
+			Mode: events.Drop, Buffer: 1024,
+			Filter: func(ev events.Event) bool { return !ev.Progress() },
+		})
 	}
 
 	var webFS fs.FS = web.Assets
@@ -349,7 +364,7 @@ func newApp(cfg config) (_ *app, err error) {
 	opts.ChangesPaused = recorder.Paused
 
 	minPwLen := cmp.Or(cfg.MinPasswordLen, auth.DefaultMinPasswordLength)
-	files := fsops.New(sb, bus, fsops.WithSpace(ledger), fsops.WithRecords(db), fsops.WithAudit(recorder))
+	files := fsops.New(sb, bus, fsops.WithSpace(ledger), fsops.WithRecords(db), fsops.WithAudit(recorder), fsops.WithStaging(staging))
 	if err := files.EmptyTrash(); err != nil {
 		log.Printf("WARNING: cannot empty the trash of deleted folders: %v", err)
 	}
@@ -393,6 +408,7 @@ func newApp(cfg config) (_ *app, err error) {
 		TLS:          tlsSetup,
 		StatePath:    statePath,
 		sb:           sb,
+		staging:      staging,
 		state:        db,
 		accounts:     accounts,
 		setupCode:    setupCode,
@@ -437,10 +453,25 @@ func (a *app) Close(ctx context.Context) error {
 	if cerr := a.volume.Close(); err == nil {
 		err = cerr
 	}
+	if cerr := a.staging.Close(); err == nil {
+		err = cerr
+	}
 	if cerr := a.sb.Close(); err == nil {
 		err = cerr
 	}
 	return err
+}
+
+func logStaging(s *sandbox.Staging) {
+	if !s.Usable() {
+		log.Printf("WARNING: the server's own folder %s can't be used: %v. Folders are deleted in place instead of through its trash.", sandbox.ReservedName, s.Problem)
+	}
+	if s.Warning != "" {
+		log.Printf("WARNING: %s", s.Warning)
+	}
+	if len(s.Unknown) > 0 {
+		log.Printf("WARNING: %s holds entries the server didn't put there, left alone: %s", sandbox.TmpDir, strings.Join(s.Unknown, ", "))
+	}
 }
 
 func (a *app) logSpace() {

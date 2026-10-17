@@ -58,8 +58,13 @@ func newAccessEnv(t *testing.T) *accessEnv {
 			{Subject: bob, Folder: "projects/team", Grant: authz.GrantViewer},
 		}),
 	}
+	staging, err := sandbox.CheckStaging(e.sb.OSRoot())
+	if err != nil || !staging.Usable() {
+		t.Fatal(err, staging.Problem)
+	}
+	t.Cleanup(func() { staging.Close() })
 	rec := &recorder{}
-	e.svc = New(e.sb, rec, WithRecords(db))
+	e.svc = New(e.sb, rec, WithRecords(db), WithStaging(staging))
 	e.svc.SetPolicy(p)
 	return &accessEnv{env: e, db: db, rec: rec, policy: p}
 }
@@ -595,12 +600,45 @@ func TestDeletedFoldersGoThroughTheTrash(t *testing.T) {
 	}
 	shown(t, errOf(a.svc.List(as(admin), trashDir)), sandbox.ErrReserved, "list the trash")
 
-	a.write(trashDir+"/crashed/x", "x")
-	if err := a.svc.EmptyTrash(); err != nil || a.exists(trashDir) {
+	a.write(trashDir+"/0123456789abcdef/x", "x")
+	a.write(trashDir+"/notes/x", "x")
+	if err := a.svc.EmptyTrash(); err != nil || a.exists(trashDir+"/0123456789abcdef") {
 		t.Errorf("EmptyTrash: %v", err)
 	}
+	if !a.exists(trashDir + "/notes/x") {
+		t.Error("EmptyTrash removed a name the server doesn't give")
+	}
+	os.RemoveAll(filepath.Join(a.root, trashDir))
 	if err := a.svc.EmptyTrash(); err != nil {
 		t.Errorf("EmptyTrash without a trash: %v", err)
+	}
+}
+
+// Without a usable staging folder, nothing goes into the trash: a folder is
+// deleted where it is, and the trash is left as it is.
+func TestFoldersAreDeletedInPlaceWithoutAStagingFolder(t *testing.T) {
+	a := newAccessEnv(t)
+	WithStaging(&sandbox.Staging{Problem: errors.New("a symlink")})(a.svc)
+	a.write("public/victim/trash/0123456789abcdef/mine.txt", "mine")
+	a.write("public/other/trash", "a file where the trash would be")
+	os.RemoveAll(filepath.Join(a.root, sandbox.ReservedName))
+	if err := os.Symlink(filepath.Join("public", "victim"), filepath.Join(a.root, sandbox.ReservedName)); err != nil {
+		t.Skipf("no symlinks here: %v", err)
+	}
+	if err := a.svc.EmptyTrash(); err != nil {
+		t.Errorf("EmptyTrash: %v", err)
+	}
+	if a.read("public/victim/trash/0123456789abcdef/mine.txt") != "mine" {
+		t.Error("EmptyTrash followed the symlink")
+	}
+
+	os.Remove(filepath.Join(a.root, sandbox.ReservedName))
+	os.Symlink(filepath.Join("public", "other"), filepath.Join(a.root, sandbox.ReservedName))
+	a.mkdir(admin, "public", "big")
+	a.write("public/big/a/b/c.txt", "c")
+	ok(t, errOf(a.svc.Delete(as(admin), "public/big")), "delete a folder")
+	if a.exists("public/big") {
+		t.Error("the folder is left")
 	}
 }
 

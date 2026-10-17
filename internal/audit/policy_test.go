@@ -166,7 +166,7 @@ func TestABrokenOrClosedWriterAnswersAtOnce(t *testing.T) {
 }
 
 func TestTheFilterNeverDropsAnAcknowledgedEvent(t *testing.T) {
-	f := Filter(false)
+	f := Filter(Keep{})
 	listed := events.Event{Type: events.FileListed, Outcome: events.OutcomeOK}
 	if f(listed) {
 		t.Fatal("a successful listing passed without -audit-listings")
@@ -247,7 +247,7 @@ func newStack(t *testing.T, opts RecorderOptions) *stack {
 	c := NewCoalescer(w, time.Minute, time.Minute)
 	bus := events.New()
 	g := NewGuard(w.Err)
-	Subscribe(bus, c, g, false, opts.Timeout)
+	Subscribe(bus, c, g, Keep{}, opts.Timeout)
 	s := &stack{bus: bus, w: w, g: g, r: NewRecorder(bus, g, opts), path: path}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

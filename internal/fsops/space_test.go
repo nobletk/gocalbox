@@ -4,6 +4,10 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -120,14 +124,7 @@ func TestReadOnlyIsAPermissionError(t *testing.T) {
 func TestUploadIntoAnotherFileSystemIsNotMeasured(t *testing.T) {
 	e, _, _ := newSpaceEnv(t, func() (int64, error) { return 0, nil }, 1<<20)
 	e.write("ext/keep", "")
-	orig := deviceOf
-	deviceOf = func(info fs.FileInfo) uint64 {
-		if info.Name() == "ext" {
-			return 2
-		}
-		return 1
-	}
-	t.Cleanup(func() { deviceOf = orig })
+	fakeVolumes(t, "ext")
 
 	if _, _, err := e.svc.Create(bg, "ext", "a.bin", strings.NewReader("abc"), 3); err != nil {
 		t.Fatalf("upload into another file system: %v", err)
@@ -142,4 +139,27 @@ func TestServedFolderAndItsSubfoldersShareAVolume(t *testing.T) {
 	if !e.svc.onServedVolume("sub") || !e.svc.onServedVolume(".") {
 		t.Error("a folder on the served file system was treated as another one")
 	}
+}
+
+// fakeVolumes makes the folders named other count as being on another file
+// system.
+func fakeVolumes(t *testing.T, other ...string) {
+	orig := sameVolume
+	sameVolume = func(_ *os.Root, a, b string) (bool, bool, error) {
+		same := slices.Contains(other, path.Base(filepath.ToSlash(a))) == slices.Contains(other, path.Base(filepath.ToSlash(b)))
+		return same, same, nil
+	}
+	t.Cleanup(func() { sameVolume = orig })
+}
+
+// A folder whose volume can't be told counts as sharing the served disk's
+// free space, so the ledger still measures uploads into it.
+func TestTheLedgerMeasuresAFolderOfUnknownVolume(t *testing.T) {
+	e, _, _ := newSpaceEnv(t, func() (int64, error) { return 0, nil }, 1<<20)
+	e.write("sub/keep", "")
+	orig := sameVolume
+	sameVolume = func(*os.Root, string, string) (bool, bool, error) { return false, false, errors.New("no identity") }
+	t.Cleanup(func() { sameVolume = orig })
+	_, _, err := e.svc.Create(bg, "sub", "a.bin", strings.NewReader("abc"), 3)
+	is(t, err, ErrInsufficientStorage, "an upload into a folder of unknown volume")
 }

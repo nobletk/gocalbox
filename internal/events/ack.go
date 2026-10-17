@@ -17,6 +17,7 @@ var (
 	ErrNotConfirmed  = errors.New("the change was made but the audit log did not confirm its record in time")
 	ErrClosed        = errors.New("the event bus is closed")
 	ErrStalled       = errors.New("the audit log took no event")
+	ErrQueueFull     = errors.New("the event bus's queue was full")
 )
 
 // IsUnrecorded reports whether err is the answer to a change that was made

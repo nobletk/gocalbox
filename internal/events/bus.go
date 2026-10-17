@@ -58,6 +58,7 @@ type Bus struct {
 
 	subs           atomic.Pointer[[]*subscriber]
 	published      atomic.Uint64
+	skipped        atomic.Uint64
 	dispatcherDone chan struct{}
 }
 
@@ -157,6 +158,40 @@ func (b *Bus) Publish(ev Event) {
 	case b.in <- ev:
 	case <-b.abort:
 		lose(ev, ErrClosed)
+	}
+}
+
+// TryPublish queues ev unless the shared queue is full, and never waits; it
+// reports whether ev was queued. An event it can't queue is counted in
+// Stats().Skipped, so it suits events subscribers may miss. One with an Ack
+// is answered and printed as lost instead.
+func (b *Bus) TryPublish(ev Event) bool {
+	if ev.Time.IsZero() {
+		ev.Time = b.now()
+	}
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		b.skip(ev, ErrClosed)
+		return false
+	}
+	b.publishers.Add(1)
+	b.mu.Unlock()
+	defer b.publishers.Done()
+
+	select {
+	case b.in <- ev:
+		return true
+	default:
+		b.skip(ev, ErrQueueFull)
+		return false
+	}
+}
+
+func (b *Bus) skip(ev Event, cause error) {
+	b.skipped.Add(1)
+	if ev.Ack != nil {
+		lose(ev, cause)
 	}
 }
 
@@ -333,11 +368,12 @@ type SubscriberStats struct {
 type Stats struct {
 	Published   uint64
 	Pending     int
+	Skipped     uint64 // given to TryPublish and not queued
 	Subscribers []SubscriberStats
 }
 
 func (b *Bus) Stats() Stats {
-	st := Stats{Published: b.published.Load(), Pending: len(b.in)}
+	st := Stats{Published: b.published.Load(), Pending: len(b.in), Skipped: b.skipped.Load()}
 	for _, s := range *b.subs.Load() {
 		st.Subscribers = append(st.Subscribers, SubscriberStats{
 			Name:      s.name,

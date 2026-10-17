@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -351,12 +352,45 @@ func withIdentity(rec state.Uploader, info fs.FileInfo) state.Uploader {
 	return rec
 }
 
-const trashDir = sandbox.ReservedName + "/trash"
+const trashDir = sandbox.TrashDir
+
+// trashName matches the names toTrash gives, which the upload engine gives
+// the staging folders it removes too.
+var trashName = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
 // EmptyTrash removes what deletes left in the trash, which a crash or a
-// failed removal can leave behind. It runs at start-up.
+// failed removal can leave behind. It runs at start-up, and removes only the
+// names the server gives.
 func (s *Service) EmptyTrash() error {
-	return s.root.RemoveAll(filepath.FromSlash(trashDir))
+	if !s.trash {
+		return nil
+	}
+	d, err := s.root.Open(filepath.FromSlash(trashDir))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	names, err := d.Readdirnames(-1)
+	d.Close()
+	if err != nil {
+		return err
+	}
+	var unknown []string
+	for _, name := range names {
+		if !trashName.MatchString(name) {
+			unknown = append(unknown, name)
+			continue
+		}
+		if err := s.root.RemoveAll(filepath.Join(filepath.FromSlash(trashDir), name)); err != nil {
+			return err
+		}
+	}
+	if len(unknown) > 0 {
+		log.Printf("WARNING: %s holds entries the server didn't put there, left alone: %s", trashDir, strings.Join(unknown, ", "))
+	}
+	return nil
 }
 
 // toTrash renames the folder at native into the trash and returns its name

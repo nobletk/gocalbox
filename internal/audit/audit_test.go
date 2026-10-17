@@ -447,16 +447,32 @@ func TestFilter(t *testing.T) {
 	checkedDenied := events.Event{Type: events.FileChecked, Outcome: events.OutcomeDenied}
 	downloaded := events.Event{Type: events.FileDownloaded, Outcome: events.OutcomeOK}
 
-	def := Filter(false)
+	def := Filter(Keep{})
 	if def(listedOK) || def(checkedOK) {
 		t.Error("default filter must drop successful listings and file checks")
 	}
 	if !def(listedDenied) || !def(listedMissing) || !def(checkedDenied) || !def(deleted) || !def(downloaded) {
 		t.Error("failed metadata reads and other events must be recorded")
 	}
-	all := Filter(true)
+	all := Filter(Keep{Metadata: true})
 	if !all(listedOK) || !all(checkedOK) || !all(listedDenied) || !all(deleted) {
 		t.Error("metadata filter must keep everything")
+	}
+
+	part := events.Event{Type: events.UploadPartReceived, Outcome: events.OutcomeOK}
+	if def(part) || all(part) {
+		t.Error("accepted parts are kept only when asked for")
+	}
+	if !Filter(Keep{Parts: true})(part) {
+		t.Error("Keep.Parts drops accepted parts")
+	}
+	for _, typ := range []events.Type{events.UploadCreated, events.UploadRejected, events.UploadCompleted, events.UploadAborted, events.UploadExpired, events.UploadFailed} {
+		if !def(events.Event{Type: typ, Outcome: events.OutcomeOK}) {
+			t.Errorf("%s dropped", typ)
+		}
+	}
+	if !def(events.Event{Type: events.UploadPartReceived, Outcome: events.OutcomeOK, Ack: events.NewAck()}) {
+		t.Error("an event with an Ack must always pass")
 	}
 }
 

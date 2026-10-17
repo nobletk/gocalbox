@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"iter"
 	"log"
 	"os"
 	"path"
@@ -77,6 +78,11 @@ type Service struct {
 	db     *state.DB
 	audit  events.Auditor
 
+	// trash: folders are deleted through the trash in the staging folder;
+	// links: hard links work there. Both come from the staging folder's
+	// checks at start-up.
+	trash, links bool
+
 	// mu serializes check-then-act sequences (unique names, no-overwrite
 	// moves, the decision and the uploader records of every change) within
 	// this process only; other processes are not covered.
@@ -97,8 +103,19 @@ func WithRecords(db *state.DB) Option { return func(s *Service) { s.db = db } }
 // log has failed, and replies only once its record is on disk.
 func WithAudit(a events.Auditor) Option { return func(s *Service) { s.audit = a } }
 
+// WithStaging applies what start-up found of the staging folder: without a
+// usable one, folders are deleted in place and nothing is kept there.
+// Without the option, the folder is assumed usable, with hard links.
+func WithStaging(st *sandbox.Staging) Option {
+	return func(s *Service) {
+		if st != nil {
+			s.trash, s.links = st.Usable(), st.Usable() && st.Links
+		}
+	}
+}
+
 func New(sb *sandbox.Sandbox, pub Publisher, opts ...Option) *Service {
-	s := &Service{sb: sb, root: sb.OSRoot(), pub: pub}
+	s := &Service{sb: sb, root: sb.OSRoot(), pub: pub, trash: true, links: true}
 	for _, o := range opts {
 		o(s)
 	}
@@ -380,18 +397,24 @@ func (s *Service) Create(ctx context.Context, dir, name string, r io.Reader, siz
 }
 
 func (s *Service) mayUpload(ctx context.Context, p sandbox.Path) (Subject, error) {
+	sub, _, err := s.uploadFolder(ctx, p)
+	return sub, err
+}
+
+// uploadFolder decides an upload into the folder p and returns its key.
+func (s *Service) uploadFolder(ctx context.Context, p sandbox.Path) (Subject, string, error) {
 	sub, ok := s.subject(ctx)
 	if !ok {
-		return sub, hide(ErrParentNotFound)
+		return sub, "", hide(ErrParentNotFound)
 	}
 	dir, err := s.storedFor(sub, p.Rel, ErrParentNotFound)
 	if err != nil {
-		return sub, err
+		return sub, "", err
 	}
 	if sandbox.HasReserved(dir) {
-		return sub, sandbox.ErrReserved
+		return sub, "", sandbox.ErrReserved
 	}
-	return sub, refusal(sub.decide(dir, authz.Unowned, authz.Upload), ErrParentNotFound)
+	return sub, dir, refusal(sub.decide(dir, authz.Unowned, authz.Upload), ErrParentNotFound)
 }
 
 func (s *Service) create(ctx context.Context, dir, name string, r io.Reader, sizeHint int64) (string, int64, error) {
@@ -557,19 +580,7 @@ func (s *Service) updateOwn(up *upload, fn func(*state.Tx) error) error {
 }
 
 func (s *Service) createUnique(dir, name string) (*os.File, string, error) {
-	ext := filepath.Ext(name)
-	base := strings.TrimSuffix(name, ext)
-	if base == "" { // dotfile such as ".env"
-		base, ext = name, ""
-	}
-	for i := 0; i < maxAutoRename; i++ {
-		candidate := name
-		if i > 0 {
-			var ok bool
-			if candidate, ok = numbered(base, ext, i); !ok {
-				break
-			}
-		}
+	for candidate := range candidates(name) {
 		rel := path.Join(dir, candidate)
 		f, err := s.root.OpenFile(filepath.FromSlash(rel), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err == nil {
@@ -580,6 +591,29 @@ func (s *Service) createUnique(dir, name string) (*os.File, string, error) {
 		}
 	}
 	return nil, "", fmt.Errorf("%w: no free numbered variant of %q", ErrExists, name)
+}
+
+// candidates yields name, then its numbered variants while they fit.
+func candidates(name string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		ext := filepath.Ext(name)
+		base := strings.TrimSuffix(name, ext)
+		if base == "" { // dotfile such as ".env"
+			base, ext = name, ""
+		}
+		for i := 0; i < maxAutoRename; i++ {
+			candidate := name
+			if i > 0 {
+				var ok bool
+				if candidate, ok = numbered(base, ext, i); !ok {
+					return
+				}
+			}
+			if !yield(candidate) {
+				return
+			}
+		}
+	}
 }
 
 func numbered(base, ext string, i int) (string, bool) {
@@ -722,9 +756,12 @@ func (s *Service) deleteLocked(ctx context.Context, p sandbox.Path) (string, err
 		}
 	}
 	var trash string
-	if info.IsDir() {
+	switch {
+	case info.IsDir() && s.trash:
 		trash, err = s.toTrash(p.Native())
-	} else {
+	case info.IsDir():
+		err = s.root.RemoveAll(p.Native())
+	default:
 		err = s.root.Remove(p.Native())
 	}
 	if err != nil {
@@ -874,25 +911,33 @@ func osErr(err error) error {
 	return err
 }
 
-var deviceOf = func(info fs.FileInfo) uint64 {
-	dev, _ := fileID(info)
-	return dev
+// sameVolume compares the volumes of the folders a and b: links tells
+// whether links and renames work between them, disk whether they share free
+// space. A bind mount shares the disk but not links.
+var sameVolume = func(root *os.Root, a, b string) (links, disk bool, err error) {
+	va, err := sandbox.VolumeOf(root, a)
+	if err != nil {
+		return false, false, err
+	}
+	vb, err := sandbox.VolumeOf(root, b)
+	return va == vb, va.SameDisk(vb), err
 }
 
-// The ledger measures only the served folder's file system. A folder on
-// another file system mounted inside the root is not checked, and a full disk
-// there still fails the write. Where fileID reports no device (Windows), every
-// folder counts as being on the served file system.
+// onServedVolume reports whether the folder dir shares the served folder's
+// free space, which is what the ledger measures. A folder whose volume can't
+// be told counts as sharing it; a full disk there still fails the write.
 func (s *Service) onServedVolume(dir string) bool {
-	root, err := s.root.Stat(".")
-	if err != nil {
-		return true
-	}
-	target, err := s.root.Stat(dir)
-	if err != nil {
-		return true
-	}
-	return deviceOf(root) == deviceOf(target)
+	_, disk, err := sameVolume(s.root, ".", dir)
+	return err != nil || disk
+}
+
+// onStagingVolume reports whether a staged file can be linked or renamed into
+// the folder dir: whether it is on the served folder's volume, which the
+// staging folder is on. A folder whose volume can't be told counts as being
+// on it; the link that places the file still fails across volumes.
+func (s *Service) onStagingVolume(dir string) bool {
+	links, _, err := sameVolume(s.root, ".", dir)
+	return err != nil || links
 }
 
 func nameErr(err error) error {

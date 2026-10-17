@@ -31,6 +31,12 @@ func LogHandler(ev Event) {
 	if ev.Size > 0 {
 		fmt.Fprintf(&b, " size=%d", ev.Size)
 	}
+	if u := ev.Upload; u != nil {
+		fmt.Fprintf(&b, " upload=%s", u.ID)
+		if u.Part > 0 {
+			fmt.Fprintf(&b, " part=%d", u.Part)
+		}
+	}
 	if ev.Detail != "" {
 		fmt.Fprintf(&b, " detail=%q", ev.Detail)
 	}

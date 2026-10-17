@@ -1,5 +1,6 @@
 // Package state keeps the server's own records in one bbolt file: accounts,
-// folder bindings, sessions, invite and reset links, and uploader records.
+// folder bindings, sessions, invite and reset links, uploader records, and
+// the registry of upload sessions.
 package state
 
 import (
@@ -33,10 +34,11 @@ var (
 	bucketLinks      = []byte("links")
 	bucketLinkIDs    = []byte("linkids")
 	bucketUploaders  = []byte("uploaders")
+	bucketUploads    = []byte("uploads")
 
 	buckets = [][]byte{
 		bucketMeta, bucketUsers, bucketUsernames, bucketBindings, bucketSessions,
-		bucketSessionIDs, bucketLinks, bucketLinkIDs, bucketUploaders,
+		bucketSessionIDs, bucketLinks, bucketLinkIDs, bucketUploaders, bucketUploads,
 	}
 
 	keySchema    = []byte("schema")

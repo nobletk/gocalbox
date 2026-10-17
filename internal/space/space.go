@@ -43,12 +43,27 @@ func (l *Ledger) Reserve(size int64) (*Reservation, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	promised := max(size, 0)
-	if avail, ok := l.available(); ok && avail < promised {
-		return nil, fmt.Errorf("%w: %d bytes needed, %d available above the %d-byte reserve",
-			ErrInsufficient, promised, max(avail, 0), l.minFree)
+	if err := l.admit(promised); err != nil {
+		return nil, err
 	}
 	l.reserved += promised
 	return &Reservation{l: l, left: promised}, nil
+}
+
+// Admits reports whether a write of size bytes would be admitted now, with
+// the error Reserve would give, without reserving anything.
+func (l *Ledger) Admits(size int64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.admit(max(size, 0))
+}
+
+func (l *Ledger) admit(promised int64) error {
+	if avail, ok := l.available(); ok && avail < promised {
+		return fmt.Errorf("%w: %d bytes needed, %d available above the %d-byte reserve",
+			ErrInsufficient, promised, max(avail, 0), l.minFree)
+	}
+	return nil
 }
 
 func (l *Ledger) Reserved() int64 {
@@ -88,7 +103,8 @@ func (l *Ledger) consume(n int64) {
 	l.mu.Unlock()
 }
 
-// Reservation is used by the one goroutine performing the write.
+// Reservation is used by one goroutine at a time: the one performing the
+// write, or whoever holds the lock of the upload it belongs to.
 type Reservation struct {
 	l         *Ledger
 	left      int64 // reserved and not yet written
@@ -101,13 +117,42 @@ type Reservation struct {
 // concurrent write can go that far.
 func (r *Reservation) Writer(w io.Writer) io.Writer { return &countingWriter{w: w, r: r} }
 
-// Release returns what the write did not use. Calling it again does nothing.
+// Release returns what the write did not use. Calling it again does nothing,
+// and Grow can hold space again afterwards.
 func (r *Reservation) Release() {
 	if r.left > 0 {
 		r.l.consume(r.left)
 		r.left = 0
 	}
 }
+
+// Grow holds n more bytes, admitted as a new reservation of n would be.
+func (r *Reservation) Grow(n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	l := r.l
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.admit(n); err != nil {
+		return err
+	}
+	l.reserved += n
+	r.left += n
+	return nil
+}
+
+// Consume gives back n bytes that were written outside Writer and now show in
+// the free space, at most what r holds.
+func (r *Reservation) Consume(n int64) {
+	if n = min(max(n, 0), r.left); n > 0 {
+		r.left -= n
+		r.l.consume(n)
+	}
+}
+
+// Left returns the bytes r still holds.
+func (r *Reservation) Left() int64 { return r.left }
 
 type countingWriter struct {
 	w io.Writer

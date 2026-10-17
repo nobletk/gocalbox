@@ -33,3 +33,33 @@ func fileID(info fs.FileInfo) (dev, ino uint64) {
 	}
 	return 0, 0
 }
+
+// writable reports whether the server may create entries in the folder dir:
+// an error for a read-only file system, an immutable folder or missing
+// permission.
+func writable(root *os.Root, dir string) error {
+	f, err := root.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var aerr error
+	if err := rc.Control(func(fd uintptr) { aerr = mayWrite(int(fd)) }); err != nil {
+		return err
+	}
+	return aerr
+}
+
+// syncDir makes the entries of the folder dir durable.
+func syncDir(root *os.Root, dir string) error {
+	f, err := root.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}

@@ -158,3 +158,84 @@ func TestClamp(t *testing.T) {
 		t.Errorf("zero block size = %d", got)
 	}
 }
+
+func TestAdmitsReservesNothing(t *testing.T) {
+	l := NewLedger(fixed(100), 10)
+	if err := l.Admits(90); err != nil {
+		t.Fatalf("90 of 100 with a floor of 10: %v", err)
+	}
+	if err := l.Admits(91); !errors.Is(err, ErrInsufficient) {
+		t.Fatalf("91: %v, want ErrInsufficient", err)
+	}
+	if l.Reserved() != 0 {
+		t.Fatalf("Admits reserved %d", l.Reserved())
+	}
+	r, _ := l.Reserve(50)
+	if err := l.Admits(41); !errors.Is(err, ErrInsufficient) {
+		t.Errorf("Admits ignores other reservations: %v", err)
+	}
+	r.Release()
+	if err := NewLedger(func() (int64, error) { return 0, os.ErrInvalid }, 10).Admits(1 << 40); err != nil {
+		t.Errorf("unmeasurable free space must admit: %v", err)
+	}
+}
+
+// A window: hold some, give back what was written, grow again as needed,
+// and drop it all while idle.
+func TestGrowConsumeAndLeft(t *testing.T) {
+	l := NewLedger(fixed(1000), 100)
+	r, err := l.Reserve(300)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Consume(120)
+	if r.Left() != 180 || l.Reserved() != 180 {
+		t.Fatalf("after consuming 120: left %d, reserved %d", r.Left(), l.Reserved())
+	}
+	r.Consume(500)
+	r.Consume(-5)
+	if r.Left() != 0 || l.Reserved() != 0 {
+		t.Fatalf("consuming more than held: left %d, reserved %d", r.Left(), l.Reserved())
+	}
+	if err := r.Grow(900); err != nil {
+		t.Fatalf("growing to the floor: %v", err)
+	}
+	other, _ := l.Reserve(0)
+	if err := other.Grow(1); !errors.Is(err, ErrInsufficient) {
+		t.Fatalf("growing past the floor: %v", err)
+	}
+	if other.Left() != 0 || l.Reserved() != 900 {
+		t.Fatalf("a refused Grow held space: left %d, reserved %d", other.Left(), l.Reserved())
+	}
+	if err := r.Grow(0); err != nil || r.Left() != 900 {
+		t.Fatalf("Grow(0): %v, left %d", err, r.Left())
+	}
+	r.Release()
+	if r.Left() != 0 || l.Reserved() != 0 {
+		t.Fatalf("after release: left %d, reserved %d", r.Left(), l.Reserved())
+	}
+	if err := r.Grow(50); err != nil || r.Left() != 50 || l.Reserved() != 50 {
+		t.Fatalf("growing after release: %v, left %d, reserved %d", err, r.Left(), l.Reserved())
+	}
+}
+
+func TestReservationsOfManySessionsAddUp(t *testing.T) {
+	l := NewLedger(fixed(1<<30), 0)
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, _ := l.Reserve(1 << 20)
+			for j := 0; j < 100; j++ {
+				r.Grow(1 << 10)
+				r.Consume(1 << 10)
+			}
+			r.Release()
+		}()
+	}
+	wg.Wait()
+	if l.Reserved() != 0 {
+		t.Errorf("reserved %d after every session released", l.Reserved())
+	}
+}
