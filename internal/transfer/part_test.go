@@ -712,3 +712,19 @@ func TestAWriteThatFailsOtherwiseFailsTheSession(t *testing.T) {
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, syscall.EIO }
+
+func TestAFailureReasonIsCutShortInTheLog(t *testing.T) {
+	en := newEnv(t)
+	f := newFile(10)
+	c := en.create(alice, "public", "a.bin", f)
+	en.e.writeAt = func(file *os.File, off int64) io.Writer {
+		return &fullWriter{w: io.NewOffsetWriter(file, off), err: errors.New(strings.Repeat("broken ", 2000))}
+	}
+	if _, err := en.send(alice, c.UploadID, f, 1); !errors.Is(err, ErrClosed) {
+		t.Fatalf("part: %v", err)
+	}
+	ls := en.logLines(c.UploadID)
+	if last := ls[len(ls)-1]; last.Op != opFailed || len(last.Reason) > maxLogged+len("…(truncated)") {
+		t.Errorf("the failed line's reason has %d bytes", len(last.Reason))
+	}
+}

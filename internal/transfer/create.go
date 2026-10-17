@@ -183,6 +183,7 @@ func (e *Engine) start(rec Record) (*session, error) {
 		s.releaseWindow()
 		return nil, fmt.Errorf("register the upload: %w", err)
 	}
+	e.at("registered")
 	if err := e.stage(s); err != nil {
 		if derr := e.reg.DeleteUpload(rec.ID); derr != nil {
 			logf("cannot delete the record of upload %s, whose staging failed: %v", rec.ID, derr)

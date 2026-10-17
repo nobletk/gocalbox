@@ -266,6 +266,7 @@ func (e *Engine) finishPart(ctx context.Context, s *session, req PartRequest, ex
 		s.mu.Unlock()
 		return PartResult{}, e.refusePart(ctx, s, req.N, refusal)
 	}
+	e.at("written")
 	if err := e.appendLine(s, line{Op: opPart, N: req.N, SHA256: got.sum, IP: clientAddr(ctx)}, true); errors.Is(err, space.ErrInsufficient) {
 		s.mu.Unlock()
 		return PartResult{}, e.refusePart(ctx, s, req.N, err)
@@ -275,6 +276,7 @@ func (e *Engine) finishPart(ctx context.Context, s *session, req PartRequest, ex
 		e.failed(s, ev)
 		return PartResult{}, ferr
 	}
+	e.at("logged")
 	var raw [sha256.Size]byte
 	hex.Decode(raw[:], []byte(got.sum))
 	s.keep(req.N, raw)

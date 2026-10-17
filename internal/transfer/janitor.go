@@ -3,6 +3,7 @@ package transfer
 import (
 	"cmp"
 	"errors"
+	"fmt"
 	"io/fs"
 	"slices"
 	"time"
@@ -74,6 +75,7 @@ func (e *Engine) sweep() {
 			}
 		case s.state.Over():
 			e.dropData(s)
+			e.logPending(s)
 		}
 		if s.state.Over() {
 			if now.Before(s.over.Add(e.lim.TombstoneTTL)) {
@@ -157,20 +159,8 @@ func (e *Engine) remove(s *session) {
 	}
 
 	id := s.rec.ID
-	trashed := native(trashDir, trashName())
-	err := e.root.Rename(sessionDir(id), trashed)
-	moved := err == nil
-	if err != nil {
-		// A missing trash folder is reported like a missing session folder,
-		// so only the session folder's absence counts as already moved.
-		if _, serr := e.root.Lstat(sessionDir(id)); !errors.Is(serr, fs.ErrNotExist) {
-			logf("cannot remove upload %s, trying again later: %v", id, err)
-			retry()
-			return
-		}
-	}
-	if err := e.reg.DeleteUpload(id); err != nil {
-		logf("cannot delete the record of upload %s, trying again later: %v", id, err)
+	if err := e.removeStaging(id); err != nil {
+		logf("cannot remove upload %s, trying again later: %v", id, err)
 		retry()
 		return
 	}
@@ -179,9 +169,30 @@ func (e *Engine) remove(s *session) {
 		delete(e.sessions, id)
 	}
 	e.mu.Unlock()
+}
+
+// removeStaging moves a session's folder into the trash, then deletes its
+// record, then empties the trash of it. After an error the record stays, so
+// that the removal can be tried again.
+func (e *Engine) removeStaging(id string) error {
+	trashed := native(trashDir, trashName())
+	err := e.root.Rename(sessionDir(id), trashed)
+	moved := err == nil
+	if err != nil {
+		// A missing trash folder is reported like a missing session folder,
+		// so only the session folder's absence counts as already moved.
+		if _, serr := e.root.Lstat(sessionDir(id)); !errors.Is(serr, fs.ErrNotExist) {
+			return err
+		}
+	}
+	e.at("moved")
+	if err := e.reg.DeleteUpload(id); err != nil {
+		return fmt.Errorf("delete its record: %w", err)
+	}
 	if moved {
 		if err := e.root.RemoveAll(trashed); err != nil {
 			logf("cannot empty %s; the next start removes it: %v", trashed, err)
 		}
 	}
+	return nil
 }

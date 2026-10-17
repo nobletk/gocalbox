@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -40,6 +41,23 @@ func (r stateRegistry) PutUpload(rec Record) error {
 
 func (r stateRegistry) DeleteUpload(id string) error {
 	return r.db.Update(func(tx *state.Tx) error { return tx.DeleteUpload(id) })
+}
+
+func (r stateRegistry) Uploads() ([]Record, map[string]error, error) {
+	var recs []Record
+	bad := map[string]error{}
+	err := r.db.View(func(tx *state.Tx) error {
+		return tx.Uploads(func(id string, u state.Upload, err error) error {
+			if err != nil {
+				bad[id] = err
+				return nil
+			}
+			recs = append(recs, Record{ID: u.ID, Owner: u.Owner, Session: u.Session, Dir: u.Dir, Folder: u.Folder, Name: u.Name,
+				Size: u.Size, PartSize: u.PartSize, PartCount: u.PartCount, ClientKey: u.ClientKey, Created: u.Created})
+			return nil
+		})
+	})
+	return recs, bad, err
 }
 
 // policy decides like the accounts do, for two contributors with homes and
@@ -88,6 +106,8 @@ func (p *policy) UserName(id string) (string, bool) {
 type stack struct {
 	t      *testing.T
 	dir    string
+	dbPath string
+	links  []bool
 	db     *state.DB
 	guard  *audit.Guard
 	writer *audit.Writer
@@ -106,6 +126,19 @@ func newStack(t *testing.T, links ...bool) *stack {
 	for _, d := range []string{"users/alice", "users/bob", "public"} {
 		os.MkdirAll(filepath.Join(dir, d), 0o755)
 	}
+	return openStack(t, dir, filepath.Join(t.TempDir(), "state.db"), filepath.Join(t.TempDir(), "audit.jsonl"), links)
+}
+
+// restart stops the server and starts it again on the same folder, state
+// file and audit log.
+func (s *stack) restart() *stack {
+	s.t.Helper()
+	s.close()
+	return openStack(s.t, s.dir, s.dbPath, s.audit, s.links)
+}
+
+func openStack(t *testing.T, dir, dbPath, auditPath string, links []bool) *stack {
+	t.Helper()
 	sb, err := sandbox.New(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -117,11 +150,10 @@ func newStack(t *testing.T, links ...bool) *stack {
 	if len(links) > 0 {
 		st.Links = links[0]
 	}
-	db, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	db, err := state.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
 	w, err := audit.Open(auditPath)
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +170,7 @@ func newStack(t *testing.T, links ...bool) *stack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &stack{t: t, dir: dir, db: db, guard: guard, writer: w, files: files, policy: p, audit: auditPath, e: e}
+	s := &stack{t: t, dir: dir, dbPath: dbPath, links: links, db: db, guard: guard, writer: w, files: files, policy: p, audit: auditPath, e: e}
 	s.close = sync.OnceFunc(func() {
 		e.Close(context.Background())
 		bus.Close(context.Background())
@@ -532,5 +564,113 @@ func TestAFolderChangeIsntHeldUpByASlowCompletion(t *testing.T) {
 	close(release)
 	if err := within(t, done); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// recoveredRecords counts the audit records of each type made again at a
+// start.
+func (s *stack) recoveredRecords() map[events.Type]int {
+	out := map[events.Type]int{}
+	for _, ev := range s.records() {
+		if ev.Detail == "recovered" {
+			out[ev.Type]++
+		}
+	}
+	return out
+}
+
+func TestTheNextStartRecordsACompletionTheAuditLogMissed(t *testing.T) {
+	s := newStack(t)
+	u := newUpload(1000, 11)
+	c, err := s.e.Create(asUser(alice), CreateRequest{Dir: "users/alice", Name: "a.bin", Size: int64(len(u.data))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.send(alice, c.UploadID, u, 1)
+	restore := events.SetLostOutput(io.Discard)
+	defer restore()
+	s.writer.Close()
+	res, err := s.e.Complete(asUser(alice), c.UploadID, u.composite())
+	if !errors.Is(err, events.ErrNotRecorded) {
+		t.Fatalf("complete with the audit log closed: %v", err)
+	}
+
+	next := s.restart()
+	want := map[events.Type]int{events.FileUploaded: 1, events.UploadCompleted: 1}
+	if got := next.recoveredRecords(); !maps.Equal(got, want) {
+		t.Errorf("recovered records %v", got)
+	}
+	for _, ev := range next.records() {
+		if ev.Detail == "recovered" && (ev.Actor.ID != alice || ev.RequestID != "req-"+alice || ev.Resolved != "users/alice/a.bin") {
+			t.Errorf("record %+v", ev)
+		}
+	}
+	if again, err := next.e.Complete(asUser(alice), c.UploadID, u.composite()); err != nil || again != res {
+		t.Errorf("the tombstone once recorded: %+v, %v", again, err)
+	}
+	if got := next.restart().recoveredRecords(); !maps.Equal(got, want) {
+		t.Errorf("after another start: %v", got)
+	}
+}
+
+func TestTheNextStartRecordsTheUploaderOfAFilePlacedBeforeACrash(t *testing.T) {
+	for _, links := range []bool{true, false} {
+		t.Run(map[bool]string{true: "linked", false: "renamed"}[links], func(t *testing.T) {
+			s := newStack(t, links)
+			u := newUpload(1000, 12)
+			res, err := s.upload(alice, "users/alice", "a.bin", u)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var id string
+			s.db.View(func(tx *state.Tx) error {
+				return tx.Uploads(func(i string, _ state.Upload, _ error) error { id = i; return nil })
+			})
+			s.close()
+
+			// What a crash right after the file was placed leaves: the log
+			// ends with finishing, there is no uploader record, and on the
+			// link path the staged name is still linked.
+			staging := filepath.Join(s.dir, sandbox.ReservedName, uploadsDir, id)
+			b, _ := os.ReadFile(filepath.Join(staging, logName))
+			var kept string
+			for _, l := range strings.SplitAfter(string(b), "\n") {
+				if strings.Contains(l, `"op":"completed"`) {
+					break
+				}
+				kept += l
+			}
+			os.WriteFile(filepath.Join(staging, logName), []byte(kept), 0o600)
+			placed := filepath.Join(s.dir, filepath.FromSlash(res.Path))
+			if links {
+				if err := os.Link(placed, filepath.Join(staging, dataName)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			db, err := state.Open(s.dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.Update(func(tx *state.Tx) error { return tx.DeleteUploader(res.Path) })
+			db.Close()
+
+			next := openStack(t, s.dir, s.dbPath, s.audit, []bool{links})
+			var up state.Uploader
+			var ok bool
+			next.db.View(func(tx *state.Tx) error { up, ok, err = tx.Uploader(res.Path); return err })
+			info, _ := os.Stat(placed)
+			if !ok || up.User != alice || up.Size == nil || *up.Size != info.Size() || up.MTime == nil || *up.MTime != info.ModTime().UnixNano() {
+				t.Errorf("uploader %+v %v", up, ok)
+			}
+			if exists(filepath.Join(staging, dataName)) {
+				t.Error("the staged name stays")
+			}
+			if got := next.recoveredRecords(); got[events.FileUploaded] != 1 || got[events.UploadCompleted] != 1 {
+				t.Errorf("recovered records %v", got)
+			}
+			if again, err := next.e.Complete(asUser(alice), id, u.composite()); err != nil || again != res {
+				t.Errorf("the tombstone: %+v, %v", again, err)
+			}
+		})
 	}
 }

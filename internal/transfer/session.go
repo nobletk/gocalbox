@@ -68,9 +68,9 @@ type session struct {
 	result    *Result
 	resultErr error
 	dataGone  bool
-	// unlogged is the end line the disk had no room for; it is written
-	// once the data is removed.
-	unlogged *line
+	// unlogged are the lines the disk had no room for, in order. They are
+	// written once there is room, and any later line waits behind them.
+	unlogged []line
 	removing bool
 }
 
@@ -286,24 +286,61 @@ func (e *Engine) dropData(s *session) {
 	err := e.root.Remove(native(uploadsDir, s.rec.ID, dataName))
 	if err == nil || errors.Is(err, fs.ErrNotExist) {
 		s.dataGone = true
-		e.logEnd(s)
+		e.logPending(s)
 		return
 	}
 	logf("cannot remove the data of upload %s: %v", s.rec.ID, err)
 }
 
-// logEnd writes the end line that had no room before the data was removed.
-// The caller holds s.mu.
-func (e *Engine) logEnd(s *session) {
-	l := s.unlogged
-	if l == nil {
-		return
+// durable reports whether a line is flushed as it is written. Losing the
+// others loses at most a counter, a republish or a reason.
+func durable(op string) bool {
+	switch op {
+	case opReject, opRecorded, opFailed:
+		return false
 	}
-	s.unlogged = nil
-	if err := e.appendLine(s, *l, l.Op != opFailed); err != nil {
-		logf("cannot log that upload %s is %s: %v", s.rec.ID, s.state, err)
+	return true
+}
+
+// logOrKeep appends l, or keeps it for logPending when the disk has no
+// room for it or a line is already waiting. It reports false when l is
+// lost. The caller holds s.mu.
+func (e *Engine) logOrKeep(s *session, l line) bool {
+	if l.At.IsZero() {
+		l.At = e.now()
 	}
-	if s.log != nil {
+	if len(s.unlogged) > 0 {
+		s.unlogged = append(s.unlogged, l)
+		return true
+	}
+	switch err := e.appendLine(s, l, durable(l.Op)); {
+	case errors.Is(err, space.ErrInsufficient):
+		s.unlogged = append(s.unlogged, l)
+	case err != nil:
+		logf("cannot log the %s line of upload %s: %v", l.Op, s.rec.ID, err)
+		return false
+	}
+	return true
+}
+
+// logPending writes the lines that had no room, in order. One that still has
+// no room waits for the next try; after any other failure the rest are
+// dropped, since they can't be written out of order. The caller holds s.mu.
+func (e *Engine) logPending(s *session) {
+	for len(s.unlogged) > 0 {
+		l := s.unlogged[0]
+		err := e.appendLine(s, l, durable(l.Op))
+		if errors.Is(err, space.ErrInsufficient) {
+			break
+		}
+		if err != nil {
+			logf("cannot log the %s line of upload %s, nor the %d after it: %v", l.Op, s.rec.ID, len(s.unlogged)-1, err)
+			s.unlogged = nil
+			break
+		}
+		s.unlogged = s.unlogged[1:]
+	}
+	if s.state.Over() && s.log != nil {
 		s.log.Close()
 		s.log = nil
 	}
@@ -315,13 +352,9 @@ func (e *Engine) logEnd(s *session) {
 func (e *Engine) end(s *session, st State, l line) {
 	l.At = e.now()
 	s.state, s.reason, s.over = st, l.Reason, l.At
-	if err := e.appendLine(s, l, l.Op != opFailed); errors.Is(err, space.ErrInsufficient) {
-		// Removing the data may make room for the line, but not while a
-		// part is still being written to it.
-		s.unlogged = &l
-	} else if err != nil {
-		logf("cannot log that upload %s is %s: %v", s.rec.ID, st, err)
-	}
+	// A line with no room is written once the data is removed, which may
+	// make room, or by the janitor.
+	e.logOrKeep(s, l)
 	e.wakeJanitor()
 	s.releaseWindow()
 	if s.log != nil {
@@ -336,6 +369,7 @@ func (e *Engine) end(s *session, st State, l line) {
 // answer to the request. The caller holds s.mu, then calls failed.
 func (e *Engine) fail(ctx context.Context, s *session, reason string) (events.Event, error) {
 	logf("upload %s failed: %s", s.rec.ID, reason)
+	reason = truncate(reason)
 	e.end(s, Failed, line{Op: opFailed, Reason: reason})
 	ev := events.Event{
 		Type:      events.UploadFailed,

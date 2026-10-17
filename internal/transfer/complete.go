@@ -151,11 +151,10 @@ func (e *Engine) finish(ctx context.Context, s *session, composite string) (Resu
 	// The file is placed: from here on the upload is done, whatever fails.
 	res := Result{Path: final, Name: path.Base(final), Size: s.rec.Size, CompositeSHA256: composite}
 	s.mu.Lock()
-	logged := true
-	if err := e.appendLine(s, line{Op: opCompleted, Path: final, Actor: &actor, Request: request}, true); err != nil {
-		logged = false
-		logf("upload %s is placed at %s, but its completion can't be logged: %v", s.rec.ID, final, err)
-	}
+	// A line with no room is written later, before recorded; one lost
+	// otherwise leaves the next start to tell from finishing.
+	logged := e.logOrKeep(s, line{Op: opCompleted, Path: final, Actor: &actor, Request: request})
+	e.at("completed")
 	s.releaseWindow()
 	e.dropData(s)
 	ev := e.event(ctx, events.UploadCompleted, s.path(), s.totals(e.now(), composite), nil)
@@ -170,11 +169,10 @@ func (e *Engine) finish(ctx context.Context, s *session, composite string) (Resu
 		e.publish(placed, ev)
 	}
 
+	e.at("recorded")
 	s.mu.Lock()
 	if rerr == nil && logged {
-		if err := e.appendLine(s, line{Op: opRecorded}, false); err != nil {
-			logf("cannot log that the completion of upload %s is recorded: %v", s.rec.ID, err)
-		}
+		e.logOrKeep(s, line{Op: opRecorded})
 	}
 	s.state, s.result, s.resultErr, s.over = Completed, &res, rerr, e.now()
 	s.closeFiles()

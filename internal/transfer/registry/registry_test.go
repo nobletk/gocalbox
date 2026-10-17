@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	bolt "go.etcd.io/bbolt"
+
 	"github.com/nobletk/gocalbox/internal/state"
 	"github.com/nobletk/gocalbox/internal/transfer"
 )
@@ -33,6 +35,10 @@ func TestRecordsGoToTheStateFile(t *testing.T) {
 	if err != nil || got != want {
 		t.Errorf("stored %+v, %v; want %+v", got, err, want)
 	}
+	recs, bad, err := r.Uploads()
+	if err != nil || len(bad) != 0 || len(recs) != 1 || recs[0] != rec {
+		t.Errorf("listed %+v, %v, %v", recs, bad, err)
+	}
 	if err := r.DeleteUpload(rec.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -42,5 +48,29 @@ func TestRecordsGoToTheStateFile(t *testing.T) {
 	}
 	if err := r.DeleteUpload(rec.ID); err != nil {
 		t.Errorf("deleting a missing record: %v", err)
+	}
+}
+
+func TestARecordThatCantBeReadIsListedApart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	raw, err := bolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.Update(func(tx *bolt.Tx) error { return tx.Bucket([]byte("uploads")).Put([]byte("bad"), []byte("{")) })
+	raw.Close()
+	db, err = state.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	recs, bad, err := New(db).Uploads()
+	if err != nil || len(recs) != 0 || len(bad) != 1 || bad["bad"] == nil {
+		t.Errorf("listed %+v, bad %v, %v", recs, bad, err)
 	}
 }

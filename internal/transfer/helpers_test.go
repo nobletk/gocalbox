@@ -33,6 +33,7 @@ const (
 var (
 	errForbidden    = errors.New("fake: forbidden")
 	errParentAbsent = errors.New("fake: parent folder not found")
+	errNotPlaced    = errors.New("fake: no longer the file that was placed")
 )
 
 type user struct {
@@ -53,6 +54,19 @@ type fakeFiles struct {
 	adopt   func(rel string) error
 	may     func()
 	adopts  int
+	// rename places files by renaming them, as on a volume without links.
+	rename bool
+	// linked runs once Adopt has placed the file.
+	linked    func(rel string)
+	recorded  []adoptedRecord
+	recordErr error
+	// onRecord runs once RecordAdopted has recorded.
+	onRecord func()
+}
+
+type adoptedRecord struct {
+	owner, rel  string
+	size, mtime int64
 }
 
 func newFakeFiles(root *os.Root) *fakeFiles {
@@ -127,7 +141,10 @@ func (f *fakeFiles) MayUpload(ctx context.Context, folder string) error {
 func (f *fakeFiles) Adopt(ctx context.Context, staged, dir, name string, intent func(string) error) (string, events.Event, error) {
 	f.mu.Lock()
 	f.adopts++
-	hook := f.adopt
+	hook, place := f.adopt, f.root.Link
+	if f.rename {
+		place = f.root.Rename
+	}
 	f.mu.Unlock()
 	clean, _ := sandbox.Clean(dir)
 	rel := path.Join(clean, name)
@@ -146,19 +163,36 @@ func (f *fakeFiles) Adopt(ctx context.Context, staged, dir, name string, intent 
 			return "", events.Event{}, err
 		}
 	}
-	if err := f.root.Link(filepath.FromSlash(staged), filepath.FromSlash(rel)); err != nil {
+	if err := place(filepath.FromSlash(staged), filepath.FromSlash(rel)); err != nil {
 		return "", events.Event{}, err
+	}
+	f.mu.Lock()
+	linked := f.linked
+	f.mu.Unlock()
+	if linked != nil {
+		linked(rel)
 	}
 	info, _ := f.root.Lstat(filepath.FromSlash(rel))
 	return rel, events.Event{Type: events.FileUploaded, Actor: events.ActorFrom(ctx), Outcome: events.OutcomeOK,
 		Path: dir + "/" + name, Resolved: rel, Size: info.Size()}, nil
 }
 
+func (f *fakeFiles) RecordAdopted(owner, rel string, size, mtime int64) error {
+	f.mu.Lock()
+	f.recorded = append(f.recorded, adoptedRecord{owner, rel, size, mtime})
+	hook, err := f.onRecord, f.recordErr
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return err
+}
+
 func (f *fakeFiles) Outcome(err error) events.Outcome {
 	switch {
 	case errors.Is(err, errForbidden), errors.Is(err, sandbox.ErrTraversal):
 		return events.OutcomeDenied
-	case errors.Is(err, errParentAbsent):
+	case errors.Is(err, errParentAbsent), errors.Is(err, errNotPlaced):
 		return events.OutcomeNotFound
 	}
 	return events.OutcomeError
@@ -173,8 +207,10 @@ func (f *fakeFiles) set(fn func(f *fakeFiles)) {
 type fakeRegistry struct {
 	mu      sync.Mutex
 	recs    map[string]Record
+	bad     map[string]error // records that can't be read
 	putErr  error
 	delErr  error
+	listErr error
 	deletes int
 }
 
@@ -199,14 +235,31 @@ func (r *fakeRegistry) DeleteUpload(id string) error {
 	}
 	r.deletes++
 	delete(r.recs, id)
+	delete(r.bad, id)
 	return nil
+}
+
+func (r *fakeRegistry) Uploads() ([]Record, map[string]error, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var recs []Record
+	for _, rec := range r.recs {
+		recs = append(recs, rec)
+	}
+	slices.SortFunc(recs, func(a, b Record) int { return strings.Compare(a.ID, b.ID) })
+	bad := map[string]error{}
+	for id, err := range r.bad {
+		bad[id] = err
+	}
+	return recs, bad, r.listErr
 }
 
 func (r *fakeRegistry) has(id string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	_, ok := r.recs[id]
-	return ok
+	_, bad := r.bad[id]
+	return ok || bad
 }
 
 // recBus keeps what is published. With full set, TryPublish gives up.
@@ -271,7 +324,11 @@ type fakeAudit struct {
 	recErr   error
 	recorded [][]events.Event
 	requests []string // the request of each Record
-	pub      *recBus
+	// spend is how long each Record takes of its request's wait budget,
+	// and left how much of a 10-second limit was left before each.
+	spend time.Duration
+	left  []time.Duration
+	pub   *recBus
 }
 
 func (a *fakeAudit) Allow() error {
@@ -287,6 +344,8 @@ func (a *fakeAudit) Record(ctx context.Context, evs ...events.Event) error {
 	a.mu.Lock()
 	a.recorded = append(a.recorded, evs)
 	a.requests = append(a.requests, events.RequestIDFrom(ctx))
+	a.left = append(a.left, events.WaitLeft(ctx, 10*time.Second))
+	events.Waited(ctx, a.spend)
 	err := a.recErr
 	a.mu.Unlock()
 	for _, ev := range evs {
@@ -335,6 +394,19 @@ type option func(*Config, *env)
 
 func withLimits(l Limits) option { return func(c *Config, _ *env) { c.Limits = l } }
 
+// withEngine sets hooks of the engine before it recovers anything.
+func withEngine(f func(*Engine)) option {
+	return func(c *Config, _ *env) {
+		prev := c.prepare
+		c.prepare = func(e *Engine) {
+			if prev != nil {
+				prev(e)
+			}
+			f(e)
+		}
+	}
+}
+
 // testPartSize keeps the tests' files small: parts of 4 KiB.
 const testPartSize = 4 << 10
 
@@ -360,7 +432,19 @@ func newEnv(t *testing.T, opts ...option) *env {
 			t.Fatal(err)
 		}
 	}
-	root, err := os.OpenRoot(dir)
+	en := &env{t: t, dir: dir, reg: &fakeRegistry{recs: map[string]Record{}},
+		clock: &clock{t: time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)}}
+	en.start(opts...)
+	return en
+}
+
+// start opens the served folder and starts an engine on it with the
+// registry en holds, as the server's start does. Options run before the
+// engine starts, so they can set up what its recovery meets.
+func (en *env) start(opts ...option) {
+	t := en.t
+	t.Helper()
+	root, err := os.OpenRoot(en.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,11 +454,10 @@ func newEnv(t *testing.T, opts ...option) *env {
 		t.Fatal(err, st.Problem)
 	}
 	t.Cleanup(func() { st.Close() })
-	en := &env{t: t, dir: dir, root: root, files: newFakeFiles(root), reg: &fakeRegistry{recs: map[string]Record{}},
-		bus: &recBus{}, clock: &clock{t: time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)}}
+	en.root, en.files, en.bus = root, newFakeFiles(root), &recBus{}
 	en.audit = &fakeAudit{pub: en.bus}
 	cfg := Config{Root: root, Staging: st, Files: en.files, Registry: en.reg, Events: en.bus, Audit: en.audit,
-		JanitorEvery: -1, Now: en.clock.now}
+		JanitorEvery: -1, Now: en.clock.now, prepare: func(e *Engine) { e.partSize = func(int64) int64 { return testPartSize } }}
 	for _, o := range opts {
 		o(&cfg, en)
 	}
@@ -382,10 +465,8 @@ func newEnv(t *testing.T, opts ...option) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.partSize = func(int64) int64 { return testPartSize }
 	t.Cleanup(func() { e.Close(context.Background()) })
 	en.e = e
-	return en
 }
 
 func (en *env) setFree(n int64) {

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -44,6 +45,10 @@ type Files interface {
 	// file.uploaded event. It calls intent with the path it chose before
 	// placing the file there.
 	Adopt(ctx context.Context, staged, dir, name string, intent func(path string) error) (string, events.Event, error)
+	// RecordAdopted writes the owner's uploader record of a file Adopt
+	// placed at path, with the size and modification time logged before it
+	// was placed, when a crash came between the two.
+	RecordAdopted(owner, path string, size, mtime int64) error
 	// Outcome classifies an error of these calls for the audit log.
 	Outcome(err error) events.Outcome
 }
@@ -54,6 +59,9 @@ type Registry interface {
 	PutUpload(Record) error
 	// DeleteUpload removes a record; a missing one is not an error.
 	DeleteUpload(id string) error
+	// Uploads lists every record, and in bad, by ID, why each record that
+	// can't be read was refused.
+	Uploads() (recs []Record, bad map[string]error, err error)
 }
 
 // Record is what the registry keeps of a session: who owns it and where it
@@ -163,6 +171,10 @@ type Config struct {
 	// janitor at all when negative.
 	JanitorEvery time.Duration
 	Now          func() time.Time
+
+	// prepare, when set, runs once the engine is made and before it
+	// recovers anything, so that tests can set its hooks.
+	prepare func(*Engine)
 }
 
 const (
@@ -186,8 +198,9 @@ type Engine struct {
 	maxFile    int64
 
 	// root is the staging folder; the engine reaches staging only through
-	// it.
+	// it. served is the served folder, which recovery only reads.
 	root     *os.Root
+	served   *os.Root
 	inflight chan struct{}
 
 	// mu guards the session map and the counters. It is never held
@@ -214,6 +227,12 @@ type Engine struct {
 	// admitted, when set, runs once a part has its slots, before the
 	// session is checked again.
 	admitted func(PartRequest)
+	// point, when set, runs at the named points where a crash leaves
+	// something recovery must tell apart.
+	point func(name string)
+	// lstat and openLog are how recovery reads the staging folder.
+	lstat   func(name string) (fs.FileInfo, error)
+	openLog func(id string) (logReader, error)
 }
 
 // New starts the engine. With a staging folder that start-up found
@@ -242,6 +261,10 @@ func New(cfg Config) (*Engine, error) {
 		writeLog:   (*os.File).WriteAt,
 		writeAt:    func(f *os.File, off int64) io.Writer { return io.NewOffsetWriter(f, off) },
 		partSize:   PartSize,
+		served:     cfg.Root,
+	}
+	if cfg.prepare != nil {
+		cfg.prepare(e)
 	}
 	if e.now == nil {
 		e.now = func() time.Time { return time.Now().Round(0).UTC() }
@@ -263,6 +286,16 @@ func New(cfg Config) (*Engine, error) {
 		return e, nil
 	}
 	e.root = root
+	if e.lstat == nil {
+		e.lstat = root.Lstat
+	}
+	if e.openLog == nil {
+		e.openLog = func(id string) (logReader, error) { return root.Open(native(uploadsDir, id, logName)) }
+	}
+	if err := e.recover(); err != nil {
+		root.Close()
+		return nil, fmt.Errorf("transfer: recover the uploads: %w", err)
+	}
 	every := cfg.JanitorEvery
 	if every == 0 {
 		every = 30 * time.Second
@@ -320,6 +353,11 @@ func (e *Engine) Close(ctx context.Context) error {
 	e.mu.Unlock()
 	for _, s := range list {
 		s.mu.Lock()
+		// Past the deadline, waiting lines are left to the next start, which
+		// decides from the log as it is.
+		if ctx.Err() == nil {
+			e.logPending(s)
+		}
 		s.releaseWindow()
 		s.closeFiles()
 		s.mu.Unlock()
@@ -456,6 +494,12 @@ func (e *Engine) admit(user string) (release func(), err error) {
 // windowFor is the most space a session holds at a time.
 func (e *Engine) windowFor(partSize int64) int64 {
 	return max(e.lim.Window, int64(e.lim.MaxParallel)*partSize)
+}
+
+func (e *Engine) at(point string) {
+	if e.point != nil {
+		e.point(point)
+	}
 }
 
 func (e *Engine) wakeJanitor() {
