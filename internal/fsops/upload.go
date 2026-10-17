@@ -32,6 +32,18 @@ func (s *Service) Who(ctx context.Context) (id string, admin, ok bool) {
 	return sub.ID, ok && sub.admin(), ok
 }
 
+// UserName names the user id; false only for a user the policy knows was
+// deleted. Without a policy no user is known, and none counts as deleted.
+func (s *Service) UserName(id string) (string, bool) {
+	if s.policy == nil {
+		return "", true
+	}
+	return s.policy.UserName(id)
+}
+
+// Outcome classifies an error of the calls of fsops for the audit log.
+func (s *Service) Outcome(err error) events.Outcome { return outcomeOf(err) }
+
 // PrepareUpload checks, before any data is sent, that the user of ctx may
 // upload a file called name into the folder dir, and that the upload can be
 // finished there: the folder is on the staging folder's file system, the

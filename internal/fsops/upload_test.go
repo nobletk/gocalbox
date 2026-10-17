@@ -47,6 +47,17 @@ func TestWho(t *testing.T) {
 	}
 }
 
+func TestUserNameCountsOnlyDeletedUsersAsGone(t *testing.T) {
+	svc := New(newEnv(t).sb, nil)
+	if name, ok := svc.UserName(alice); name != "" || !ok {
+		t.Errorf("without a policy: %q, %v", name, ok)
+	}
+	a := newAccessEnv(t)
+	if _, ok := a.svc.UserName("u-deleted"); ok {
+		t.Error("a user the policy doesn't know is not gone")
+	}
+}
+
 func TestPrepareUploadDecidesLikeAnUpload(t *testing.T) {
 	a := newAccessEnv(t)
 	a.write("public/file.txt", "x")
