@@ -658,7 +658,8 @@ func TestE2EUploadFlagsAreChecked(t *testing.T) {
 	root := filepath.Join(base, "root")
 	os.Mkdir(root, 0o755)
 	for _, flag := range []string{"-upload-window-mb=0", "-upload-idle-ttl=0", "-upload-first-part-ttl=0", "-upload-max-age=-1s",
-		"-upload-tombstone-ttl=0", "-upload-max-sessions=0", "-upload-max-sessions-total=0", "-upload-max-inflight=-1"} {
+		"-upload-tombstone-ttl=0", "-upload-max-sessions=0", "-upload-max-sessions-total=0", "-upload-max-inflight=-1",
+		"-max-upload-mb=-1", "-max-upload-mb=67108865"} {
 		out, code := runToCompletion(t, flag, "-port=0", "-root="+root, "-audit-log="+filepath.Join(base, "a.jsonl"))
 		name, _, _ := strings.Cut(flag, "=")
 		if code == 0 || !strings.Contains(out, name+" must be") {
@@ -948,6 +949,10 @@ func TestE2EUploadFlagDefaults(t *testing.T) {
 			t.Errorf("-%s: %q, want the default %s", flag, usage, def)
 		}
 	}
+	i := strings.Index(out, "  -max-upload-mb ")
+	if usage, _, _ := strings.Cut(out[max(i, 0)+3:], "\n  -"); i < 0 || !strings.Contains(usage, "from 0 to 67108864") {
+		t.Errorf("-max-upload-mb's usage doesn't give its range: %q", usage)
+	}
 }
 
 // within returns what ch gives, and fails the test if it gives nothing
@@ -1051,6 +1056,25 @@ func TestE2EARefusedPartLeavesAnHTTP2ConnectionInUse(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 200 || !reused {
 		t.Errorf("the next request: %d, on the same connection %v", resp.StatusCode, reused)
+	}
+	if err := s.stop(syscall.SIGTERM); err != nil {
+		t.Fatalf("exit: %v", err)
+	}
+}
+
+// -max-upload-mb bounds a resumable upload to the byte.
+func TestE2EMaxUploadMBBoundsResumableUploads(t *testing.T) {
+	s := newLiveServer(t)
+	tokens := addUsers(t, s, "alice:contributor")
+	s.start("-max-upload-mb=1")
+	alice := s.uploader(tokens["alice"])
+	var c transfer.Created
+	if err := alice.call("/api/upload/create", transfer.CreateRequest{Dir: "users/alice", Name: "a.bin", Size: 1 << 20}, &c); err != nil {
+		t.Errorf("1 MiB: %v", err)
+	}
+	err := alice.call("/api/upload/create", transfer.CreateRequest{Dir: "users/alice", Name: "b.bin", Size: 1<<20 + 1}, &c)
+	if codeOf(err) != "too_large" {
+		t.Errorf("1 MiB and a byte: %v", err)
 	}
 	if err := s.stop(syscall.SIGTERM); err != nil {
 		t.Fatalf("exit: %v", err)

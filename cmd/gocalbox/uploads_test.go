@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -272,6 +274,20 @@ func TestUploadLimits(t *testing.T) {
 	}
 	if l, err := uploadLimits(1<<43-1, good); err != nil || l.Window != (1<<43-1)<<20 {
 		t.Errorf("the largest window: %d %v", l.Window, err)
+	}
+}
+
+func TestMaxUploadBytes(t *testing.T) {
+	for mb, want := range map[int64]int64{0: 0, 1: 1 << 20, 67108864: 1 << 46} {
+		if got, err := maxUploadBytes(mb); err != nil || got != want {
+			t.Errorf("%d MiB: %d %v, want %d", mb, got, err, want)
+		}
+	}
+	for _, mb := range []int64{67108865, -1, 1 << 43, 1 << 44, math.MaxInt64, math.MinInt64} {
+		_, err := maxUploadBytes(mb)
+		if err == nil || err.Error() != fmt.Sprintf("-max-upload-mb must be between 0 and 67108864, got %d", mb) {
+			t.Errorf("%d MiB: %v", mb, err)
+		}
 	}
 }
 

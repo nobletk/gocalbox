@@ -51,7 +51,7 @@ func run() error {
 	port := flag.String("port", "8080", "Port to run the server on")
 	rootDir := flag.String("root", ".", "The local directory to sandbox and serve")
 	webDir := flag.String("web", "", "Serve the web UI from this directory instead of the embedded copy (for frontend development)")
-	maxUploadMB := flag.Int64("max-upload-mb", 0, "Maximum size of a single upload in MiB (0 = no limit beyond the free space)")
+	maxUploadMB := flag.Int64("max-upload-mb", 0, "Largest upload in MiB, single-request or resumable, from 0 to 67108864 (64 TiB); 0 = no limit beyond the free space")
 	minFreeMB := flag.Int64("min-free-mb", 1024, "Free space in MiB that uploads must leave on the served volume (0 = only refuse uploads that do not fit)")
 	allowedHosts := flag.String("allowed-hosts", "", "Extra comma-separated host names clients may use to reach the server (e.g. a DNS name)")
 	auditLog := flag.String("audit-log", defaultAuditPath(), "Audit log file; must be outside the served directory")
@@ -111,6 +111,10 @@ func run() error {
 	if *minFreeMB < 0 || *minFreeMB > math.MaxInt64>>20 {
 		return fmt.Errorf("-min-free-mb must be between 0 and %d, got %d", int64(math.MaxInt64>>20), *minFreeMB)
 	}
+	maxUpload, err := maxUploadBytes(*maxUploadMB)
+	if err != nil {
+		return err
+	}
 	uploads, err := uploadLimits(*uploadWindowMB, transfer.Limits{
 		IdleTTL:          *uploadIdleTTL,
 		FirstPartTTL:     *uploadFirstPartTTL,
@@ -127,7 +131,7 @@ func run() error {
 	a, err := newApp(config{
 		RootDir:          *rootDir,
 		WebDir:           *webDir,
-		MaxUploadBytes:   *maxUploadMB << 20,
+		MaxUploadBytes:   maxUpload,
 		MinFreeBytes:     *minFreeMB << 20,
 		AllowedHosts:     hostAllowlist(*host, *allowedHosts),
 		AuditLog:         *auditLog,
@@ -544,6 +548,15 @@ func (a *app) logSpace() {
 		return
 	}
 	log.Printf("Free space: %.1f GiB on the served volume; uploads leave at least %d MiB free", float64(free)/(1<<30), a.minFree>>20)
+}
+
+// maxUploadBytes checks -max-upload-mb and gives it in bytes. Its largest
+// value is the largest file the upload engine takes.
+func maxUploadBytes(mb int64) (int64, error) {
+	if mb < 0 || mb > transfer.MaxSize>>20 {
+		return 0, fmt.Errorf("-max-upload-mb must be between 0 and %d, got %d", int64(transfer.MaxSize>>20), mb)
+	}
+	return mb << 20, nil
 }
 
 // uploadLimits checks the limits the upload flags set, and adds the window
