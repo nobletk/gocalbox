@@ -1,9 +1,13 @@
 package transfer
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"errors"
+	"io"
 	"slices"
 	"testing"
+	"testing/iotest"
 )
 
 func TestPartSizeSchedule(t *testing.T) {
@@ -107,5 +111,54 @@ func TestPartHashesBeyondTheFirstChunk(t *testing.T) {
 	want := []Range{{1, 1}, {hashChunk, hashChunk + 1}, {2050, 2050}}
 	if got := s.ranges(false); !slices.Equal(got, want) {
 		t.Errorf("ranges %v", got)
+	}
+}
+
+func TestTheCompositeOfAStoredFile(t *testing.T) {
+	data := make([]byte, 1000)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	for _, c := range []struct {
+		data     []byte
+		partSize int64
+		want     string
+		parts    int64
+	}{
+		{nil, 8 << 20, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 0},
+		{[]byte("abc"), 8 << 20, "4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358", 1},
+		{data, 256, "e6cec81163d2e289742636ba3b36a7b799773a56971c086fcd851aee99ccac17", 4},
+		{data[:768], 256, Composite([][sha256.Size]byte{sha256.Sum256(data[:256]), sha256.Sum256(data[256:512]), sha256.Sum256(data[512:768])}), 3},
+		{[]byte("abc"), 1, Composite([][sha256.Size]byte{sha256.Sum256([]byte("a")), sha256.Sum256([]byte("b")), sha256.Sum256([]byte("c"))}), 3},
+	} {
+		got, n, err := CompositeOf(iotest.OneByteReader(bytes.NewReader(c.data)), c.partSize)
+		if err != nil || got != c.want || n != c.parts {
+			t.Errorf("%d bytes in parts of %d: %s, %d parts, %v; want %s, %d", len(c.data), c.partSize, got, n, err, c.want, c.parts)
+		}
+	}
+	for _, ps := range []int64{0, -1} {
+		if _, _, err := CompositeOf(bytes.NewReader(data), ps); err == nil {
+			t.Errorf("part size %d accepted", ps)
+		}
+	}
+	broken := errors.New("broken")
+	if _, _, err := CompositeOf(io.MultiReader(bytes.NewReader(data), iotest.ErrReader(broken)), 256); !errors.Is(err, broken) {
+		t.Errorf("a failed read: %v", err)
+	}
+}
+
+func TestThePartSizesTheServerUses(t *testing.T) {
+	for n, want := range map[int64]bool{
+		8 << 20: true, 16 << 20: true, 32 << 20: true, 64 << 20: true,
+		0: false, 1: false, 8<<20 - 1: false, 8<<20 + 1: false, 4 << 20: false, 128 << 20: false, 24 << 20: false, -8 << 20: false,
+	} {
+		if got := IsPartSize(n); got != want {
+			t.Errorf("IsPartSize(%d) = %v", n, got)
+		}
+	}
+	for size := int64(1); size < 1<<46; size *= 3 {
+		if ps := PartSize(size); !IsPartSize(ps) {
+			t.Errorf("the schedule gives %d bytes a part size of %d, which IsPartSize refuses", size, ps)
+		}
 	}
 }

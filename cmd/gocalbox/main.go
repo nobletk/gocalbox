@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"math"
@@ -38,6 +42,11 @@ func main() {
 		os.Exit(command(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 	}
 	if err := run(); err != nil {
+		var unchecked *uncheckedError
+		if errors.As(err, &unchecked) {
+			log.Printf("Fatal Error: %v", err)
+			os.Exit(2)
+		}
 		log.Fatalf("Fatal Error: %v", err)
 	}
 }
@@ -60,6 +69,7 @@ func run() error {
 	auditWait := flag.Bool("audit-wait", true, "Reply to a change only once its audit record is on disk (false only for measurements)")
 	auditWaitTimeout := flag.Duration("audit-wait-timeout", 10*time.Second, "Longest a change waits for its audit record; a record not confirmed by then pauses changes")
 	auditFailOpen := flag.Bool("audit-fail-open", false, "Keep accepting changes after the audit log failed (only for measurements)")
+	auditParts := flag.Bool("audit-parts", false, "Record every accepted part of a resumable upload in the audit log; parts then wait for the log when it falls behind")
 	logEvents := flag.Bool("log-events", true, "Print every file event to the console (the audit log is not affected)")
 	bodyTimeout := flag.Duration("body-timeout", 30*time.Second, "Abort an upload or other request whose body delivers less than 64 KiB in this long (0 = never)")
 	tlsDir := flag.String("tls-dir", defaultTLSDir(), "Folder of the local CA that issues the HTTPS certificate when -tls-cert is not given; must be outside the served directory")
@@ -84,9 +94,21 @@ func run() error {
 	uploadMaxSessionsTotal := flag.Int("upload-max-sessions-total", defaults.MaxSessionsTotal, "Resumable uploads open at once on the server")
 	uploadMaxInflight := flag.Int("upload-max-inflight", defaults.MaxInflight, "Parts of resumable uploads being received at once on the server")
 	verifyLog := flag.String("verify-audit", "", "Verify the integrity of this audit log file and exit")
+	verifyFile := flag.String("verify-upload", "", "Check this stored file against its upload.completed record and exit; needs -part-size and -composite")
+	partSize := flag.Int64("part-size", 0, "With -verify-upload: the part size in bytes, part_size in the upload's record")
+	composite := flag.String("composite", "", "With -verify-upload: the composite SHA-256, sha256 in the upload's record")
 	flag.Parse()
 
-	if *verifyLog != "" {
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	switch {
+	case set["verify-audit"] && set["verify-upload"]:
+		return &uncheckedError{errors.New("-verify-audit and -verify-upload: give one at a time")}
+	case set["verify-upload"]:
+		return verifyUpload(*verifyFile, *partSize, *composite)
+	case set["part-size"] || set["composite"]:
+		return errors.New("-part-size and -composite are only for -verify-upload")
+	case *verifyLog != "":
 		return verifyAudit(*verifyLog)
 	}
 	if err := checkTLSFlags(*host, *tlsCert, *tlsKey, *tlsDir, *insecureHTTP); err != nil {
@@ -140,6 +162,7 @@ func run() error {
 		AuditNoWait:      !*auditWait,
 		AuditWaitTimeout: *auditWaitTimeout,
 		AuditFailOpen:    *auditFailOpen,
+		AuditParts:       *auditParts,
 		LogEvents:        *logEvents,
 		BodyTimeout:      *bodyTimeout,
 		TLSCert:          *tlsCert,
@@ -230,6 +253,7 @@ type config struct {
 	AuditNoWait      bool          // changes reply without waiting for their records
 	AuditWaitTimeout time.Duration // 10 s when 0
 	AuditFailOpen    bool
+	AuditParts       bool // every accepted part of a resumable upload is recorded
 	LogEvents        bool
 	BodyTimeout      time.Duration
 
@@ -353,7 +377,7 @@ func newApp(cfg config) (_ *app, err error) {
 
 	bus := events.New()
 	undo = append(undo, func() error { return bus.Close(context.Background()) })
-	audit.Subscribe(bus, coalescer, guard, audit.Keep{Metadata: cfg.AuditListings}, waitTimeout)
+	audit.Subscribe(bus, coalescer, guard, audit.Keep{Metadata: cfg.AuditListings, Parts: cfg.AuditParts}, waitTimeout)
 	if cfg.LogEvents {
 		bus.Subscribe("console", events.LogHandler, events.Options{
 			Mode: events.Drop, Buffer: 1024,
@@ -427,7 +451,7 @@ func newApp(cfg config) (_ *app, err error) {
 	limits.MaxSize = cfg.MaxUploadBytes
 	uploads, err := transfer.New(transfer.Config{
 		Root: sb.OSRoot(), Staging: staging, Files: files, Registry: registry.New(db),
-		Events: bus, Audit: recorder, Ledger: ledger, Limits: limits,
+		Events: bus, Audit: recorder, Ledger: ledger, Limits: limits, AuditParts: cfg.AuditParts,
 	})
 	if err != nil {
 		return nil, err
@@ -676,6 +700,93 @@ func defaultAuditPath() string {
 		return filepath.Join(dir, "gocalbox", "audit.jsonl")
 	}
 	return "gocalbox-audit.jsonl"
+}
+
+// uncheckedError is a -verify-upload that couldn't check the file: it exits
+// with 2, where a file that doesn't match its record exits with 1.
+type uncheckedError struct{ err error }
+
+func (e *uncheckedError) Error() string { return e.err.Error() }
+func (e *uncheckedError) Unwrap() error { return e.err }
+
+// beforeVerifyOpen and afterVerifyRead, when set, run before -verify-upload
+// opens the file and once it has read it.
+var beforeVerifyOpen, afterVerifyRead func()
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// verifyUpload checks a stored file against the part size and composite
+// SHA-256 its upload.completed record carries.
+func verifyUpload(path string, partSize int64, composite string) error {
+	unchecked := func(err error) error { return &uncheckedError{err} }
+	if path == "" {
+		return unchecked(errors.New("-verify-upload needs the stored file's path"))
+	}
+	if partSize <= 0 {
+		return unchecked(fmt.Errorf("-verify-upload needs -part-size, part_size in the upload's record, at least 1; got %d", partSize))
+	}
+	want := strings.ToLower(composite)
+	if b, err := hex.DecodeString(want); err != nil || len(b) != sha256.Size {
+		return unchecked(fmt.Errorf("-verify-upload needs -composite, sha256 in the upload's record: 64 hex digits, got %q", composite))
+	}
+	// Opening a device may act on it, and opening a FIFO waits for a writer:
+	// only a regular file is opened, and in case the path is replaced in the
+	// meantime, without waiting.
+	before, err := os.Stat(path)
+	if err != nil {
+		return unchecked(err)
+	}
+	if !before.Mode().IsRegular() {
+		return unchecked(fmt.Errorf("%s is not a regular file", path))
+	}
+	if beforeVerifyOpen != nil {
+		beforeVerifyOpen()
+	}
+	f, err := openToVerify(path)
+	if err != nil {
+		return unchecked(err)
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return unchecked(err)
+	}
+	if !opened.Mode().IsRegular() {
+		return unchecked(fmt.Errorf("%s is not a regular file", path))
+	}
+	r := &countingReader{r: f}
+	got, parts, err := transfer.CompositeOf(bufio.NewReaderSize(r, 1<<20), partSize)
+	if err != nil {
+		return unchecked(fmt.Errorf("%s: %w", path, err))
+	}
+	if afterVerifyRead != nil {
+		afterVerifyRead()
+	}
+	after, err := f.Stat()
+	if err != nil {
+		return unchecked(err)
+	}
+	if r.n != opened.Size() || after.Size() != opened.Size() || !after.ModTime().Equal(opened.ModTime()) {
+		return unchecked(fmt.Errorf("%s changed while it was read: %d bytes when opened, %d read, %d after", path, opened.Size(), r.n, after.Size()))
+	}
+	if got != want {
+		msg := fmt.Sprintf("%s doesn't match its record: its %d parts of %d bytes give the composite %s, not %s", path, parts, partSize, got, want)
+		if !transfer.IsPartSize(partSize) {
+			msg += fmt.Sprintf("; the server only cuts files into parts of a power of two from %d to %d bytes, so take -part-size from the record", transfer.MinPartSize, transfer.MaxPartSize)
+		}
+		return errors.New(msg)
+	}
+	fmt.Printf("OK: %s matches its record: %d bytes, %d parts of %d bytes, composite %s\n", path, r.n, parts, partSize, got)
+	return nil
 }
 
 func verifyAudit(path string) error {

@@ -3,12 +3,16 @@ package transfer
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
 	"math/bits"
 )
 
 const (
-	minPartSize = 8 << 20
-	maxPartSize = 64 << 20
+	// MinPartSize and MaxPartSize bound the part sizes the server chooses.
+	MinPartSize = 8 << 20
+	MaxPartSize = 64 << 20
 	partsTarget = 10000
 )
 
@@ -22,11 +26,11 @@ const MaxSize = 1 << 46
 // at most MaxSize.
 func PartSize(size int64) int64 {
 	if size <= 0 {
-		return minPartSize
+		return MinPartSize
 	}
 	per := (size + partsTarget - 1) / partsTarget
 	p := int64(1) << (64 - bits.LeadingZeros64(uint64(per-1)))
-	return min(max(p, minPartSize), maxPartSize)
+	return min(max(p, MinPartSize), MaxPartSize)
 }
 
 // PartCount returns how many parts of partSize make up size bytes, at most
@@ -93,4 +97,35 @@ func validClientKey(k string) bool {
 		}
 	}
 	return true
+}
+
+// IsPartSize reports whether the server cuts files into parts of n bytes:
+// a power of two from MinPartSize to MaxPartSize.
+func IsPartSize(n int64) bool {
+	return n >= MinPartSize && n <= MaxPartSize && n&(n-1) == 0
+}
+
+// CompositeOf reads r to its end, cut into parts of partSize bytes, and
+// returns the composite of those parts and how many there were: what an
+// upload of the same bytes would have been recorded with.
+func CompositeOf(r io.Reader, partSize int64) (composite string, parts int64, err error) {
+	if partSize <= 0 {
+		return "", 0, fmt.Errorf("part size %d: it must be at least 1", partSize)
+	}
+	all, h := sha256.New(), sha256.New()
+	var sum [sha256.Size]byte
+	for {
+		h.Reset()
+		n, err := io.CopyN(h, r, partSize)
+		if n > 0 {
+			all.Write(h.Sum(sum[:0]))
+			parts++
+		}
+		switch {
+		case errors.Is(err, io.EOF):
+			return hex.EncodeToString(all.Sum(nil)), parts, nil
+		case err != nil:
+			return "", 0, err
+		}
+	}
 }
