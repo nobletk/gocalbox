@@ -324,3 +324,52 @@ func TestASessionOutlivesTheLoginThatMadeIt(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// status tells why a session failed without the system's error text, which
+// names files of the staging folder; the full reason stays in the log.
+func TestStatusTellsAFailureWithoutItsDetail(t *testing.T) {
+	en := newEnv(t)
+	f := newFile(10)
+	c := en.create(alice, "public", "a.bin", f)
+	en.sendAll(alice, c.UploadID, f)
+	if err := os.Remove(en.staged(c.UploadID, dataName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := en.e.Complete(as(alice), c.UploadID, f.composite()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("complete: %v", err)
+	}
+	st, err := en.e.Status(as(alice), c.UploadID, nil)
+	if err != nil || st.State != Failed || st.Reason != "the staged data is gone" {
+		t.Errorf("status: %+v %v", st, err)
+	}
+	list, _ := en.e.List(as(alice), false)
+	if len(list) != 1 || list[0].Reason != "the staged data is gone" {
+		t.Errorf("list: %+v", list)
+	}
+	ls := en.logLines(c.UploadID)
+	if last := ls[len(ls)-1]; last.Op != opFailed || !strings.HasPrefix(last.Reason, "the staged data is gone: ") || !strings.Contains(last.Reason, c.UploadID) {
+		t.Errorf("the log's reason: %q", last.Reason)
+	}
+	expired := en.create(alice, "public", "b.bin", f)
+	en.clock.add(DefaultLimits.FirstPartTTL)
+	en.e.sweep()
+	if st, _ := en.e.Status(as(alice), expired.UploadID, nil); st.Reason != "no_parts" {
+		t.Errorf("an expired session's reason: %q", st.Reason)
+	}
+}
+
+func TestShownReasonCutsAtTheErrorItWraps(t *testing.T) {
+	for reason, want := range map[string]string{
+		"cannot write part 3: write data: input/output error":                                               "cannot write part 3",
+		"its staged data is gone, and the file at its target isn't the one placed: public/notes: draft.txt": "its staged data is gone, and the file at its target isn't the one placed",
+		"its log can't be trusted: line 3: unknown field \"x\"":                                             "its log can't be trusted",
+		"its log is gone": "its log is gone",
+	} {
+		if got := shownReason(Failed, reason); got != want {
+			t.Errorf("%q: %q", reason, got)
+		}
+	}
+	if got := shownReason(Expired, "idle: x"); got != "idle: x" {
+		t.Errorf("an expired session's reason: %q", got)
+	}
+}

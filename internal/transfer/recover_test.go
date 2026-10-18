@@ -368,7 +368,7 @@ func TestAFileRenamedIntoPlaceIsFoundByItsSizeAndTime(t *testing.T) {
 		case change == "":
 			next.recovered(c.UploadID)
 		case next.state(c.UploadID) != Failed || len(next.bus.of(events.UploadFailed)) != 1 || !exists(placed) ||
-			!strings.Contains(next.bus.of(events.UploadFailed)[0].Detail, "isn't the file it was placed as"):
+			!strings.Contains(next.bus.of(events.UploadFailed)[0].Detail, "isn't the one placed: public/a.bin"):
 			t.Errorf("%s since: state %s, events %+v", change, next.state(c.UploadID), next.bus.all())
 		}
 	}
@@ -712,7 +712,11 @@ func TestALogThatCantBeTrustedFailsTheSession(t *testing.T) {
 			next.clock.add(5 * time.Hour)
 			again := next.restart()
 			st, _ := again.e.Status(as(alice), c.UploadID, nil)
-			if st.State != Failed || st.Reason != evs[0].Detail || len(again.bus.all()) != 0 || !st.ExpiresAt.Equal(first.ExpiresAt) {
+			kept := again.session(c.UploadID)
+			kept.mu.Lock()
+			reason := kept.reason
+			kept.mu.Unlock()
+			if st.State != Failed || reason != evs[0].Detail || st.Reason != "its log can't be trusted" || len(again.bus.all()) != 0 || !st.ExpiresAt.Equal(first.ExpiresAt) {
 				t.Errorf("the next start: %+v, events %+v; it expired at %v", st, again.bus.all(), first.ExpiresAt)
 			}
 			if n := len(lines[len(lines)-1]); n > 8*maxLogged {

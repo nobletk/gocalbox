@@ -447,7 +447,7 @@ func TestACompletionAppliesTheCapOnTombstones(t *testing.T) {
 		t.Fatal(err)
 	}
 	e2.partSize = en.e.partSize
-	t.Cleanup(func() { e2.Close(context.Background()) })
+	t.Cleanup(func() { closeWithin(t, e2, context.Background()) })
 	en.e = e2
 	f := newFile(10)
 	aborted := en.create(alice, "public", "a.bin", f)

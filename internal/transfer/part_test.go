@@ -110,6 +110,8 @@ func TestPartRefusals(t *testing.T) {
 			t.Errorf("%s: events %+v", tc.name, evs)
 		} else if tc.user != alice && (evs[0].Upload.Owner != alice || evs[0].Upload.OwnerName != "alice") {
 			t.Errorf("%s: the refusal doesn't name the owner: %+v", tc.name, evs[0].Upload)
+		} else if evs[0].Upload.ID != tc.req.ID || tc.user == alice && tc.want != ErrUploadNotFound && evs[0].Upload.Part != tc.req.N {
+			t.Errorf("%s: the refusal names %+v", tc.name, evs[0].Upload)
 		}
 		ls := en.logLines(c.UploadID)
 		if tc.logged != (len(ls) == before+1) {
@@ -726,5 +728,17 @@ func TestAFailureReasonIsCutShortInTheLog(t *testing.T) {
 	ls := en.logLines(c.UploadID)
 	if last := ls[len(ls)-1]; last.Op != opFailed || len(last.Reason) > maxLogged+len("…(truncated)") {
 		t.Errorf("the failed line's reason has %d bytes", len(last.Reason))
+	}
+}
+
+func TestAPartWithALongMalformedIDIsRecordedCutShort(t *testing.T) {
+	en := newEnv(t)
+	id := strings.Repeat("x", 200)
+	if _, err := en.e.Part(as(alice), PartRequest{ID: id, N: 1, SHA256: strings.Repeat("0", 64)}); !errors.Is(err, ErrInvalidPart) {
+		t.Fatal(err)
+	}
+	evs := en.bus.of(events.UploadRejected)
+	if len(evs) != 1 || evs[0].Upload.ID != id[:64]+"…(truncated)" || evs[0].Upload.Part != 1 {
+		t.Errorf("recorded %+v", evs)
 	}
 }

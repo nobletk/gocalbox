@@ -56,6 +56,10 @@ type Options struct {
 	// API request and every file until the first admin exists. Without it,
 	// every route but the UI and /ca.crt answers 401.
 	Accounts AccountService
+
+	// Uploads serves the resumable uploads under /api/upload/; without it
+	// they answer 503 uploads_unavailable.
+	Uploads UploadService
 }
 
 type ClientFileInfo struct {
@@ -102,6 +106,7 @@ type ErrorBody struct {
 type api struct {
 	files         FileService
 	accounts      AccountService
+	uploads       UploadService
 	maxUpload     int64
 	changesPaused func() bool
 	linkTarget    func() LinkTarget
@@ -110,7 +115,7 @@ type api struct {
 
 func New(files FileService, webFS fs.FS, opts Options) http.Handler {
 	a := &api{
-		files: files, accounts: opts.Accounts, maxUpload: opts.MaxUploadBytes,
+		files: files, accounts: opts.Accounts, uploads: opts.Uploads, maxUpload: opts.MaxUploadBytes,
 		changesPaused: opts.ChangesPaused, linkTarget: opts.LinkTarget, tracker: opts.Tracker,
 	}
 
@@ -149,6 +154,10 @@ const (
 	accessSession               // a session; acts on the session's own account
 	accessFiles                 // a session; fsops decides on every path it touches
 	accessAdmin                 // a session; the accounts check it is an admin's, and the reauth window for changes
+	// accessUploads: a session; the engine answers only the owner of an
+	// upload, or an admin where the protocol allows it, and fsops decides on
+	// the folder.
+	accessUploads
 )
 
 type route struct {
@@ -171,6 +180,7 @@ func (a *api) routes(webFS fs.FS, opts Options) []route {
 			writeErrorJSON(w, r, http.StatusNotFound, "not_found", "Unknown API endpoint")
 		})},
 	}
+	rs = append(rs, a.uploadRoutes()...)
 	if a.accounts != nil {
 		rs = append(rs,
 			route{"/api/setup", accessPublic, a.track(http.HandlerFunc(a.handleSetup))},

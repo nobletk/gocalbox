@@ -65,7 +65,7 @@ func (e *Engine) status(s *session, hashes []int) Status {
 	st := Status{
 		UploadID:  s.rec.ID,
 		State:     s.state,
-		Reason:    s.reason,
+		Reason:    shownReason(s.state, s.reason),
 		Dir:       s.rec.Dir,
 		Name:      s.rec.Name,
 		Size:      s.rec.Size,
@@ -90,6 +90,18 @@ func (e *Engine) status(s *session, hashes []int) Status {
 		}
 	}
 	return st
+}
+
+// shownReason is why a session ended, as status tells it: a failure's
+// reason without the detail after its first ": ", which can carry the
+// system's error text and names inside the staging folder. The whole reason
+// stays in parts.log, the console and the audit log.
+func shownReason(st State, reason string) string {
+	if st != Failed {
+		return reason
+	}
+	cause, _, _ := strings.Cut(reason, ": ")
+	return cause
 }
 
 func (e *Engine) owner(id string) *Owner {

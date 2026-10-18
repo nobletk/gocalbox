@@ -44,7 +44,7 @@ func (e *Engine) Part(ctx context.Context, req PartRequest) (PartResult, error) 
 	}
 	defer e.leave()
 	if !ValidID(req.ID) || req.N < 1 {
-		e.publish(e.event(ctx, events.UploadRejected, "", &events.UploadInfo{Part: req.N}, ErrInvalidPart))
+		e.publish(e.event(ctx, events.UploadRejected, "", &events.UploadInfo{ID: shownID(req.ID), Part: req.N}, ErrInvalidPart))
 		return PartResult{}, ErrInvalidPart
 	}
 	if !isHex(req.SHA256, 2*sha256.Size) {

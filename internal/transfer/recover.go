@@ -361,7 +361,7 @@ func (e *Engine) reconcile(s *session, r replayed, data fileState) (found, error
 	}
 	switch {
 	case !placed && data.missing:
-		return e.foundFailed(s, fmt.Sprintf("its staged data is gone, and %s isn't the file it was placed as", fin.Path)), nil
+		return e.foundFailed(s, fmt.Sprintf("its staged data is gone, and the file at its target isn't the one placed: %s", fin.Path)), nil
 	case !placed:
 		return e.receiving(s, r, data), nil
 	}

@@ -218,6 +218,10 @@ type Engine struct {
 	wake        chan struct{}
 	stop        chan struct{}
 	janitorDone chan struct{}
+	// sweeping, guarded by mu, is whether a run of the janitor is under way;
+	// swept, once Close waits for that run, is closed when it ends.
+	sweeping bool
+	swept    chan struct{}
 
 	syncFile func(*os.File) error
 	syncDir  func(root *os.Root, dir string) error
@@ -329,19 +333,20 @@ func (e *Engine) Close(ctx context.Context) error {
 			close(e.stop)
 		}
 	}
+	var swept chan struct{}
+	if e.sweeping {
+		if e.swept == nil {
+			e.swept = make(chan struct{})
+		}
+		swept = e.swept
+	}
 	e.mu.Unlock()
 
-	select {
-	case <-e.drained:
-	case <-ctx.Done():
+	if !waitFor(ctx, e.drained) {
 		return fmt.Errorf("upload calls still running at shutdown: %w", ctx.Err())
 	}
-	if e.stop != nil {
-		select {
-		case <-e.janitorDone:
-		case <-ctx.Done():
-			return fmt.Errorf("the upload janitor still running at shutdown: %w", ctx.Err())
-		}
+	if swept != nil && !waitFor(ctx, swept) {
+		return fmt.Errorf("the upload janitor still running at shutdown: %w", ctx.Err())
 	}
 	e.mu.Lock()
 	if e.finished {
@@ -366,6 +371,38 @@ func (e *Engine) Close(ctx context.Context) error {
 		return e.root.Close()
 	}
 	return nil
+}
+
+// Ready returns the error a call would get now for an engine that is off,
+// ErrUnavailable, or one that is closing, ErrShuttingDown; otherwise nil.
+// It lets a caller refuse a call before reading its request.
+func (e *Engine) Ready() error {
+	if e.off != nil {
+		return ErrUnavailable
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return ErrShuttingDown
+	}
+	return nil
+}
+
+// waitFor waits until done is closed, or ctx ends first. A done that is
+// closed already counts even if ctx has ended too, which select alone would
+// decide at random.
+func waitFor(ctx context.Context, done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // enter admits a call, unless the engine is off or closing.

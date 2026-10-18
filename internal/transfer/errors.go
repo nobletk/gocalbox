@@ -40,7 +40,7 @@ var (
 	ErrTooManyUploads    = &Error{429, "too_many_uploads", "too many uploads are open for this user"}
 	ErrTooManyRequests   = &Error{429, "too_many_requests", "too many parts are being sent at once"}
 	ErrBusy              = &Error{503, "busy", "the server is busy; try again in a moment"}
-	ErrPartAborted       = &Error{400, "part_aborted", "the part's body ended early"}
+	ErrPartAborted       = &Error{400, "part_aborted", "the part's body ended early or stalled"}
 )
 
 // MissingError is ErrPartsMissing with the parts that are missing.

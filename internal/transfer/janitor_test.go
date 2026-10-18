@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -196,7 +197,7 @@ func TestEachUserKeepsAtMostSoManyTombstones(t *testing.T) {
 		t.Fatal(err)
 	}
 	e2.partSize = en.e.partSize
-	defer e2.Close(context.Background())
+	defer closeWithin(t, e2, context.Background())
 	en.e = e2
 
 	f := newFile(10)
@@ -298,7 +299,7 @@ func TestCloseGivesUpAtItsDeadline(t *testing.T) {
 	within(t, g.reached)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if err := en.e.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+	if err := closeWithin(t, en.e, ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Close: %v", err)
 	}
 	// What is still running finds its files open.
@@ -309,7 +310,7 @@ func TestCloseGivesUpAtItsDeadline(t *testing.T) {
 	if st := en.state(c.UploadID); st != Receiving || len(en.logLines(c.UploadID)) != 1 {
 		t.Errorf("state %s, log %v", st, en.logLines(c.UploadID))
 	}
-	if err := en.e.Close(context.Background()); err != nil {
+	if err := closeWithin(t, en.e, context.Background()); err != nil {
 		t.Errorf("Close again: %v", err)
 	}
 	if _, err := en.e.root.Stat("."); err == nil {
@@ -326,11 +327,13 @@ func TestCloseGivesUpOnAJanitorRunAtItsDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	e2.partSize = en.e.partSize
-	t.Cleanup(func() { e2.Close(context.Background()) })
+	t.Cleanup(func() { closeWithin(t, e2, context.Background()) })
 	en.e = e2
 	c := en.create(alice, "public", "a.bin", newFile(10))
 	held, release := make(chan struct{}), make(chan struct{})
-	var once sync.Once
+	var once, freed sync.Once
+	free := func() { freed.Do(func() { close(release) }) }
+	t.Cleanup(free)
 	en.e.syncFile = func(f *os.File) error {
 		once.Do(func() { close(held); <-release })
 		return f.Sync()
@@ -340,13 +343,118 @@ func TestCloseGivesUpOnAJanitorRunAtItsDeadline(t *testing.T) {
 	within(t, held) // the janitor is flushing the expired line
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if err := en.e.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+	if err := closeWithin(t, en.e, ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Close: %v", err)
 	}
-	close(release)
+	free()
 	within(t, en.e.janitorDone)
 	if st := en.state(c.UploadID); st != Expired {
 		t.Errorf("state %s", st)
+	}
+}
+
+// A shutdown whose deadline the HTTP server's drain used up still closes an
+// engine that has nothing running, its janitor included.
+func TestCloseAfterItsDeadlineClosesWhenNothingRuns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := range 32 {
+		en := newEnv(t)
+		e, held, release := janitorEngine(t, en)
+		within(t, held)
+		if err := closeWithin(t, e, ctx); err != nil {
+			t.Fatalf("try %d: %v", i, err)
+		}
+		if _, err := e.root.Stat("."); err == nil {
+			t.Fatalf("try %d: the staging folder is still open", i)
+		}
+		give(t, release)
+		within(t, e.janitorDone)
+	}
+}
+
+// janitorEngine is an engine of en's with a janitor of its own. Each run
+// of the janitor stops at the point "janitor", sends on held and waits for
+// release, the first one, which recovery wakes, included.
+func janitorEngine(t *testing.T, en *env) (e *Engine, held, release chan struct{}) {
+	t.Helper()
+	en.e.Close(context.Background())
+	held, release = make(chan struct{}), make(chan struct{})
+	e, err := New(Config{Root: en.root, Staging: &sandbox.Staging{Links: true}, Files: en.files, Registry: en.reg, Events: en.bus,
+		JanitorEvery: time.Hour, Now: en.clock.now, prepare: func(e *Engine) {
+			e.partSize = func(int64) int64 { return testPartSize }
+			e.point = func(name string) {
+				if name == "janitor" {
+					held <- struct{}{}
+					<-release
+				}
+			}
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		close(release)
+		closeWithin(t, e, context.Background())
+	})
+	en.e = e
+	return e, held, release
+}
+
+// A run of the janitor that began just as Close ended does nothing: the
+// files it would use are closed.
+func TestAJanitorRunThatStartsAfterCloseDoesNothing(t *testing.T) {
+	en := newEnv(t)
+	e, held, release := janitorEngine(t, en)
+	c := en.create(alice, "public", "a.bin", newFile(10))
+	en.clock.add(DefaultLimits.FirstPartTTL)
+	within(t, held)
+	if err := closeWithin(t, e, context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	give(t, release)
+	within(t, e.janitorDone)
+	if st := en.state(c.UploadID); st != Receiving {
+		t.Errorf("state %s after a run that began once Close had ended", st)
+	}
+	if evs := en.bus.of(events.UploadExpired); len(evs) != 0 {
+		t.Errorf("published %v", evs)
+	}
+}
+
+// Close waits for a run of the janitor under way, and then closes.
+func TestCloseWaitsForAJanitorRunUnderWay(t *testing.T) {
+	en := newEnv(t)
+	e, point, pass := janitorEngine(t, en)
+	c := en.create(alice, "public", "a.bin", newFile(10))
+	held, release := make(chan struct{}), make(chan struct{})
+	var once, freed sync.Once
+	free := func() { freed.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	e.syncFile = func(f *os.File) error {
+		once.Do(func() { close(held); <-release })
+		return f.Sync()
+	}
+	en.clock.add(DefaultLimits.FirstPartTTL)
+	within(t, point)
+	give(t, pass)
+	within(t, held)
+	closed := make(chan error)
+	go func() { closed <- e.Close(context.Background()) }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned during a run of the janitor: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	free()
+	if err := within(t, closed); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if st := en.state(c.UploadID); st != Expired {
+		t.Errorf("state %s", st)
+	}
+	if _, err := e.root.Stat("."); err == nil {
+		t.Error("the staging folder is still open")
 	}
 }
 
@@ -457,5 +565,149 @@ func TestARemovalKeepsTheRecordUntilTheFolderMoved(t *testing.T) {
 				t.Errorf("once the trash is back: record %v, session %v, folder %v", en.reg.has(c.UploadID), en.e.lookup(c.UploadID) != nil, exists(en.staged(c.UploadID, "")))
 			}
 		})
+	}
+}
+
+// Two Close calls during one run of the janitor both wait for it, and both
+// return once it ends.
+func TestTwoClosesWaitForOneJanitorRun(t *testing.T) {
+	en := newEnv(t)
+	e, point, pass := janitorEngine(t, en)
+	en.create(alice, "public", "a.bin", newFile(10))
+	held, release := make(chan struct{}), make(chan struct{})
+	var once, freed sync.Once
+	free := func() { freed.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	e.syncFile = func(f *os.File) error {
+		once.Do(func() { close(held); <-release })
+		return f.Sync()
+	}
+	en.clock.add(DefaultLimits.FirstPartTTL)
+	within(t, point)
+	give(t, pass)
+	within(t, held)
+	first, second := make(chan error, 1), make(chan error, 1)
+	go func() { first <- e.Close(context.Background()) }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		e.mu.Lock()
+		closed := e.closed
+		e.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first Close never began")
+		}
+	}
+	go func() { second <- e.Close(context.Background()) }()
+	select {
+	case err := <-first:
+		t.Fatalf("Close returned during a run of the janitor: %v", err)
+	case err := <-second:
+		t.Fatalf("the second Close returned during a run of the janitor: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	free()
+	if err := within(t, second); err != nil {
+		t.Errorf("the second Close: %v", err)
+	}
+	if err := within(t, first); err != nil {
+		t.Errorf("the first Close: %v", err)
+	}
+}
+
+// A Close whose deadline has already passed, during a run of the janitor,
+// leaves open what the run uses; a later Close finishes the job.
+func TestClosePastItsDeadlineLeavesAJanitorRunItsFiles(t *testing.T) {
+	en := newEnv(t)
+	e, point, pass := janitorEngine(t, en)
+	c := en.create(alice, "public", "a.bin", newFile(10))
+	held, release := make(chan struct{}), make(chan struct{})
+	var once, freed sync.Once
+	free := func() { freed.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	e.syncFile = func(f *os.File) error {
+		once.Do(func() { close(held); <-release })
+		return f.Sync()
+	}
+	en.clock.add(DefaultLimits.FirstPartTTL)
+	within(t, point)
+	give(t, pass)
+	within(t, held)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := closeWithin(t, e, ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("Close: %v", err)
+	}
+	if _, err := e.root.Stat("."); err != nil {
+		t.Errorf("the staging folder was closed under the janitor: %v", err)
+	}
+	free()
+	if err := closeWithin(t, e, context.Background()); err != nil {
+		t.Errorf("Close again: %v", err)
+	}
+	if st := en.state(c.UploadID); st != Expired {
+		t.Errorf("state %s", st)
+	}
+}
+
+// Close that begins with a part and a janitor run under way waits for the
+// run after the part has ended, also when the run holds no session lock.
+func TestCloseWaitsForAJanitorRunAfterTheCallsEnd(t *testing.T) {
+	en := newEnv(t)
+	e, point, pass := janitorEngine(t, en)
+	f := newFile(10)
+	c := en.create(alice, "public", "a.bin", f)
+	en.create(alice, "public", "b.bin", f)
+	g := newGate(f.part(1))
+	sent := make(chan error, 1)
+	go func() {
+		_, err := e.Part(as(alice), PartRequest{ID: c.UploadID, N: 1, SHA256: f.sum(1), Length: int64(len(f.data)), Body: g})
+		sent <- err
+	}()
+	within(t, g.reached)
+	held, release := make(chan struct{}), make(chan struct{})
+	var first atomic.Bool
+	var freed sync.Once
+	free := func() { freed.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	en.bus.publish = func(ev events.Event) {
+		if ev.Type == events.UploadExpired && first.CompareAndSwap(false, true) {
+			close(held)
+			<-release
+		}
+	}
+	en.clock.add(DefaultLimits.FirstPartTTL)
+	within(t, point)
+	give(t, pass)
+	within(t, held)
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close(context.Background()) }()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		e.mu.Lock()
+		began := e.closed
+		e.mu.Unlock()
+		if began {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close never began")
+		}
+	}
+	g.open()
+	if err := within(t, sent); err != nil {
+		t.Fatalf("the part: %v", err)
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned during a run of the janitor: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := e.root.Stat("."); err != nil {
+		t.Errorf("the staging folder was closed under the run: %v", err)
+	}
+	free()
+	if err := within(t, closed); err != nil {
+		t.Errorf("Close: %v", err)
 	}
 }

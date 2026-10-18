@@ -28,6 +28,8 @@ import (
 	"github.com/nobletk/gocalbox/internal/sandbox"
 	"github.com/nobletk/gocalbox/internal/space"
 	"github.com/nobletk/gocalbox/internal/state"
+	"github.com/nobletk/gocalbox/internal/transfer"
+	"github.com/nobletk/gocalbox/internal/transfer/registry"
 	"github.com/nobletk/gocalbox/web"
 )
 
@@ -72,6 +74,15 @@ func run() error {
 	inviteTTL := flag.Duration("invite-ttl", auth.DefaultLinks.InviteTTL, "How long an invite link stays usable (an admin invite at most 24 hours)")
 	resetTTL := flag.Duration("reset-ttl", auth.DefaultLinks.ResetTTL, "How long a password reset link stays usable (-recover-admin's at most 1 hour)")
 	recoverAdmin := flag.String("recover-admin", "", "Print a one-time password reset link for this admin on the console at start-up")
+	defaults := transfer.DefaultLimits
+	uploadWindowMB := flag.Int64("upload-window-mb", defaults.Window>>20, "Free space in MiB one resumable upload holds ahead for its parts, or more when the parts it may have in flight need it")
+	uploadIdleTTL := flag.Duration("upload-idle-ttl", defaults.IdleTTL, "A resumable upload that receives no new part for this long expires")
+	uploadFirstPartTTL := flag.Duration("upload-first-part-ttl", defaults.FirstPartTTL, "A resumable upload that receives no part at all for this long expires")
+	uploadMaxAge := flag.Duration("upload-max-age", defaults.MaxAge, "A resumable upload expires this long after it began, however active it is")
+	uploadTombstoneTTL := flag.Duration("upload-tombstone-ttl", defaults.TombstoneTTL, "How long a finished resumable upload still answers a client that repeats a call")
+	uploadMaxSessions := flag.Int("upload-max-sessions", defaults.MaxSessions, "Resumable uploads one user may have open at once")
+	uploadMaxSessionsTotal := flag.Int("upload-max-sessions-total", defaults.MaxSessionsTotal, "Resumable uploads open at once on the server")
+	uploadMaxInflight := flag.Int("upload-max-inflight", defaults.MaxInflight, "Parts of resumable uploads being received at once on the server")
 	verifyLog := flag.String("verify-audit", "", "Verify the integrity of this audit log file and exit")
 	flag.Parse()
 
@@ -100,6 +111,18 @@ func run() error {
 	if *minFreeMB < 0 || *minFreeMB > math.MaxInt64>>20 {
 		return fmt.Errorf("-min-free-mb must be between 0 and %d, got %d", int64(math.MaxInt64>>20), *minFreeMB)
 	}
+	uploads, err := uploadLimits(*uploadWindowMB, transfer.Limits{
+		IdleTTL:          *uploadIdleTTL,
+		FirstPartTTL:     *uploadFirstPartTTL,
+		MaxAge:           *uploadMaxAge,
+		TombstoneTTL:     *uploadTombstoneTTL,
+		MaxSessions:      *uploadMaxSessions,
+		MaxSessionsTotal: *uploadMaxSessionsTotal,
+		MaxInflight:      *uploadMaxInflight,
+	})
+	if err != nil {
+		return err
+	}
 
 	a, err := newApp(config{
 		RootDir:          *rootDir,
@@ -123,6 +146,7 @@ func run() error {
 		Sessions:         sessions,
 		Links:            auth.LinkConfig{InviteTTL: *inviteTTL, ResetTTL: *resetTTL},
 		RecoverAdmin:     *recoverAdmin,
+		Uploads:          uploads,
 	})
 	if err != nil {
 		return err
@@ -221,6 +245,10 @@ type config struct {
 	Sessions       auth.SessionConfig // auth.DefaultSessions when zero
 	Links          auth.LinkConfig    // auth.DefaultLinks when zero
 	RecoverAdmin   string             // an admin to print a reset link for
+
+	// Uploads bounds the resumable uploads; a zero field takes its default,
+	// and MaxUploadBytes is the largest size.
+	Uploads transfer.Limits
 }
 
 type app struct {
@@ -243,10 +271,14 @@ type app struct {
 	coalescer *audit.Coalescer
 	audit     *audit.Writer
 	inflight  *httpapi.Tracker
-	volume    *os.File
-	space     *space.Ledger // nil where free space cannot be measured
-	spaceErr  error
-	minFree   int64
+	uploads   *transfer.Engine
+	// kept is set when shutdown left the served folder and the lock of its
+	// staging folder to the process's exit.
+	kept     bool
+	volume   *os.File
+	space    *space.Ledger // nil where free space cannot be measured
+	spaceErr error
+	minFree  int64
 }
 
 func newApp(cfg config) (_ *app, err error) {
@@ -393,6 +425,20 @@ func newApp(cfg config) (_ *app, err error) {
 		return nil, fmt.Errorf("read the sessions: %w", err)
 	}
 	undo = append(undo, accounts.Close)
+	limits := cfg.Uploads
+	limits.MaxSize = cfg.MaxUploadBytes
+	uploads, err := transfer.New(transfer.Config{
+		Root: sb.OSRoot(), Staging: staging, Files: files, Registry: registry.New(db),
+		Events: bus, Audit: recorder, Ledger: ledger, Limits: limits,
+	})
+	if err != nil {
+		return nil, err
+	}
+	undo = append(undo, func() error { return uploads.Close(context.Background()) })
+	if staging.Usable() && uploads.Off() != nil {
+		log.Printf("WARNING: resumable uploads are off: %v", uploads.Off())
+	}
+	opts.Uploads = uploads
 	var recovery auth.NewLink
 	if cfg.RecoverAdmin != "" {
 		if recovery, err = accounts.ConsoleResetLink(context.Background(), cfg.RecoverAdmin); err != nil && !events.IsUnrecorded(err) {
@@ -419,6 +465,7 @@ func newApp(cfg config) (_ *app, err error) {
 		coalescer:    coalescer,
 		audit:        auditWriter,
 		inflight:     inflight,
+		uploads:      uploads,
 		volume:       volume,
 		space:        ledger,
 		spaceErr:     spaceErr,
@@ -436,6 +483,15 @@ func (a *app) Close(ctx context.Context) error {
 		log.Printf("SHUTDOWN: %d file operation(s) still running at exit; they may be left incomplete and missing from the audit log: %s",
 			len(left), strings.Join(left, "; "))
 	}
+	// An engine that missed the deadline still has calls or a janitor run
+	// writing in the staging folder: its lock stays held until the process
+	// exits, so that no other server recovers those uploads meanwhile.
+	if err := a.uploads.Close(ctx); errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		a.kept = true
+		log.Printf("SHUTDOWN: %v. The lock of %s is kept until the server exits; the next start recovers those uploads", err, sandbox.ReservedName)
+	} else if err != nil {
+		log.Printf("SHUTDOWN: closing the upload engine: %v", err)
+	}
 
 	flushCtx, cancel := context.WithTimeout(context.Background(), flushTimeout)
 	defer cancel()
@@ -449,6 +505,9 @@ func (a *app) Close(ctx context.Context) error {
 	}
 	if cerr := a.state.Close(); err == nil {
 		err = cerr
+	}
+	if a.kept {
+		return err
 	}
 	if cerr := a.volume.Close(); err == nil {
 		err = cerr
@@ -464,7 +523,7 @@ func (a *app) Close(ctx context.Context) error {
 
 func logStaging(s *sandbox.Staging) {
 	if !s.Usable() {
-		log.Printf("WARNING: the server's own folder %s can't be used: %v. Folders are deleted in place instead of through its trash.", sandbox.ReservedName, s.Problem)
+		log.Printf("WARNING: the server's own folder %s can't be used: %v. Resumable uploads are off, and folders are deleted in place instead of through its trash.", sandbox.ReservedName, s.Problem)
 	}
 	if s.Warning != "" {
 		log.Printf("WARNING: %s", s.Warning)
@@ -485,6 +544,38 @@ func (a *app) logSpace() {
 		return
 	}
 	log.Printf("Free space: %.1f GiB on the served volume; uploads leave at least %d MiB free", float64(free)/(1<<30), a.minFree>>20)
+}
+
+// uploadLimits checks the limits the upload flags set, and adds the window
+// of windowMB MiB.
+func uploadLimits(windowMB int64, l transfer.Limits) (transfer.Limits, error) {
+	if windowMB <= 0 || windowMB > math.MaxInt64>>20 {
+		return l, fmt.Errorf("-upload-window-mb must be between 1 and %d, got %d", int64(math.MaxInt64>>20), windowMB)
+	}
+	for _, d := range []struct {
+		flag string
+		v    time.Duration
+	}{
+		{"-upload-idle-ttl", l.IdleTTL}, {"-upload-first-part-ttl", l.FirstPartTTL},
+		{"-upload-max-age", l.MaxAge}, {"-upload-tombstone-ttl", l.TombstoneTTL},
+	} {
+		if d.v <= 0 {
+			return l, fmt.Errorf("%s must be longer than 0, got %v", d.flag, d.v)
+		}
+	}
+	for _, n := range []struct {
+		flag string
+		v    int
+	}{
+		{"-upload-max-sessions", l.MaxSessions}, {"-upload-max-sessions-total", l.MaxSessionsTotal},
+		{"-upload-max-inflight", l.MaxInflight},
+	} {
+		if n.v <= 0 {
+			return l, fmt.Errorf("%s must be at least 1, got %d", n.flag, n.v)
+		}
+	}
+	l.Window = windowMB << 20
+	return l, nil
 }
 
 func checkSessions(c auth.SessionConfig) error {

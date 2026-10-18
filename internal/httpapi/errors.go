@@ -37,14 +37,19 @@ func writeErrorJSON(w http.ResponseWriter, r *http.Request, status int, code, me
 }
 
 func writeErrorResult(w http.ResponseWriter, r *http.Request, status int, code, message string, result any) {
-	for _, h := range []string{"Content-Disposition", "Content-Security-Policy", "Content-Encoding", "Content-Length"} {
-		w.Header().Del(h)
-	}
-	writeJSON(w, status, ErrorResponse{
+	writeErrorBody(w, status, ErrorResponse{
 		Error:     ErrorBody{Code: code, Message: message},
 		RequestID: events.RequestIDFrom(r.Context()),
 		Result:    result,
 	})
+}
+
+// writeErrorBody answers with an error envelope, or one with more fields.
+func writeErrorBody(w http.ResponseWriter, status int, body any) {
+	for _, h := range []string{"Content-Disposition", "Content-Security-Policy", "Content-Encoding", "Content-Length"} {
+		w.Header().Del(h)
+	}
+	writeJSON(w, status, body)
 }
 
 // reply answers a change with v, or, if the change was made but its record

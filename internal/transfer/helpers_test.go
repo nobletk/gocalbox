@@ -465,7 +465,7 @@ func (en *env) start(opts ...option) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { e.Close(context.Background()) })
+	t.Cleanup(func() { closeWithin(t, e, context.Background()) })
 	en.e = e
 }
 
@@ -634,4 +634,24 @@ func within[T any](t *testing.T, ch <-chan T) T {
 		t.Fatal("waited ten seconds")
 	}
 	panic("unreachable")
+}
+
+// closeWithin closes e with ctx, and fails the test if Close hasn't
+// returned within ten seconds.
+func closeWithin(t *testing.T, e *Engine, ctx context.Context) error {
+	t.Helper()
+	closed := make(chan error, 1)
+	go func() { closed <- e.Close(ctx) }()
+	return within(t, closed)
+}
+
+// give sends on ch, and fails the test if nothing receives it within ten
+// seconds.
+func give(t *testing.T, ch chan<- struct{}) {
+	t.Helper()
+	select {
+	case ch <- struct{}{}:
+	case <-time.After(10 * time.Second):
+		t.Fatal("waited ten seconds")
+	}
 }

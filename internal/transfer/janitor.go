@@ -22,7 +22,34 @@ func (e *Engine) janitor(every time.Duration) {
 		case <-t.C:
 		case <-e.wake:
 		}
+		e.at("janitor")
+		if !e.startSweep() {
+			return
+		}
 		e.sweep()
+		e.endSweep()
+	}
+}
+
+// startSweep marks a run of the janitor as under way, unless the engine is
+// closing; Close waits only for a run under way, not for the goroutine.
+func (e *Engine) startSweep() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return false
+	}
+	e.sweeping = true
+	return true
+}
+
+func (e *Engine) endSweep() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.sweeping = false
+	if e.swept != nil {
+		close(e.swept)
+		e.swept = nil
 	}
 }
 
