@@ -56,9 +56,12 @@ type Result struct {
 	Duration time.Duration
 	// Codes counts the files by the HTTP status their upload ended with:
 	// 201 for a file uploaded, otherwise the status of the refusal that
-	// stopped it.
+	// stopped it, or 000 for a request that got no answer.
 	Codes map[string]int
-	Parts []time.Duration // the latency of every part accepted, its last try only
+	// Retried counts the refusals that were tried again, by their status:
+	// 503 busy, 429 too_many_requests and 409 part_in_progress.
+	Retried map[string]int
+	Parts   []time.Duration // the latency of every part accepted, its last try only
 }
 
 // Uploaded is how many files were uploaded.
@@ -67,7 +70,7 @@ func (r Result) Uploaded() int { return r.Codes["201"] }
 // Run uploads cfg.Files files of cfg.Size bytes for every user at once and
 // returns when all have ended.
 func Run(ctx context.Context, cfg Config) Result {
-	res := Result{Codes: map[string]int{}}
+	res := Result{Codes: map[string]int{}, Retried: map[string]int{}}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -80,6 +83,9 @@ func Run(ctx context.Context, cfg Config) Result {
 			defer mu.Unlock()
 			for k, v := range r.Codes {
 				res.Codes[k] += v
+			}
+			for k, v := range r.Retried {
+				res.Retried[k] += v
 			}
 			res.Parts = append(res.Parts, r.Parts...)
 		}()
@@ -105,8 +111,13 @@ type job struct {
 }
 
 func runUser(ctx context.Context, u User, cfg Config, user int) Result {
-	res := Result{Codes: map[string]int{}}
+	res := Result{Codes: map[string]int{}, Retried: map[string]int{}}
 	var mu sync.Mutex
+	retried := func(err error) {
+		mu.Lock()
+		res.Retried[status(err)]++
+		mu.Unlock()
+	}
 	jobs := make(chan job)
 	var workers sync.WaitGroup
 	for range max(cfg.Parallel, 1) {
@@ -124,7 +135,7 @@ func runUser(ctx context.Context, u User, cfg Config, user int) Result {
 					if ps := j.up.c.PartSize; int64(len(buf)) < ps {
 						buf = make([]byte, ps)
 					}
-					d, err = sendPart(ctx, u.API, cfg.Size, j, buf)
+					d, err = sendPart(ctx, u.API, cfg.Size, j, buf, retried)
 				}
 				mu.Lock()
 				if err != nil && j.up.failed == nil {
@@ -137,7 +148,7 @@ func runUser(ctx context.Context, u User, cfg Config, user int) Result {
 				last := j.up.left == 0
 				mu.Unlock()
 				if last {
-					status := finish(ctx, u.API, j.up)
+					status := finish(ctx, u.API, j.up, retried)
 					mu.Lock()
 					res.Codes[status]++
 					mu.Unlock()
@@ -150,7 +161,7 @@ func runUser(ctx context.Context, u User, cfg Config, user int) Result {
 		name := fmt.Sprintf("load-%03d-%04d.bin", user, f)
 		c, _, err := retry(ctx, func() (transfer.Created, error) {
 			return u.API.Create(ctx, transfer.CreateRequest{Dir: u.Dir, Name: name, Size: cfg.Size})
-		})
+		}, retried)
 		if err != nil {
 			mu.Lock()
 			res.Codes[status(err)]++
@@ -159,8 +170,9 @@ func runUser(ctx context.Context, u User, cfg Config, user int) Result {
 		}
 		up.c, up.hashes, up.left = c, make([][sha256.Size]byte, c.PartCount), c.PartCount
 		if c.PartCount == 0 {
+			code := finish(ctx, u.API, up, retried)
 			mu.Lock()
-			res.Codes[finish(ctx, u.API, up)]++
+			res.Codes[code]++
 			mu.Unlock()
 			continue
 		}
@@ -183,7 +195,7 @@ func fill(b []byte, off int64, seed byte) {
 
 // sendPart sends part j.n, as the server's answer to create cut the file,
 // and returns how long its last try took.
-func sendPart(ctx context.Context, api API, size int64, j job, buf []byte) (time.Duration, error) {
+func sendPart(ctx context.Context, api API, size int64, j job, buf []byte, retried func(error)) (time.Duration, error) {
 	c := j.up.c
 	off := int64(j.n-1) * c.PartSize
 	b := buf[:min(c.PartSize, size-off)]
@@ -193,17 +205,17 @@ func sendPart(ctx context.Context, api API, size int64, j job, buf []byte) (time
 	sum := hex.EncodeToString(h[:])
 	_, d, err := retry(ctx, func() (transfer.PartResult, error) {
 		return api.Part(ctx, transfer.PartRequest{ID: c.UploadID, N: j.n, SHA256: sum, Length: int64(len(b)), Body: bytes.NewReader(b)})
-	})
+	}, retried)
 	return d, err
 }
 
-func finish(ctx context.Context, api API, up *upload) string {
+func finish(ctx context.Context, api API, up *upload, retried func(error)) string {
 	if up.failed != nil {
 		return status(up.failed)
 	}
 	_, _, err := retry(ctx, func() (transfer.Result, error) {
 		return api.Complete(ctx, up.c.UploadID, transfer.Composite(up.hashes))
-	})
+	}, retried)
 	if err != nil {
 		return status(err)
 	}
@@ -211,8 +223,9 @@ func finish(ctx context.Context, api API, up *upload) string {
 }
 
 // retry repeats a call the server refused for being busy, with growing
-// pauses, and returns how long its last try took.
-func retry[T any](ctx context.Context, call func() (T, error)) (T, time.Duration, error) {
+// pauses, telling retried of each refusal, and returns how long its last
+// try took.
+func retry[T any](ctx context.Context, call func() (T, error), retried func(error)) (T, time.Duration, error) {
 	wait := 5 * time.Millisecond
 	for {
 		start := time.Now()
@@ -226,6 +239,7 @@ func retry[T any](ctx context.Context, call func() (T, error)) (T, time.Duration
 			return v, took, err
 		case <-time.After(wait):
 		}
+		retried(err)
 		wait = min(2*wait, time.Second)
 	}
 }
@@ -259,7 +273,12 @@ var statuses = []struct {
 // status is the HTTP status the server answers err with.
 func status(err error) string {
 	var te *transfer.Error
+	var rf *Refused
 	switch {
+	case errors.As(err, &rf):
+		return strconv.Itoa(rf.Status)
+	case errors.Is(err, ErrNoAnswer):
+		return "000"
 	case events.IsUnrecorded(err):
 		return "500"
 	case errors.As(err, &te):
@@ -305,8 +324,9 @@ func (r Result) Percentile(p float64) time.Duration {
 const Header = "commit,dirty,scenario,size_bytes,files,concurrency,rep,seconds,mib_per_s,durable_upper_seconds,server_cpu_s,http_code,transport"
 
 // Row is one line of that CSV. A completion answers only once the file is
-// on disk, so the durable time is the time itself; the server's CPU time
-// can't be told apart from the client's in one process and is left empty.
+// on disk, so the durable time is the time itself. The server's CPU time
+// isn't measured, and is left empty: in one process it can't be told apart
+// from the client's.
 func (r Result) Row(commit string, dirty bool, scenario string, size int64, concurrency, rep int, transport string) string {
 	secs := r.Duration.Seconds()
 	mibs := 0.0

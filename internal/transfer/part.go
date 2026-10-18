@@ -172,6 +172,7 @@ func (e *Engine) duplicate(ctx context.Context, s *session, req PartRequest, exp
 		return PartResult{}, s.stateErr()
 	}
 	s.retries++
+	e.counters.duplicates.Add(1)
 	s.seen(clientAddr(ctx))
 	return PartResult{Part: req.N, Size: expected, SHA256: req.SHA256, Received: s.nReceived, PartCount: s.rec.PartCount, Duplicate: true}, nil
 }
@@ -282,6 +283,8 @@ func (e *Engine) finishPart(ctx context.Context, s *session, req PartRequest, ex
 	s.keep(req.N, raw)
 	s.nReceived++
 	s.recvBytes += expected
+	e.counters.parts.Add(1)
+	e.counters.bytes.Add(expected)
 	s.lastPart = e.now()
 	if s.window != nil {
 		s.window.Consume(expected)

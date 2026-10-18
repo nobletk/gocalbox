@@ -215,6 +215,8 @@ type Engine struct {
 	active    int
 	drained   chan struct{}
 
+	counters counters
+
 	wake        chan struct{}
 	stop        chan struct{}
 	janitorDone chan struct{}
@@ -473,8 +475,10 @@ func (e *Engine) takeSession(user string) error {
 	defer e.mu.Unlock()
 	switch {
 	case e.open[user] >= e.lim.MaxSessions:
+		e.counters.tooManyUploads.Add(1)
 		return ErrTooManyUploads
 	case e.openTotal >= e.lim.MaxSessionsTotal:
+		e.counters.busy.Add(1)
 		return ErrBusy
 	}
 	e.open[user]++
@@ -510,11 +514,13 @@ func (e *Engine) admit(user string) (release func(), err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.userParts[user] >= e.lim.MaxInflightUser {
+		e.counters.tooManyRequests.Add(1)
 		return nil, ErrTooManyRequests
 	}
 	select {
 	case e.inflight <- struct{}{}:
 	default:
+		e.counters.busy.Add(1)
 		return nil, ErrBusy
 	}
 	e.userParts[user]++

@@ -150,6 +150,7 @@ func (e *Engine) finish(ctx context.Context, s *session, composite string) (Resu
 
 	// The file is placed: from here on the upload is done, whatever fails.
 	res := Result{Path: final, Name: path.Base(final), Size: s.rec.Size, CompositeSHA256: composite}
+	e.counters.completed.Add(1)
 	s.mu.Lock()
 	// A line with no room is written later, before recorded; one lost
 	// otherwise leaves the next start to tell from finishing.

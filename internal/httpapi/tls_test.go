@@ -79,7 +79,7 @@ func newTLSEnv(t *testing.T, opts Options, sniffTimeout time.Duration) *tlsEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &tlsEnv{addr: ln.Addr().String(), srv: &http.Server{Handler: handler}, done: make(chan error, 1), pool: pool, rec: rec, root: sb.Root()}
+	e := &tlsEnv{addr: ln.Addr().String(), srv: NewServer(handler), done: make(chan error, 1), pool: pool, rec: rec, root: sb.Root()}
 	go func() { e.done <- e.srv.Serve(SplitTLS(ln, cfg, sniffTimeout)) }()
 	t.Cleanup(func() { e.srv.Close() })
 	return e

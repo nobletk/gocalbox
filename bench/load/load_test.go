@@ -69,18 +69,21 @@ func TestCodeColumn(t *testing.T) {
 func TestRetryWaitsOutBusyAnswers(t *testing.T) {
 	for _, busy := range []error{transfer.ErrBusy, transfer.ErrTooManyRequests, transfer.ErrPartInProgress} {
 		calls := 0
+		var told []error
 		v, _, err := retry(context.Background(), func() (int, error) {
 			if calls++; calls < 3 {
 				return 0, busy
 			}
 			return 7, nil
-		})
-		if v != 7 || err != nil || calls != 3 {
-			t.Errorf("%v: %d, %v after %d calls", busy, v, err, calls)
+		}, func(err error) { told = append(told, err) })
+		if v != 7 || err != nil || calls != 3 || len(told) != 2 || told[0] != busy || told[1] != busy {
+			t.Errorf("%v: %d, %v after %d calls, retries told %v", busy, v, err, calls, told)
 		}
 	}
 	calls := 0
-	if _, _, err := retry(context.Background(), func() (int, error) { calls++; return 0, transfer.ErrChecksumMismatch }); err == nil || calls != 1 {
+	if _, _, err := retry(context.Background(), func() (int, error) { calls++; return 0, transfer.ErrChecksumMismatch }, func(err error) {
+		t.Errorf("a refusal was told as retried: %v", err)
+	}); err == nil || calls != 1 {
 		t.Errorf("a refusal was retried: %v, %d calls", err, calls)
 	}
 }

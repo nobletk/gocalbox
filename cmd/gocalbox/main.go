@@ -176,13 +176,7 @@ func run() error {
 	target := a.linkTarget(*host, boundPort)
 	a.target.Store(&target)
 
-	srv := &http.Server{
-		Handler: a.Handler,
-		// No read or write timeout: they would cut off long uploads and media
-		// streams. Stalled request bodies are limited per request (-body-timeout).
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-	}
+	srv := httpapi.NewServer(a.Handler)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
