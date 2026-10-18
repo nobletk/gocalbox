@@ -169,7 +169,7 @@ const (
 	connWindow    = 4<<20 - 1
 )
 
-func newH2Env(t *testing.T) *h2Env {
+func newH2Env(t *testing.T, bodyTimeout time.Duration) *h2Env {
 	t.Helper()
 	root := t.TempDir()
 	sb, err := sandbox.New(root)
@@ -181,7 +181,7 @@ func newH2Env(t *testing.T) *h2Env {
 	files := stallingFiles{FileService: adminFiles(sb, &recorder{}), release: e.release, entered: e.entered}
 	h := newTestHandler(files, fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}, Options{
 		Uploads:      &stallingUploads{release: e.release, entered: e.entered},
-		BodyTimeout:  h2BodyTimeout,
+		BodyTimeout:  bodyTimeout,
 		AllowedHosts: []string{"127.0.0.1"},
 	})
 	srv := NewServer(h)
@@ -320,7 +320,10 @@ func (e *h2Env) waitStalled(n int, done func(streams, total int) bool) {
 }
 
 func TestFifteenStalledBodiesHoldUpNoOtherRequest(t *testing.T) {
-	e := newH2Env(t)
+	// The probes' bodies have the same timeout, and must never reach it
+	// however long a busy machine takes to create their files.
+	const bodyTimeout = time.Second
+	e := newH2Env(t, bodyTimeout)
 	body := bytes.Repeat([]byte("x"), 1<<20)
 	e.open()
 	for i := range 8 {
@@ -330,7 +333,9 @@ func TestFifteenStalledBodiesHoldUpNoOtherRequest(t *testing.T) {
 		e.send(e.uploadRequest(fmt.Sprintf("stall%d.bin", i), body))
 	}
 	e.waitStalled(15, func(streams, _ int) bool { return streams >= 15 })
-	time.Sleep(2 * h2BodyTimeout)
+	// Past the stalled bodies' timeouts: their handlers, blocked, still
+	// hold what they received.
+	time.Sleep(bodyTimeout + 100*time.Millisecond)
 
 	if code, took := e.within(5*time.Second, e.mkdirRequest("probe")); code != http.StatusCreated {
 		t.Errorf("a small POST behind 15 stalled bodies = %d after %v", code, took)
@@ -350,7 +355,7 @@ func TestFifteenStalledBodiesHoldUpNoOtherRequest(t *testing.T) {
 }
 
 func TestSixteenStalledBodiesFillTheConnectionsWindow(t *testing.T) {
-	e := newH2Env(t)
+	e := newH2Env(t, h2BodyTimeout)
 	body := bytes.Repeat([]byte("x"), 1<<20)
 	e.open()
 	for i := range 16 {
