@@ -44,3 +44,19 @@ func TestAMoveToAWindowsDeviceNameIsAMoveElsewhere(t *testing.T) {
 	}
 	shown(t, errOf(a.svc.Move(as(alice), "public/a.txt", `public/a\b`)), ErrInvalidName, "a move to a name with a backslash")
 }
+
+// Elsewhere a path through such a name is a path like any other.
+func TestPathsThroughWindowsDeviceNamesWorkElsewhere(t *testing.T) {
+	a := newAccessEnv(t)
+	ok(t, errOf(a.svc.Mkdir(as(alice), "public", "a:b")), "a folder named a:b")
+	a.upload(alice, "public/a:b", "CON", "x")
+	if names := a.names(alice, "public/a:b"); strings.Join(names, ",") != "CON" {
+		t.Errorf("listing: %v", names)
+	}
+	f, err := a.svc.Open(as(alice), "public/a:b/CON")
+	ok(t, err, "a download of public/a:b/CON")
+	if f != nil {
+		f.Close()
+	}
+	ok(t, errOf(a.svc.Delete(as(alice), "public/a:b/CON")), "a delete of public/a:b/CON")
+}

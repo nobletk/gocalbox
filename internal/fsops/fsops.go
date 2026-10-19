@@ -950,19 +950,20 @@ func (s *Service) move(ctx context.Context, oldPath, newPath string) (from, to s
 }
 
 // invalidNewName reports whether the last element of a move's new path is a
-// name no file can have. On Windows a device name or a colon in it makes the
-// whole path one that leaves the root, so the name is then judged apart from
-// the folders before it.
+// name no file can have. On Windows a device name or a colon in it makes
+// sandbox.Clean refuse the whole path, as one the system can't hold or, for
+// a stream of the reserved name, as reserved, so the name is then judged
+// apart from the folders before it, as a new folder's name is.
 func invalidNewName(newPath string) bool {
 	clean, err := sandbox.Clean(newPath)
 	if err == nil {
 		return clean != "." && !ValidName(path.Base(clean))
 	}
-	if !errors.Is(err, sandbox.ErrTraversal) {
+	if !errors.Is(err, sandbox.ErrUnnamable) && !errors.Is(err, sandbox.ErrReserved) {
 		return false
 	}
 	dir, name := path.Split(path.Clean(strings.TrimLeft(newPath, "/"+string(filepath.Separator))))
-	if name == ".." || strings.ContainsRune(name, '\\') || filepath.IsLocal(name) {
+	if filepath.IsLocal(name) {
 		return false
 	}
 	_, err = sandbox.Clean(dir)

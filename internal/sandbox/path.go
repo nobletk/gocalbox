@@ -19,6 +19,10 @@ var (
 	ErrBrokenLink  = errors.New("path goes through a broken symlink")
 	ErrInvalidPath = errors.New("invalid path")
 	ErrReserved    = errors.New("reserved path")
+	// ErrUnnamable marks a client path that stays in the root but names what
+	// the system can't hold: on Windows a device, such as NUL, or a name with
+	// a colon.
+	ErrUnnamable = fmt.Errorf("%w: a name in it can't be held here", ErrInvalidPath)
 )
 
 // ReservedName is the server's own folder, at the root for the upload engine
@@ -28,10 +32,17 @@ const ReservedName = ".gocalbox"
 // IsReserved reports whether a volume may take name for ReservedName: in
 // any letter case; with trailing dots and spaces, which Windows drops (FAT
 // and exFAT drop the dots on Linux too); and as the 8.3 short name FAT and
-// Windows give it, which Linux finds as well. Short names a volume makes
-// after collisions, such as GO3F2A~1, can't be told from the name; changes
-// check the stored spelling of their folders for those.
+// Windows give it, which Linux finds as well; and on Windows with a stream
+// after a colon, since on NTFS .gocalbox::$INDEX_ALLOCATION is the folder
+// itself. Short names a volume makes after collisions, such as GO3F2A~1,
+// can't be told from the name; changes check the stored spelling of their
+// folders for those.
 func IsReserved(name string) bool {
+	if filepath.Separator == '\\' {
+		if i := strings.IndexByte(name, ':'); i >= 0 {
+			name = name[:i]
+		}
+	}
 	name = strings.TrimRight(name, ". ")
 	if strings.EqualFold(name, ReservedName) {
 		return true
@@ -200,7 +211,13 @@ func cleanRel(userPath string) (string, error) {
 	trimmed := strings.TrimLeft(userPath, "/"+string(filepath.Separator))
 	rel := filepath.Clean(filepath.FromSlash(trimmed))
 	if rel != "." && !filepath.IsLocal(rel) {
-		return "", ErrTraversal
+		if leavesRoot(userPath, trimmed) {
+			return "", ErrTraversal
+		}
+		if HasReserved(rel) {
+			return "", ErrReserved
+		}
+		return "", ErrUnnamable
 	}
 	// Client paths are separated by "/" only, on every system.
 	if filepath.Separator == '\\' && strings.ContainsRune(userPath, '\\') {
@@ -210,6 +227,35 @@ func cleanRel(userPath string) (string, error) {
 		return "", ErrReserved
 	}
 	return rel, nil
+}
+
+// leavesRoot reports whether a client path that filepath.IsLocal refuses
+// leaves the root: through "..", or as an absolute path of Windows, which
+// starts with a drive and a separator, or with a share or device prefix such
+// as \\server\share or \\?\. Otherwise it is refused only for a name the
+// system can't hold; a drive letter and a colon with no separator after them
+// are such a name. Leading separators are read as the root, so two slashes
+// before a name are no share: a share prefix counts only with a backslash in
+// its first two characters, or as a device prefix in either slash. trimmed is
+// userPath without its leading separators.
+func leavesRoot(userPath, trimmed string) bool {
+	if len(filepath.VolumeName(userPath)) > 2 {
+		switch strings.ReplaceAll(userPath[:min(4, len(userPath))], "/", `\`) {
+		case `\\?\`, `\\.\`, `\??\`:
+			return true
+		}
+		if userPath[0] == '\\' || userPath[1] == '\\' {
+			return true
+		}
+	}
+	if v := filepath.VolumeName(trimmed); v != "" && len(trimmed) > len(v) && os.IsPathSeparator(trimmed[len(v)]) {
+		return true
+	}
+	if filepath.Separator == '\\' {
+		trimmed = strings.ReplaceAll(trimmed, `\`, "/")
+	}
+	c := path.Clean(trimmed)
+	return c == ".." || strings.HasPrefix(c, "../")
 }
 
 func isLoop(err error) bool {

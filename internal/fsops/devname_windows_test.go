@@ -38,22 +38,56 @@ func TestDeviceAndStreamNamesAreInvalid(t *testing.T) {
 	}
 }
 
-// A move's new name is judged apart from the folders before it: a device
-// name or a colon makes the whole path one that leaves the root. A path that
-// leaves the root through its folders stays one.
+// A move's new name is judged apart from the folders before it, though a
+// device name or a colon in it makes the whole path one Windows can't hold,
+// and a stream of the reserved name makes it reserved: as a new folder's
+// name, it is an invalid name.
+// A folder that is such a name makes an invalid path. A path that leaves the
+// root through "..", or is an absolute path of Windows, still leaves it.
 func TestAMoveToADeviceOrStreamNameIsAnInvalidName(t *testing.T) {
 	a := newAccessEnv(t)
 	a.upload(alice, "public", "a.txt", "a")
-	for _, to := range []string{"CON", "public/CON", "/public/nul", "public/sub/COM1/", "public/b/../CONIN$", "public/x.txt:hidden", "public/C:x", "a:b", "C:", "C:x", "/C:"} {
+	for _, to := range []string{"CON", "public/CON", "/public/nul", "public/sub/COM1/", "public/b/../CONIN$", "public/x.txt:hidden",
+		"public/C:x", "a:b", "C:", "C:x", "/C:", `public\CON`, ".gocalbox:x", "public/.gocalbox::$DATA", "GOCALB~1:x"} {
 		shown(t, errOf(a.svc.Move(as(alice), "public/a.txt", to)), ErrInvalidName, "a move to "+to)
 	}
-	for _, to := range []string{"..", "../", "/..", "public/../..", "../CON", "/../CON", "public/../../nul", "C:/x", "C:/CON", "C:/../x", `public\CON`} {
+	for _, to := range []string{"public/.gocalbox", ".gocalbox::$INDEX_ALLOCATION/tmp", ".gocalbox/CON", ".gocalbox:x/CON"} {
+		shown(t, errOf(a.svc.Move(as(alice), "public/a.txt", to)), sandbox.ErrReserved, "a move to "+to)
+	}
+	for _, to := range []string{"a:x/..", "CON/x", "public/CON/x", "public/a:b/x", "public/a:\x00"} {
+		shown(t, errOf(a.svc.Move(as(alice), "public/a.txt", to)), sandbox.ErrInvalidPath, "a move to "+to)
+	}
+	for _, to := range []string{"..", "../", "/..", "public/../..", "../CON", "/../CON", "public/../../nul",
+		"C:/", "C:/x", "C:/CON", "C:/../x", "C:/../CON", `C:\x`} {
 		shown(t, errOf(a.svc.Move(as(alice), "public/a.txt", to)), sandbox.ErrTraversal, "a move to "+to)
 	}
-	shown(t, errOf(a.svc.Move(as(alice), "public/a.txt", "a:x/..")), sandbox.ErrTraversal, "a move to a:x/..")
-	shown(t, errOf(a.svc.Move(as(alice), "public/a.txt", "public/a:\x00")), sandbox.ErrInvalidPath, "a move to a name with a NUL")
 	if a.read("public/a.txt") != "a" {
 		t.Errorf("the file moved: %q", a.read("public/a.txt"))
+	}
+}
+
+// A path through a name Windows can't hold is an invalid path wherever it is
+// read or written, decided before anything is resolved, so that it tells
+// nothing about the folders on the way. An absolute path of Windows leaves
+// the root, and the reserved folder stays reserved.
+func TestAPathThroughADeviceNameIsAnInvalidPath(t *testing.T) {
+	a := newAccessEnv(t)
+	a.upload(alice, "public", "a.txt", "a")
+	for _, p := range []string{"CON", "public/CON", "a:b", "public/a:b/c", "public/x.txt:hidden", "users/bob/CON"} {
+		shown(t, errOf(a.svc.List(as(alice), p)), sandbox.ErrInvalidPath, "a listing of "+p)
+		shown(t, errOf(a.svc.Open(as(alice), p)), sandbox.ErrInvalidPath, "a download of "+p)
+		shown(t, errOf(a.svc.Delete(as(alice), p)), sandbox.ErrInvalidPath, "a delete of "+p)
+		shown(t, errOf(a.svc.Move(as(alice), p, "public/b.txt")), sandbox.ErrInvalidPath, "a move from "+p)
+		shown(t, errOf3(a.svc.Create(as(alice), p, "x.txt", untouched{t}, -1)), sandbox.ErrInvalidPath, "an upload into "+p)
+		shown(t, errOf(a.svc.Mkdir(as(alice), p, "x")), sandbox.ErrInvalidPath, "a folder made in "+p)
+		shown(t, errOf3(a.svc.PrepareUpload(as(alice), p, "x.txt")), sandbox.ErrInvalidPath, "a resumable upload into "+p)
+	}
+	for _, p := range []string{"C:/Windows/win.ini", `C:\Windows`, `\\server\share\CON`, "../CON"} {
+		shown(t, errOf(a.svc.Open(as(alice), p)), sandbox.ErrTraversal, "a download of "+p)
+	}
+	shown(t, errOf(a.svc.Open(as(admin), ".gocalbox/CON")), sandbox.ErrReserved, "a download from the reserved folder")
+	if names := a.names(alice, "public"); strings.Join(names, ",") != "a.txt" {
+		t.Errorf("listing: %v", names)
 	}
 }
 

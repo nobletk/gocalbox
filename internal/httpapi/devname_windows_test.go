@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -34,8 +35,22 @@ func TestADeviceNameIsAnInvalidName(t *testing.T) {
 			t.Errorf("a.txt renamed %q = %d %s", name, code, body)
 		}
 	}
+	for _, p := range []string{"CON", "x/CON", "a:b", "C:"} {
+		if code, _, body := e.list(p); code != 400 || errorCode(body) != "invalid_path" {
+			t.Errorf("a listing of %q = %d %s", p, code, body)
+		}
+		if code, body := e.do(http.MethodGet, "/files/"+p, nil, ""); code != 400 || errorCode(body) != "invalid_path" {
+			t.Errorf("a download of %q = %d %s", p, code, body)
+		}
+		if code, body := e.postJSON("/api/fs/delete", DeleteRequest{Path: p}); code != 400 || errorCode(body) != "invalid_path" {
+			t.Errorf("a delete of %q = %d %s", p, code, body)
+		}
+	}
 	if log := out.String(); strings.Contains(log, "SECURITY ALERT") {
 		t.Errorf("log: %q", log)
+	}
+	if code, body := e.do(http.MethodGet, "/files/C:/Windows/win.ini", nil, ""); code != 403 || errorCode(body) != "path_outside_root" {
+		t.Errorf("a download of C:/Windows/win.ini = %d %s", code, body)
 	}
 	if code, body := e.postJSON("/api/fs/move", MoveRequest{OldPath: "a.txt", NewPath: "../CON"}); code != 403 || errorCode(body) != "path_outside_root" {
 		t.Errorf("a.txt moved to ../CON = %d %s", code, body)

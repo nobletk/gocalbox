@@ -63,7 +63,8 @@ func TestCleanReadsNothing(t *testing.T) {
 			t.Errorf("Clean(%q) = %q, %v", in, got, err)
 		}
 	}
-	for in, want := range map[string]error{"../x": ErrTraversal, "a/../../x": ErrTraversal, "a\x00": ErrInvalidPath} {
+	for in, want := range map[string]error{"../x": ErrTraversal, "a/../../x": ErrTraversal, "a\x00": ErrInvalidPath,
+		"../.gocalbox": ErrTraversal, "a/../../.gocalbox/x": ErrTraversal} {
 		if _, err := Clean(in); !errors.Is(err, want) {
 			t.Errorf("Clean(%q) err = %v, want %v", in, err, want)
 		}
