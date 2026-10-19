@@ -38,6 +38,14 @@ var (
 	buildErr  error
 )
 
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if binPath != "" {
+		os.RemoveAll(filepath.Dir(binPath))
+	}
+	os.Exit(code)
+}
+
 func binary(t *testing.T) string {
 	t.Helper()
 	if testing.Short() {

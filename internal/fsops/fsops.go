@@ -926,7 +926,7 @@ func (s *Service) move(ctx context.Context, oldPath, newPath string) (from, to s
 	if _, err := sandbox.Clean(oldPath); err != nil {
 		return from, sandbox.Path{}, err
 	}
-	if clean, err := sandbox.Clean(newPath); err == nil && clean != "." && !ValidName(path.Base(clean)) {
+	if invalidNewName(newPath) {
 		return from, sandbox.Path{}, ErrInvalidName
 	}
 	if from, err = s.resolve(sub, oldPath, true, ErrNotFound); err != nil {
@@ -947,6 +947,26 @@ func (s *Service) move(ctx context.Context, oldPath, newPath string) (from, to s
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return from, to, s.moveLocked(ctx, from, to)
+}
+
+// invalidNewName reports whether the last element of a move's new path is a
+// name no file can have. On Windows a device name or a colon in it makes the
+// whole path one that leaves the root, so the name is then judged apart from
+// the folders before it.
+func invalidNewName(newPath string) bool {
+	clean, err := sandbox.Clean(newPath)
+	if err == nil {
+		return clean != "." && !ValidName(path.Base(clean))
+	}
+	if !errors.Is(err, sandbox.ErrTraversal) {
+		return false
+	}
+	dir, name := path.Split(path.Clean(strings.TrimLeft(newPath, "/"+string(filepath.Separator))))
+	if name == ".." || strings.ContainsRune(name, '\\') || filepath.IsLocal(name) {
+		return false
+	}
+	_, err = sandbox.Clean(dir)
+	return err == nil
 }
 
 // moveLocked decides and makes the move. The decisions come before the
