@@ -176,6 +176,7 @@ func TestStatusesAreTheServers(t *testing.T) {
 		{fsops.ErrMoveIntoSelf, "400"},
 		{fsops.ErrExists, "409"},
 		{fsops.ErrUploadMoved, "409"},
+		{fmt.Errorf("%w: unexpected EOF", fsops.ErrBodyAborted), "400"},
 		{fsops.ErrCrossDevice, "409"},
 		{fsops.ErrReadOnly, "403"},
 		{&fs.PathError{Op: "open", Path: "x", Err: fs.ErrPermission}, "403"},

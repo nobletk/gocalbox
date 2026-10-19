@@ -195,7 +195,9 @@ func TestAStalledSubscriberDoesntHoldPublishersUp(t *testing.T) {
 				stalled++
 			}
 		}
-		if b.Stats().Pending == 0 && b.Dropped("audit") == uint64(stalled) {
+		// The stalled handler holds one event and its buffer is full: every
+		// other event has had its Ack answered once it was dropped.
+		if stalled+b.Stats().Subscribers[0].Queued+1 == len(acks) && b.Dropped("audit") == uint64(stalled) {
 			break
 		}
 	}

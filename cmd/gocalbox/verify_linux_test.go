@@ -55,11 +55,29 @@ func opensOf(t *testing.T, path string, do func()) int {
 
 // A FIFO or a device isn't opened at all: opening one may act on it.
 func TestWhatIsntAFileIsNeverOpened(t *testing.T) {
-	fifo := filepath.Join(t.TempDir(), "fifo")
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo")
 	if err := unix.Mkfifo(fifo, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{fifo, os.DevNull} {
+	paths := []string{fifo}
+	// A node of its own for the null device: other processes open
+	// /dev/null all the time, and the watch would count them too.
+	null := filepath.Join(dir, "null")
+	// On a nodev mount the node can't be opened, so opening it by mistake
+	// would go unseen.
+	err := unix.Mknod(null, unix.S_IFCHR|0o666, int(unix.Mkdev(1, 3)))
+	if err == nil {
+		var f *os.File
+		if f, err = os.Open(null); err == nil {
+			f.Close()
+			paths = append(paths, null)
+		}
+	}
+	if err != nil {
+		t.Logf("no device node of its own, so no device is tried: %v", err)
+	}
+	for _, path := range paths {
 		var err error
 		if n := opensOf(t, path, func() { err = verifyUpload(path, 8<<20, emptyComposite) }); n != 0 || err == nil {
 			t.Errorf("%s: opened %d times; %v", path, n, err)

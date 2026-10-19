@@ -33,10 +33,17 @@ var tempName = regexp.MustCompile(`^[ns]-[0-9a-f]{32}$`)
 
 // TempName returns a new name for a short-lived file or folder in TmpDir,
 // one that start-up removes if a crash leaves it behind.
-func TempName() string {
+func TempName() string { return randomName("n-") }
+
+// StagedName returns a new name in TmpDir for the file of a single-request
+// upload while its body arrives, one that start-up removes if a crash
+// leaves it behind.
+func StagedName() string { return randomName("s-") }
+
+func randomName(prefix string) string {
 	var b [16]byte
 	rand.Read(b[:])
-	return "n-" + hex.EncodeToString(b[:])
+	return prefix + hex.EncodeToString(b[:])
 }
 
 // Staging is ReservedName at the root as start-up found it.

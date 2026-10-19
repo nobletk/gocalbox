@@ -39,6 +39,9 @@ var (
 	ErrPreconditionFailed = errors.New("precondition failed")
 	ErrAborted            = errors.New("transfer aborted")
 	ErrUploadMoved        = errors.New("the file was moved or deleted while it was uploaded")
+	// ErrBodyAborted marks an error reading an upload's body that is the
+	// client's: the body broke off or stalled before its end.
+	ErrBodyAborted = errors.New("the request's body broke off or stalled")
 
 	ErrInsufficientStorage = space.ErrInsufficient
 	ErrCrossDevice         = errors.New("source and destination are on different file systems")
@@ -134,7 +137,10 @@ func ValidName(name string) bool {
 			return false
 		}
 	}
-	return true
+	// On Windows, a name the system reads as a device, such as NUL or COM1,
+	// or one with a colon, which names a stream of a file, can't be a name
+	// in the folder.
+	return filepath.IsLocal(name)
 }
 
 func (s *Service) List(ctx context.Context, dir string) ([]Entry, error) {
@@ -418,41 +424,168 @@ func (s *Service) uploadFolder(ctx context.Context, p sandbox.Path) (Subject, st
 }
 
 func (s *Service) create(ctx context.Context, dir, name string, r io.Reader, sizeHint int64) (string, int64, error) {
-	if err := s.allow(); err != nil {
-		return "", 0, err
-	}
-	sub, ok := s.subject(ctx)
-	if !ok {
-		return "", 0, hide(ErrParentNotFound)
-	}
-	if _, err := sandbox.Clean(dir); err != nil {
-		return "", 0, err
-	}
-	if !ValidName(name) {
-		return "", 0, ErrInvalidName
-	}
-	if sandbox.IsReserved(name) {
-		return "", 0, sandbox.ErrReserved
-	}
-	p, err := s.resolve(sub, dir, false, ErrParentNotFound)
+	p, err := s.checkUpload(ctx, dir, name)
 	if err != nil {
 		return "", 0, err
 	}
+	if s.trash && s.onStagingVolume(p.Native()) {
+		return s.createStaged(ctx, p, dir, name, r, sizeHint)
+	}
+	return s.createDirect(ctx, p, name, r, sizeHint)
+}
+
+// checkUpload checks the request of an upload of name into dir and decides
+// it, returning the folder.
+func (s *Service) checkUpload(ctx context.Context, dir, name string) (sandbox.Path, error) {
+	if err := s.allow(); err != nil {
+		return sandbox.Path{}, err
+	}
+	sub, ok := s.subject(ctx)
+	if !ok {
+		return sandbox.Path{}, hide(ErrParentNotFound)
+	}
+	if _, err := sandbox.Clean(dir); err != nil {
+		return sandbox.Path{}, err
+	}
+	if !ValidName(name) {
+		return sandbox.Path{}, ErrInvalidName
+	}
+	if sandbox.IsReserved(name) {
+		return sandbox.Path{}, sandbox.ErrReserved
+	}
+	p, err := s.resolve(sub, dir, false, ErrParentNotFound)
+	if err != nil {
+		return p, err
+	}
 	// Decided before the space is reserved, and again under mu with the file.
 	if _, err := s.mayUpload(ctx, p); err != nil {
-		return "", 0, err
+		return p, err
 	}
 	if !s.isDir(p.Native()) {
-		return "", 0, ErrParentNotFound
+		return p, ErrParentNotFound
+	}
+	return p, nil
+}
+
+// reserve holds room for an upload of at most sizeHint bytes into the folder
+// p, if its free space is measured; the reservation may be nil.
+func (s *Service) reserve(p sandbox.Path, sizeHint int64) (*space.Reservation, error) {
+	if s.space == nil || !s.onServedVolume(p.Native()) {
+		return nil, nil
+	}
+	return s.space.Reserve(sizeHint)
+}
+
+var syncStaged = (*os.File).Sync
+
+func release(res *space.Reservation) {
+	if res != nil {
+		res.Release()
+	}
+}
+
+// writeErr names a failure of copying an upload's body to its file as the
+// disk's, unless it is marked as the body's.
+func writeErr(err error) error {
+	if errors.Is(err, ErrBodyAborted) {
+		return err
+	}
+	return fmt.Errorf("write file: %w", err)
+}
+
+// createStaged writes the body to a file of its own in the staging folder,
+// and places it in the folder with Adopt once the body has arrived whole and
+// is on the disk. The name is chosen then, so another file may take it
+// meanwhile. If the folder has moved to another file system, the file is
+// copied there instead, as an upload into such a folder is written.
+func (s *Service) createStaged(ctx context.Context, p sandbox.Path, dir, name string, r io.Reader, sizeHint int64) (string, int64, error) {
+	if err := writable(s.root, p.Native()); err != nil {
+		return "", 0, fmt.Errorf("check the folder: %w", err)
+	}
+	if err := s.root.MkdirAll(filepath.FromSlash(sandbox.TmpDir), 0o700); err != nil {
+		return "", 0, fmt.Errorf("create %s: %w", sandbox.TmpDir, err)
+	}
+	if err := s.testName(name); err != nil {
+		return "", 0, err
 	}
 
-	var res *space.Reservation
-	if s.space != nil && s.onServedVolume(p.Native()) {
-		if res, err = s.space.Reserve(sizeHint); err != nil {
-			return "", 0, err
-		}
-		defer res.Release()
+	staged := path.Join(sandbox.TmpDir, sandbox.StagedName())
+	f, err := s.root.OpenFile(filepath.FromSlash(staged), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return "", 0, fmt.Errorf("stage the upload: %w", err)
 	}
+	defer s.unstage(staged)
+	if in, err := inheritedFrom(s.root, p.Native()); err == nil && !in.allowed(f) {
+		// The file couldn't be given the folder's group once placed.
+		f.Close()
+		s.unstage(staged)
+		return s.createDirect(ctx, p, name, r, sizeHint)
+	}
+	res, err := s.reserve(p, sizeHint)
+	if err != nil {
+		f.Close()
+		return "", 0, err
+	}
+	defer release(res)
+	var w io.Writer = f
+	if res != nil {
+		w = res.Writer(f)
+	}
+	size, err := io.Copy(w, r)
+	if err == nil {
+		err = syncStaged(f)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return "", size, writeErr(err)
+	}
+
+	rel, _, err := s.adopt(ctx, staged, dir, name, nil)
+	if errors.Is(osErr(err), ErrCrossDevice) {
+		release(res)
+		return s.copyStaged(ctx, staged, dir, name, size)
+	}
+	if err != nil {
+		return "", size, err
+	}
+	return rel, size, nil
+}
+
+// copyStaged writes the staged file of an upload into dir as an upload into
+// a folder on another file system is written. The size reported is the
+// body's, which arrived whole.
+func (s *Service) copyStaged(ctx context.Context, staged, dir, name string, size int64) (string, int64, error) {
+	f, err := s.root.Open(filepath.FromSlash(staged))
+	if err != nil {
+		return "", size, fmt.Errorf("open the staged upload: %w", err)
+	}
+	defer f.Close()
+	p, err := s.checkUpload(ctx, dir, name)
+	if err != nil {
+		return "", size, err
+	}
+	stored, _, err := s.createDirect(ctx, p, name, f, size)
+	return stored, size, err
+}
+
+// unstage removes a staged upload's name. One left behind is removed by the
+// next start.
+func (s *Service) unstage(staged string) {
+	if err := s.root.Remove(filepath.FromSlash(staged)); err != nil && !notExist(err) {
+		log.Printf("Cannot remove the staged upload %s: %v", staged, err)
+	}
+}
+
+// createDirect writes the body to its file in the folder from the start,
+// as for a folder that staged files can't be placed in.
+func (s *Service) createDirect(ctx context.Context, p sandbox.Path, name string, r io.Reader, sizeHint int64) (string, int64, error) {
+	res, err := s.reserve(p, sizeHint)
+	if err != nil {
+		return "", 0, err
+	}
+	defer release(res)
 
 	s.mu.Lock()
 	up, err := s.createRecorded(ctx, p, name)
@@ -474,7 +607,7 @@ func (s *Service) create(ctx context.Context, dir, name string, r io.Reader, siz
 	}
 	switch {
 	case err != nil:
-		err = fmt.Errorf("write file: %w", err)
+		err = writeErr(err)
 	case !here:
 		err = ErrUploadMoved
 	default:

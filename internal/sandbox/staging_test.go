@@ -203,3 +203,10 @@ func TestTempName(t *testing.T) {
 		t.Errorf("TempName gave %q and %q", a, b)
 	}
 }
+
+func TestStagedName(t *testing.T) {
+	a, b := StagedName(), StagedName()
+	if a == b || !tempName.MatchString(a) || !strings.HasPrefix(a, "s-") {
+		t.Errorf("StagedName gave %q and %q", a, b)
+	}
+}

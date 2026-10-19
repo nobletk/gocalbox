@@ -112,6 +112,9 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeErrorJSON(w, r, http.StatusConflict, "already_exists", "Already exists")
 	case errors.Is(err, fsops.ErrUploadMoved):
 		writeErrorJSON(w, r, http.StatusConflict, "upload_moved", "The file was moved or deleted while it was uploaded")
+	case errors.Is(err, fsops.ErrBodyAborted):
+		log.Printf("Upload aborted: %v", err)
+		writeErrorJSON(w, r, http.StatusBadRequest, "upload_aborted", "The upload's body broke off or stalled; nothing was stored")
 	case errors.Is(err, fsops.ErrCrossDevice):
 		writeErrorJSON(w, r, http.StatusConflict, "cross_device", "Source and destination are on different file systems")
 	case errors.Is(err, fsops.ErrInsufficientStorage):

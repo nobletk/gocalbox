@@ -214,6 +214,7 @@ func TestAChangeAsksAgainOnceItHoldsTheLock(t *testing.T) {
 	e.write("b.txt", "B")
 	a := &pausesAfter{fakeAuditor: fakeAuditor{t: t}, n: 1}
 	e.svc = asAdmin(New(e.sb, &recorder{}, WithAudit(a)))
+	directUploads(e.svc)
 	a.svc = e.svc
 
 	for name, op := range map[string]func() error{

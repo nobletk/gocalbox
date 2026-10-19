@@ -2,12 +2,14 @@ package httpapi
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"path"
 
 	"github.com/nobletk/gocalbox/internal/events"
+	"github.com/nobletk/gocalbox/internal/fsops"
 )
 
 func (a *api) handleListFiles(w http.ResponseWriter, r *http.Request) {
@@ -69,7 +71,7 @@ func (a *api) handleUpload(w http.ResponseWriter, r *http.Request) {
 		if a.maxUpload > 0 && sizeHint > a.maxUpload {
 			sizeHint = a.maxUpload
 		}
-		stored, size, err := a.files.Create(r.Context(), r.URL.Query().Get("path"), part.FileName(), part, sizeHint)
+		stored, size, err := a.files.Create(r.Context(), r.URL.Query().Get("path"), part.FileName(), uploadBody{part}, sizeHint)
 		if err != nil && !events.IsUnrecorded(err) {
 			writeError(w, r, err)
 			return
@@ -127,4 +129,18 @@ func (a *api) handleCreateFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reply(w, r, http.StatusCreated, PathResponse{Path: created}, err)
+}
+
+// uploadBody marks the errors of reading an upload's body as the client's:
+// the body broke off or stalled. A body over the size limit keeps its own
+// error.
+type uploadBody struct{ r io.Reader }
+
+func (b uploadBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	var tooBig *http.MaxBytesError
+	if err != nil && err != io.EOF && !errors.As(err, &tooBig) {
+		err = fmt.Errorf("%w: %w", fsops.ErrBodyAborted, err)
+	}
+	return n, err
 }

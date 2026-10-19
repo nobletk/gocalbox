@@ -265,6 +265,7 @@ var statuses = []struct {
 	{fsops.ErrMoveIntoSelf, "400"},
 	{fsops.ErrExists, "409"},
 	{fsops.ErrUploadMoved, "409"},
+	{fsops.ErrBodyAborted, "400"},
 	{fsops.ErrCrossDevice, "409"},
 	{space.ErrInsufficient, "507"},
 	{fs.ErrPermission, "403"},

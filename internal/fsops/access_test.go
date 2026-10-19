@@ -493,6 +493,7 @@ func TestChangedFilesLoseTheirUploader(t *testing.T) {
 
 func TestAnUploadRecordsItsIdentityWhenItEnds(t *testing.T) {
 	a := newAccessEnv(t)
+	directUploads(a.svc)
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
@@ -520,6 +521,7 @@ func TestAnUploadRecordsItsIdentityWhenItEnds(t *testing.T) {
 
 func TestAnUploadMovedMeanwhileKeepsItsRecord(t *testing.T) {
 	a := newAccessEnv(t)
+	directUploads(a.svc)
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
@@ -805,6 +807,7 @@ func TestAFailedUploadSparesWhatTookItsName(t *testing.T) {
 	} {
 		t.Run(tc.what, func(t *testing.T) {
 			a := newAccessEnv(t)
+			directUploads(a.svc)
 			pr, pw := io.Pipe()
 			done := make(chan error, 1)
 			go func() {
@@ -834,6 +837,7 @@ func TestAFailedUploadSparesWhatTookItsName(t *testing.T) {
 
 func TestAFailedIdentityWriteFailsTheUpload(t *testing.T) {
 	a := newAccessEnv(t)
+	directUploads(a.svc)
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
@@ -1011,6 +1015,7 @@ func TestARoleChangedWhileAChangeWaitsCounts(t *testing.T) {
 
 func TestAFailedUploadSparesTheSameUsersNewerUpload(t *testing.T) {
 	a := newAccessEnv(t)
+	directUploads(a.svc)
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
@@ -1041,6 +1046,7 @@ func TestAFailedUploadSparesTheSameUsersNewerUpload(t *testing.T) {
 
 func TestAnUploadEndingAfterItsPlaceChangedRemovesOnlyItsOwnRecord(t *testing.T) {
 	a := newAccessEnv(t)
+	directUploads(a.svc)
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {

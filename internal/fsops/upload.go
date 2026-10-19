@@ -149,6 +149,8 @@ func (s *Service) MayUpload(ctx context.Context, folder string) error {
 // Before placing the file, Adopt passes the path it chose to intent, with
 // no lock held, and places it only if intent succeeds; if the name is taken
 // or the folder moves meanwhile, it chooses again, a few times at most.
+// Without intent, the name is chosen and the file placed under one hold of
+// the lock, so that no other upload of this process takes the name between.
 // It returns the path and the file.uploaded event, which the caller
 // publishes. An error means that nothing was placed.
 func (s *Service) Adopt(ctx context.Context, staged, dir, name string, intent func(path string) error) (string, events.Event, error) {
@@ -177,18 +179,31 @@ func (s *Service) adopt(ctx context.Context, staged, dir, name string, intent fu
 		return "", 0, sandbox.ErrReserved
 	}
 	for range adoptRounds {
-		var folder, candidate string
-		err := s.locked(func() (err error) { folder, candidate, err = s.chooseName(ctx, dir, name); return err })
-		if err != nil {
-			return "", 0, err
-		}
-		rel := path.Join(folder, candidate)
-		if err := intent(rel); err != nil {
-			return "", 0, fmt.Errorf("log the chosen name: %w", err)
-		}
+		var folder, rel string
 		var size int64
 		var again bool
-		err = s.locked(func() (err error) { size, again, err = s.place(ctx, staged, dir, folder, rel); return err })
+		choose := func() error {
+			var candidate string
+			var err error
+			folder, candidate, err = s.chooseName(ctx, dir, name)
+			rel = path.Join(folder, candidate)
+			return err
+		}
+		place := func() (err error) { size, again, err = s.place(ctx, staged, dir, folder, rel); return err }
+		var err error
+		if intent == nil {
+			err = s.locked(func() error {
+				if err := choose(); err != nil {
+					return err
+				}
+				return place()
+			})
+		} else if err = s.locked(choose); err == nil {
+			if err = intent(rel); err != nil {
+				return "", 0, fmt.Errorf("log the chosen name: %w", err)
+			}
+			err = s.locked(place)
+		}
 		if again {
 			continue
 		}
@@ -274,6 +289,9 @@ func (s *Service) place(ctx context.Context, staged, dir, folder, rel string) (s
 		return 0, true, nil
 	}
 	from, to := filepath.FromSlash(staged), filepath.FromSlash(rel)
+	if err := s.inherit(from, p.Native()); err != nil {
+		log.Printf("WARNING: the upload for %s keeps the group and permissions it got in the staging folder: %v", rel, err)
+	}
 	if s.links {
 		err = s.root.Link(from, to)
 		if errors.Is(err, fs.ErrExist) {
@@ -292,6 +310,9 @@ func (s *Service) place(ctx context.Context, staged, dir, folder, rel string) (s
 	}
 	if err != nil {
 		return 0, false, fmt.Errorf("place the upload: %w", err)
+	}
+	if err := s.reinherit(p.Native(), to); err != nil {
+		log.Printf("WARNING: the upload placed at %s keeps the permissions it got in the staging folder: %v", rel, err)
 	}
 
 	info, err := s.root.Lstat(to)
