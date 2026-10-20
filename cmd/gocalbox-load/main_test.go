@@ -11,37 +11,139 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"testing/iotest"
 
+	"github.com/nobletk/gocalbox/bench/lib"
 	"github.com/nobletk/gocalbox/bench/load"
 	"github.com/nobletk/gocalbox/internal/transfer"
 )
 
-func TestTheScratchFolderMustBeThisCommands(t *testing.T) {
-	dir := t.TempDir()
-	keep := filepath.Join(dir, "repo", "go.mod")
-	os.MkdirAll(filepath.Dir(keep), 0o755)
-	os.WriteFile(keep, nil, 0o644)
-	if err := emptyWork(filepath.Dir(keep)); err == nil {
-		t.Error("a folder of other files was accepted")
+// benchDir makes a benchmark folder as bench/init.sh does.
+func benchDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "bench")
+	os.Mkdir(dir, 0o755)
+	if err := os.WriteFile(filepath.Join(dir, lib.Mark), []byte("gocalbox-bench 0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(keep); err != nil {
-		t.Errorf("a refused folder lost its files: %v", err)
+	return dir
+}
+
+// In process, the engine works in the benchmark folder's subfolder load,
+// which is emptied before each repetition and deleted at the end; nothing
+// else in the folder is touched, and a folder without the marker is refused.
+func TestTheEngineWorksInTheBenchmarkFolder(t *testing.T) {
+	dir := benchDir(t)
+	keep := filepath.Join(dir, "server", "root", "keep.bin")
+	os.MkdirAll(filepath.Dir(keep), 0o755)
+	os.WriteFile(keep, []byte("mine"), 0o644)
+	left := filepath.Join(dir, "load", "root", "left.bin")
+	os.MkdirAll(filepath.Dir(left), 0o755)
+	os.WriteFile(left, nil, 0o644)
+	csv := filepath.Join(t.TempDir(), "out.csv")
+	t.Setenv("BENCH_DIR", dir)
+	if err := run([]string{"-csv", csv, "-size", "10", "-reps", "2", "-min-free-mb", "0"}, strings.NewReader(""), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if rows := readCSV(t, csv); len(rows) != 2 {
+		t.Errorf("rows %q", rows)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "load")); !os.IsNotExist(err) {
+		t.Errorf("the engine's folder after the run: %v", err)
+	}
+	if b, err := os.ReadFile(keep); err != nil || string(b) != "mine" {
+		t.Errorf("a file of the benchmark folder was touched: %q, %v", b, err)
 	}
 
-	work := filepath.Join(dir, "work")
-	if err := emptyWork(work); err != nil {
+	unmarked := t.TempDir()
+	os.WriteFile(filepath.Join(unmarked, "go.mod"), nil, 0o644)
+	for _, c := range []struct {
+		env  string
+		args []string
+		want string
+	}{
+		{"", nil, "no benchmark folder given"},
+		{unmarked, nil, "is not a benchmark folder"},
+		{dir, []string{"-bench-dir", unmarked}, "is not a benchmark folder"},
+		{dir, []string{"-bench-dir", "relative"}, "must be an absolute path"},
+		{dir, []string{"-work", dir}, "-work is replaced by -bench-dir"},
+	} {
+		t.Setenv("BENCH_DIR", c.env)
+		err := run(append(c.args, "-csv", csv, "-size", "10", "-reps", "1"), strings.NewReader(""), io.Discard)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("BENCH_DIR=%q %q: %v, want %q", c.env, c.args, err, c.want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(unmarked, "go.mod")); err != nil {
+		t.Errorf("a refused folder lost its files: %v", err)
+	}
+}
+
+// A file stopped halfway resumes in process, and the row says so.
+func TestTheCommandResumesInProcess(t *testing.T) {
+	csv := filepath.Join(t.TempDir(), "out.csv")
+	if err := run([]string{"-bench-dir", benchDir(t), "-csv", csv, "-size", "20M", "-files", "2", "-reps", "1", "-min-free-mb", "0", "-resume-at", "0.5", "-retry-for", "1m"}, strings.NewReader(""), io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(filepath.Join(work, "left"), nil, 0o644)
-	if err := emptyWork(work); err != nil {
-		t.Fatal(err)
+	rows := readCSV(t, csv)
+	header := strings.Split(load.Header, ",")
+	col := func(name string) string { return rows[0][slices.Index(header, name)] }
+	if len(rows) != 1 || col("scenario") != "engine_upload_1u_resume50" || col("http_code") != "201" || col("resumed") != "2" || col("client_cpu_s") != "" {
+		t.Errorf("rows %q", rows)
 	}
-	if _, err := os.Stat(filepath.Join(work, "left")); !os.IsNotExist(err) {
-		t.Errorf("the scratch folder wasn't emptied: %v", err)
+}
+
+// A CSV file with other columns isn't appended to.
+func TestACSVWithOtherColumnsIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	scripts := filepath.Join(dir, "scripts.csv")
+	os.WriteFile(scripts, []byte(load.ScriptColumns+"\nc,0,s,1,1,1,1,1,1,1,,201,https-h2\n"), 0o644)
+	_, err := openCSV(scripts)
+	if err == nil || !strings.Contains(err.Error(), "other columns") {
+		t.Errorf("a script's CSV: %v", err)
+	}
+	if b, _ := os.ReadFile(scripts); !strings.HasSuffix(string(b), "https-h2\n") {
+		t.Errorf("a refused CSV was written to: %q", b)
+	}
+	ours := filepath.Join(dir, "ours.csv")
+	for range 2 {
+		f, err := openCSV(ours)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintln(f, "row")
+		f.Close()
+	}
+	if b, _ := os.ReadFile(ours); string(b) != load.Header+"\nrow\nrow\n" {
+		t.Errorf("our CSV: %q", b)
+	}
+	empty := filepath.Join(dir, "empty.csv")
+	os.WriteFile(empty, nil, 0o644)
+	if f, err := openCSV(empty); err != nil {
+		t.Errorf("an empty file: %v", err)
+	} else {
+		f.Close()
+	}
+	if b, _ := os.ReadFile(empty); string(b) != load.Header+"\n" {
+		t.Errorf("an empty file got %q", b)
+	}
+	unended := filepath.Join(dir, "unended.csv")
+	os.WriteFile(unended, []byte(load.Header), 0o644)
+	if f, err := openCSV(unended); err != nil {
+		t.Errorf("a header without its line end: %v", err)
+	} else {
+		fmt.Fprintln(f, "row")
+		f.Close()
+	}
+	if b, _ := os.ReadFile(unended); string(b) != load.Header+"\nrow\n" {
+		t.Errorf("a header without its line end got %q", b)
+	}
+	if _, err := openCSV(filepath.Join(dir, "missing", "x.csv")); err == nil {
+		t.Error("a CSV in a missing folder")
 	}
 }
 
@@ -66,11 +168,11 @@ func TestEachModeTakesOnlyItsFlags(t *testing.T) {
 		want      string
 	}{
 		{nil, false, "https-h2", ""},
-		{[]string{"work", "audit-wait", "audit-parts", "min-free-mb", "users", "csv"}, false, "https-h2", ""},
-		{[]string{"url", "ca", "transport", "user-prefix", "users", "csv"}, true, "https-h1", ""},
+		{[]string{"bench-dir", "audit-wait", "audit-parts", "min-free-mb", "users", "csv", "resume-at", "retry-for"}, false, "https-h2", ""},
+		{[]string{"url", "ca", "transport", "user-prefix", "users", "csv", "resume-at", "retry-for"}, true, "https-h1", ""},
 		{[]string{"ca"}, false, "https-h2", "-ca: only for -url"},
 		{[]string{"transport", "user-prefix"}, false, "https-h1", "-transport, -user-prefix: only for -url"},
-		{[]string{"work"}, true, "https-h2", "-work: only for the in-process mode; set them on the server"},
+		{[]string{"bench-dir"}, true, "https-h2", "-bench-dir: only for the in-process mode; set them on the server"},
 		{[]string{"audit-wait", "audit-parts", "min-free-mb"}, true, "https-h2", "-audit-wait, -audit-parts, -min-free-mb: only for the in-process mode; set them on the server"},
 		{[]string{"transport"}, true, "h2", `-transport must be https-h2 or https-h1, not "h2"`},
 	} {
@@ -109,11 +211,11 @@ func TestUserNamesAndCounts(t *testing.T) {
 		t.Errorf("%d names for none", got)
 	}
 	for want, m := range map[string]map[string]int{
-		"none":        nil,
+		"":            nil,
 		"429x1 503x2": {"503": 2, "429": 1},
 		"409x3":       {"409": 3, "503": 0},
 	} {
-		if got := counts(m); got != want {
+		if got := load.Counts(m); got != want {
 			t.Errorf("%v: %q, want %q", m, got, want)
 		}
 	}
@@ -130,6 +232,7 @@ type fakeServer struct {
 	done   map[string]string // completed uploads and their paths
 
 	refuseDeletes bool
+	unavailable   int      // creates answered 503 unavailable, as by a server shutting down
 	users         []string // who logged in
 }
 
@@ -165,6 +268,12 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 		f.users = append(f.users, body["username"].(string))
 		http.SetCookie(w, &http.Cookie{Name: "s", Value: body["username"].(string), Path: "/"})
 	case "/api/upload/create":
+		if f.unavailable > 0 {
+			f.unavailable--
+			w.WriteHeader(503)
+			w.Write([]byte(`{"error":{"code":"unavailable"}}`))
+			return
+		}
 		id := fmt.Sprintf("%s/%s", body["dir"], body["name"])
 		w.WriteHeader(201)
 		json.NewEncoder(w).Encode(transfer.Created{UploadID: id, PartSize: 4, PartCount: transfer.PartCount(int64(body["size"].(float64)), 4)})
@@ -217,7 +326,7 @@ func TestTheCommandUploadsOverHTTPS(t *testing.T) {
 		f := newFakeServer(t)
 		csv := filepath.Join(t.TempDir(), "out.csv")
 		args := append([]string{"-url", f.srv.URL, "-ca", f.caFile, "-users", "2", "-files", "1", "-size", "10", "-reps", "2", "-csv", csv}, c.flags...)
-		if err := run(args, strings.NewReader("pw\n")); err != nil {
+		if err := run(args, strings.NewReader("pw\n"), io.Discard); err != nil {
 			t.Fatal(err)
 		}
 		rows := readCSV(t, csv)
@@ -250,18 +359,40 @@ func TestTheCommandUploadsOverHTTPS(t *testing.T) {
 	}
 }
 
+// -retry-for waits out a server shutting down; without it, the file ends.
+func TestTheCommandWaitsOutAServerShuttingDown(t *testing.T) {
+	f := newFakeServer(t)
+	header := strings.Split(load.Header, ",")
+	for _, c := range []struct {
+		args          []string
+		code, retried string
+	}{
+		{nil, "503x1", ""},
+		{[]string{"-retry-for", "30s"}, "201", "503x2"},
+	} {
+		f.mu.Lock()
+		f.unavailable = 2
+		f.mu.Unlock()
+		csv := filepath.Join(t.TempDir(), "out.csv")
+		args := append([]string{"-url", f.srv.URL, "-ca", f.caFile, "-csv", csv, "-size", "10", "-reps", "1"}, c.args...)
+		if err := run(args, strings.NewReader("pw\n"), io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		row := readCSV(t, csv)[0]
+		if code, retried := row[slices.Index(header, "http_code")], row[slices.Index(header, "retried")]; code != c.code || retried != c.retried {
+			t.Errorf("%v: code %s, retried %q; want %s, %q", c.args, code, retried, c.code, c.retried)
+		}
+	}
+}
+
 func TestTheCommandRunsTheEngineInProcess(t *testing.T) {
-	dir := t.TempDir()
-	csv, work := filepath.Join(dir, "out.csv"), filepath.Join(dir, "work")
-	if err := run([]string{"-work", work, "-csv", csv, "-size", "10", "-reps", "1", "-min-free-mb", "0", "-audit-parts", "-audit-wait=false"}, strings.NewReader("")); err != nil {
+	csv := filepath.Join(t.TempDir(), "out.csv")
+	if err := run([]string{"-bench-dir", benchDir(t), "-csv", csv, "-size", "10", "-reps", "1", "-min-free-mb", "0", "-audit-parts", "-audit-wait=false"}, strings.NewReader(""), io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	rows := readCSV(t, csv)
 	if len(rows) != 1 || rows[0][2] != "engine_upload_1u_audit_parts_no_wait" || rows[0][5] != "4" || rows[0][11] != "201" || rows[0][12] != "inprocess" {
 		t.Errorf("rows %q", rows)
-	}
-	if entries, err := os.ReadDir(work); err != nil || len(entries) != 1 || entries[0].Name() != workMark {
-		t.Errorf("the scratch folder after the run: %v, %v", entries, err)
 	}
 }
 
@@ -275,7 +406,12 @@ func TestTheCommandRefuses(t *testing.T) {
 		stdin string
 		want  string
 	}{
-		{append(remote, "-work", dir), "pw\n", "-work: only for the in-process mode"},
+		{append(remote, "-bench-dir", dir), "pw\n", "-bench-dir: only for the in-process mode"},
+		{append(remote, "-work", dir), "pw\n", "-work is replaced by -bench-dir"},
+		{append(remote, "-resume-at", "1"), "pw\n", "-resume-at must be at least 0 and below 1"},
+		{append(remote, "-resume-at", "-0.5"), "pw\n", "-resume-at must be"},
+		{append(remote, "-resume-at", "NaN"), "pw\n", "-resume-at must be"},
+		{append(remote, "-retry-for", "-1s"), "pw\n", "-retry-for not negative"},
 		{remote, "", "no password"},
 		{remote, "wrong\n", "log in as load00"},
 		{[]string{"-url", f.srv.URL, "-ca", filepath.Join(dir, "missing.crt")}, "pw\n", "missing.crt"},
@@ -283,7 +419,7 @@ func TestTheCommandRefuses(t *testing.T) {
 		{[]string{"-users", "0"}, "", "invalid flags"},
 		{[]string{"-ca", f.caFile}, "", "-ca: only for -url"},
 	} {
-		if err := run(c.args, strings.NewReader(c.stdin)); err == nil || !strings.Contains(err.Error(), c.want) {
+		if err := run(c.args, strings.NewReader(c.stdin), io.Discard); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%q: %v, want %q", c.args, err, c.want)
 		}
 	}
@@ -293,17 +429,21 @@ func TestTheCommandRefuses(t *testing.T) {
 	f.mu.Lock()
 	f.refuseDeletes = true
 	f.mu.Unlock()
-	err := run(append(remote, "-reps", "2"), strings.NewReader("pw\n"))
+	err := run(append(remote, "-reps", "2"), strings.NewReader("pw\n"), io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "removing what rep 1 uploaded") {
 		t.Errorf("a refused delete: %v", err)
 	}
 	if rows := readCSV(t, csv); len(rows) != 1 || rows[0][11] != "201" {
 		t.Errorf("the measured repetition's row: %q", rows)
 	}
-	if err := run([]string{"-no-such-flag"}, strings.NewReader("")); !errors.Is(err, errUsage) {
+	if err := run([]string{"-no-such-flag"}, strings.NewReader(""), io.Discard); !errors.Is(err, errUsage) {
 		t.Errorf("an unknown flag: %v", err)
 	}
-	if err := run([]string{"-h"}, strings.NewReader("")); !errors.Is(err, flag.ErrHelp) {
+	if err := run([]string{"-h"}, strings.NewReader(""), io.Discard); !errors.Is(err, flag.ErrHelp) {
 		t.Errorf("-h: %v", err)
+	}
+	var out strings.Builder
+	if err := run([]string{"-header", "-users", "0"}, strings.NewReader(""), &out); err != nil || out.String() != load.Header+"\n" {
+		t.Errorf("-header: %q, %v", out.String(), err)
 	}
 }

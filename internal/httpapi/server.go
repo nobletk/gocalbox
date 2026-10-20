@@ -3,6 +3,8 @@ package httpapi
 import (
 	"net/http"
 	"time"
+
+	"github.com/nobletk/gocalbox/internal/benchmode"
 )
 
 // HTTP/2's receive windows. A request body whose handler stops reading, an
@@ -21,16 +23,17 @@ const (
 
 // NewServer returns the HTTP server for h.
 func NewServer(h http.Handler) *http.Server {
+	conn, stream := benchmode.H2Windows(receiveWindowPerConnection, receiveWindowPerStream)
 	return &http.Server{
-		Handler: h,
+		Handler: logRequests(h),
 		// No read or write timeout: they would cut off long uploads and media
 		// streams. Stalled request bodies are limited per request
 		// (Options.BodyTimeout).
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		HTTP2: &http.HTTP2Config{
-			MaxReceiveBufferPerConnection: receiveWindowPerConnection,
-			MaxReceiveBufferPerStream:     receiveWindowPerStream,
+			MaxReceiveBufferPerConnection: conn,
+			MaxReceiveBufferPerStream:     stream,
 		},
 	}
 }

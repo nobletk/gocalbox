@@ -10,9 +10,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nobletk/gocalbox/internal/events"
 	"github.com/nobletk/gocalbox/internal/fsops"
@@ -54,6 +57,74 @@ func TestTheLoadClientUploadsThroughTheEngine(t *testing.T) {
 	}
 }
 
+// Each column of the load client's own lands under its name.
+func TestTheRowsOwnColumns(t *testing.T) {
+	ms := time.Millisecond
+	r := Result{
+		Files: 2, Bytes: 2 << 20, Duration: 2 * time.Second, Codes: map[string]int{"201": 2},
+		Retried:   map[string]int{"503": 2, "000": 1, "429": 0},
+		Parts:     []time.Duration{4 * ms, 1 * ms, 3 * ms, 2 * ms},
+		Completes: []time.Duration{30 * ms, 10 * ms, 20 * ms},
+		Resent:    12345,
+		Resumes:   []time.Duration{3 * time.Second, time.Second, 2 * time.Second},
+		Stalled:   1500 * ms,
+		UserRates: []float64{2.5, 0.75, 1},
+		CPU:       1250 * ms,
+		Start:     time.UnixMicro(1760000000123456),
+	}
+	header := strings.Split(Header, ",")
+	if strings.Join(header[:13], ",") != ScriptColumns {
+		t.Fatalf("the scripts' columns don't come first: %s", Header)
+	}
+	col := func(row, name string) string {
+		cols := strings.Split(row, ",")
+		if len(cols) != len(header) {
+			t.Fatalf("%d columns, want %d: %s", len(cols), len(header), row)
+		}
+		return cols[slices.Index(header, name)]
+	}
+	row := r.Row("c", true, "s", 1<<20, 4, 1, "https-h2")
+	for name, want := range map[string]string{
+		"dirty": "1", "mib_per_s": "1.000",
+		"part_p50_ms": "3.000", "part_p99_ms": "4.000", "complete_p50_ms": "20.000", "complete_max_ms": "30.000",
+		"retried": "000x1 503x2", "resent_bytes": "12345", "user_min_mib_s": "0.750", "user_max_mib_s": "2.500",
+		"client_cpu_s": "1.250", "resumed": "3", "resume_p50_s": "2.000", "resume_max_s": "3.000", "stalled_s": "1.500",
+		"started_unix": "1760000000.123456",
+	} {
+		if got := col(row, name); got != want {
+			t.Errorf("%s: %q, want %q", name, got, want)
+		}
+	}
+	if got := col(r.Row("c", false, "s", 1, 4, 1, "inprocess"), "client_cpu_s"); got != "" {
+		t.Errorf("in process, the client's CPU: %q", got)
+	}
+	r.CPU = -1
+	if got := col(r.Row("c", false, "s", 1, 4, 1, "https-h1"), "client_cpu_s"); got != "" {
+		t.Errorf("CPU unknown: %q", got)
+	}
+	empty := Result{Codes: map[string]int{"000": 1}, CPU: -1}
+	row = empty.Row("c", false, "s", 1, 4, 1, "https-h2")
+	for name, want := range map[string]string{"mib_per_s": "0.000", "part_p50_ms": "0.000", "retried": "", "user_min_mib_s": "0.000", "resumed": "0"} {
+		if got := col(row, name); got != want {
+			t.Errorf("nothing measured, %s: %q, want %q", name, got, want)
+		}
+	}
+	if got := Percentile([]time.Duration{5, 1, 4, 2, 3}, 0.5); got != 3 {
+		t.Errorf("median %v", got)
+	}
+}
+
+// The run's CPU time is read where the system tells it.
+func TestTheRunsCPUTimeIsRead(t *testing.T) {
+	res := Run(context.Background(), Config{Users: []User{{API: newKeyed(1 << 20), Dir: "x"}}, Files: 4, Size: 16 << 20, Parallel: 2})
+	if res.CPU <= 0 {
+		t.Errorf("CPU %v", res.CPU)
+	}
+	if d := time.Since(res.Start); d < res.Duration || d > res.Duration+time.Second {
+		t.Errorf("started %v ago, took %v", d, res.Duration)
+	}
+}
+
 func TestCodeColumn(t *testing.T) {
 	for want, codes := range map[string]map[string]int{
 		"201":         {"201": 3},
@@ -66,25 +137,27 @@ func TestCodeColumn(t *testing.T) {
 	}
 }
 
+func newState() *userState { return &userState{res: Result{Retried: map[string]int{}}} }
+
 func TestRetryWaitsOutBusyAnswers(t *testing.T) {
-	for _, busy := range []error{transfer.ErrBusy, transfer.ErrTooManyRequests, transfer.ErrPartInProgress} {
+	for _, busy := range []*transfer.Error{transfer.ErrBusy, transfer.ErrTooManyRequests, transfer.ErrPartInProgress} {
 		calls := 0
-		var told []error
-		v, _, err := retry(context.Background(), func() (int, error) {
+		st := newState()
+		v, _, err := retry(context.Background(), retrier{st: st}, func() (int, error) {
 			if calls++; calls < 3 {
 				return 0, busy
 			}
 			return 7, nil
-		}, func(err error) { told = append(told, err) })
-		if v != 7 || err != nil || calls != 3 || len(told) != 2 || told[0] != busy || told[1] != busy {
-			t.Errorf("%v: %d, %v after %d calls, retries told %v", busy, v, err, calls, told)
+		})
+		code := strconv.Itoa(busy.Status)
+		if v != 7 || err != nil || calls != 3 || st.res.Retried[code] != 2 || len(st.res.Retried) != 1 {
+			t.Errorf("%v: %d, %v after %d calls, retried %v", busy, v, err, calls, st.res.Retried)
 		}
 	}
 	calls := 0
-	if _, _, err := retry(context.Background(), func() (int, error) { calls++; return 0, transfer.ErrChecksumMismatch }, func(err error) {
-		t.Errorf("a refusal was told as retried: %v", err)
-	}); err == nil || calls != 1 {
-		t.Errorf("a refusal was retried: %v, %d calls", err, calls)
+	st := newState()
+	if _, _, err := retry(context.Background(), retrier{st: st}, func() (int, error) { calls++; return 0, transfer.ErrChecksumMismatch }); err == nil || calls != 1 || len(st.res.Retried) != 0 {
+		t.Errorf("a refusal was retried: %v, %d calls, %v", err, calls, st.res.Retried)
 	}
 }
 

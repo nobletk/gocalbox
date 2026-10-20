@@ -26,6 +26,7 @@ import (
 
 	"github.com/nobletk/gocalbox/internal/audit"
 	"github.com/nobletk/gocalbox/internal/auth"
+	"github.com/nobletk/gocalbox/internal/benchmode"
 	"github.com/nobletk/gocalbox/internal/events"
 	"github.com/nobletk/gocalbox/internal/fsops"
 	"github.com/nobletk/gocalbox/internal/httpapi"
@@ -110,6 +111,9 @@ func run() error {
 		return errors.New("-part-size and -composite are only for -verify-upload")
 	case *verifyLog != "":
 		return verifyAudit(*verifyLog)
+	}
+	if err := benchmode.Init(); err != nil {
+		return err
 	}
 	if err := checkTLSFlags(*host, *tlsCert, *tlsKey, *tlsDir, *insecureHTTP); err != nil {
 		return err

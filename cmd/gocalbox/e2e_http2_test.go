@@ -34,6 +34,15 @@ func readFrame(t *testing.T, r io.Reader) (typ, flags byte, stream uint32, paylo
 // the connection.
 func TestE2EHTTPSAdvertisesTheHTTP2Windows(t *testing.T) {
 	s := startServer(t)
+	if stream, conn := advertisedWindows(t, s); stream != 256<<10 || conn != 4<<20-1 {
+		t.Errorf("windows: %d per stream and %d for the connection, want %d and %d", stream, conn, 256<<10, 4<<20-1)
+	}
+}
+
+// advertisedWindows returns the receive windows the server's HTTPS port
+// gives an HTTP/2 client: per stream, and for the connection.
+func advertisedWindows(t *testing.T, s *liveServer) (stream, conn int) {
+	t.Helper()
 	cfg := s.tlsConfig.Clone()
 	cfg.NextProtos = []string{"h2"}
 	c, err := tls.Dial("tcp", s.addr, cfg)
@@ -48,7 +57,7 @@ func TestE2EHTTPSAdvertisesTheHTTP2Windows(t *testing.T) {
 	if _, err := io.WriteString(c, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00"); err != nil {
 		t.Fatal(err)
 	}
-	stream, conn := -1, -1
+	stream, conn = -1, -1
 	for stream < 0 || conn < 0 {
 		typ, flags, id, payload := readFrame(t, c)
 		switch {
@@ -63,9 +72,7 @@ func TestE2EHTTPSAdvertisesTheHTTP2Windows(t *testing.T) {
 			conn = 65535 + int(be.BigEndian.Uint32(payload)&(1<<31-1))
 		}
 	}
-	if stream != 256<<10 || conn != 4<<20-1 {
-		t.Errorf("windows: %d per stream and %d for the connection, want %d and %d", stream, conn, 256<<10, 4<<20-1)
-	}
+	return stream, conn
 }
 
 // The load client logs its users in to the real server over HTTPS, each on

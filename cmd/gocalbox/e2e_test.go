@@ -101,6 +101,7 @@ func (s *syncBuffer) String() string {
 
 type liveServer struct {
 	t         *testing.T
+	bin       string // the binary to run; the one binary builds when empty
 	cmd       *exec.Cmd
 	out       *syncBuffer
 	url       string
@@ -187,7 +188,10 @@ func newLiveServer(t *testing.T) *liveServer {
 func (s *liveServer) start(extraArgs ...string) {
 	t := s.t
 	t.Helper()
-	bin := binary(t)
+	bin := s.bin
+	if bin == "" {
+		bin = binary(t)
+	}
 	port := freePort(t)
 	s.addr = fmt.Sprintf("127.0.0.1:%d", port)
 	trusted := filepath.Join(s.tlsDir, "ca.crt")

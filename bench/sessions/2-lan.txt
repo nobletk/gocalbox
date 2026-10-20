@@ -1,0 +1,80 @@
+# Session 2: wired LAN, Linux; the server on PC A, the client on PC B (X4, X5, X6, X7, X8).
+# It can be split in two with CELLS, such as CELLS=x4- and then CELLS=x5-,x6-,x7-,x8-.
+# X7's server kill and network cut, X8's seeks and the baselines come with M8a-2;
+# x7-stop is the client stopping and resuming, as a browser does after a reload.
+# The same file runs session 3 (Wi-Fi) with PC B on Wi-Fi, without the x6 rows:
+# CELLS=x4-,x5-,x7-,x8-.
+
+server default
+server h2-bench BUILD_TAGS=bench
+server h2-128k BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=128K
+server h2-448k BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=448K
+server h2-1m BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=1M GOCALBOX_BENCH_H2_CONN_WINDOW=16M
+server part-16m BUILD_TAGS=bench GOCALBOX_BENCH_PART_SIZE=16M
+server part-64m BUILD_TAGS=bench GOCALBOX_BENCH_PART_SIZE=64M
+
+# X4: part size and parts in flight. 8 MiB is what the server picks for these sizes.
+cell x4-p8-par1-1G   h2-bench engine size=1G parallel=1
+cell x4-p8-par2-1G   h2-bench engine size=1G parallel=2
+cell x4-p8-par4-1G   h2-bench engine size=1G parallel=4
+cell x4-p8-par8-1G   h2-bench engine size=1G parallel=8
+cell x4-p16-par1-1G  part-16m engine size=1G parallel=1
+cell x4-p16-par2-1G  part-16m engine size=1G parallel=2
+cell x4-p16-par4-1G  part-16m engine size=1G parallel=4
+cell x4-p16-par8-1G  part-16m engine size=1G parallel=8
+cell x4-p64-par1-1G  part-64m engine size=1G parallel=1
+cell x4-p64-par2-1G  part-64m engine size=1G parallel=2
+cell x4-p64-par4-1G  part-64m engine size=1G parallel=4
+cell x4-p64-par8-1G  part-64m engine size=1G parallel=8
+cell x4-p8-par1-5G   h2-bench engine size=5G parallel=1
+cell x4-p8-par2-5G   h2-bench engine size=5G parallel=2
+cell x4-p8-par4-5G   h2-bench engine size=5G parallel=4
+cell x4-p8-par8-5G   h2-bench engine size=5G parallel=8
+cell x4-p16-par1-5G  part-16m engine size=5G parallel=1
+cell x4-p16-par2-5G  part-16m engine size=5G parallel=2
+cell x4-p16-par4-5G  part-16m engine size=5G parallel=4
+cell x4-p16-par8-5G  part-16m engine size=5G parallel=8
+cell x4-p64-par1-5G  part-64m engine size=5G parallel=1
+cell x4-p64-par2-5G  part-64m engine size=5G parallel=2
+cell x4-p64-par4-5G  part-64m engine size=5G parallel=4
+cell x4-p64-par8-5G  part-64m engine size=5G parallel=8
+
+# X5: HTTP/1.1 against HTTP/2, then HTTP/2's stream window (256 KiB is today's).
+cell x5-engine-h1    default  engine   transport=https-h1 size=1G
+cell x5-engine-h2    default  engine   transport=https-h2 size=1G
+cell x5-single-h1    default  upload   transport=https-h1 size=1G
+cell x5-single-h2    default  upload   transport=https-h2 size=1G
+cell x5-down-h1      default  download transport=https-h1 size=1G
+cell x5-down-h2      default  download transport=https-h2 size=1G
+cell x5-w128-engine  h2-128k  engine   transport=https-h2 size=1G
+cell x5-w256-engine  h2-bench engine   transport=https-h2 size=1G
+cell x5-w448-engine  h2-448k  engine   transport=https-h2 size=1G
+cell x5-w1m-engine   h2-1m    engine   transport=https-h2 size=1G
+cell x5-w128-single  h2-128k  upload   transport=https-h2 size=1G
+cell x5-w256-single  h2-bench upload   transport=https-h2 size=1G
+cell x5-w448-single  h2-448k  upload   transport=https-h2 size=1G
+cell x5-w1m-single   h2-1m    upload   transport=https-h2 size=1G
+cell x5-w128-down    h2-128k  download transport=https-h2 size=1G
+cell x5-w256-down    h2-bench download transport=https-h2 size=1G
+cell x5-w448-down    h2-448k  download transport=https-h2 size=1G
+cell x5-w1m-down     h2-1m    download transport=https-h2 size=1G
+
+# X6: many users at once, each with its own login and connection, 3 files of 256 MiB each.
+cell x6-users-1  default engine size=256M files=3 users=1
+cell x6-users-2  default engine size=256M files=3 users=2
+cell x6-users-4  default engine size=256M files=3 users=4
+cell x6-users-8  default engine size=256M files=3 users=8
+cell x6-users-16 default engine size=256M files=3 users=16
+
+# X7, the client's part: each file stops at 10, 50 or 90% and resumes by its client key.
+cell x7-stop-10 default engine size=5G resume-at=0.1 retry-for=2m
+cell x7-stop-50 default engine size=5G resume-at=0.5 retry-for=2m
+cell x7-stop-90 default engine size=5G resume-at=0.9 retry-for=2m
+
+# X8: downloads.
+cell x8-down-h2-64M default download transport=https-h2 size=64M
+cell x8-down-h2-1G  default download transport=https-h2 size=1G
+cell x8-down-h2-5G  default download transport=https-h2 size=5G
+cell x8-down-h1-64M default download transport=https-h1 size=64M
+cell x8-down-h1-1G  default download transport=https-h1 size=1G
+cell x8-down-h1-5G  default download transport=https-h1 size=5G

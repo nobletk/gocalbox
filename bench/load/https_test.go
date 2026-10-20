@@ -2,6 +2,7 @@ package load
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -564,13 +565,14 @@ func TestAnEmptyFileRefusedBusyIsTriedAgain(t *testing.T) {
 func TestARetryCutShortIsNotCounted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
-	_, _, err := retry(ctx, func() (int, error) {
+	st := &userState{res: Result{Retried: map[string]int{}}}
+	_, _, err := retry(ctx, retrier{st: st}, func() (int, error) {
 		calls++
 		cancel()
 		return 0, transfer.ErrBusy
-	}, func(err error) { t.Errorf("a refusal not tried again was told as retried: %v", err) })
-	if !errors.Is(err, transfer.ErrBusy) || calls != 1 {
-		t.Errorf("%v after %d calls", err, calls)
+	})
+	if !errors.Is(err, transfer.ErrBusy) || calls != 1 || len(st.res.Retried) != 0 {
+		t.Errorf("%v after %d calls, retried %v", err, calls, st.res.Retried)
 	}
 }
 
@@ -599,5 +601,49 @@ func TestARefusalMatchesTheEnginesErrorOfItsStatusAndCode(t *testing.T) {
 	}
 	if status(fmt.Errorf("%w: reset", ErrNoAnswer)) != "000" || status(&Refused{Status: 507}) != "507" {
 		t.Error("the statuses of the HTTPS client's errors")
+	}
+}
+
+// A request to a server that takes no connection is no answer and was never
+// sent; one cut off after it was sent is no answer only.
+func TestANoAnswerSaysWhetherItConnected(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := l.Addr().String()
+	l.Close()
+	a := &remote{url: "https://" + closed, client: &http.Client{Transport: &http.Transport{}}, open: map[string]bool{}}
+	_, err = a.Part(context.Background(), transfer.PartRequest{ID: "u", N: 1, Length: 1, Body: strings.NewReader("x")})
+	if !errors.Is(err, ErrNoAnswer) || !errors.Is(err, ErrNotConnected) {
+		t.Errorf("a refused connection: %v", err)
+	}
+
+	f := newFakeHTTPS(t, false)
+	f.on("/api/upload/part", func(w http.ResponseWriter, r *http.Request, _ map[string]any) bool {
+		if r.URL.Query().Get("id") == "reset" {
+			// A reset, which the client reads as a network error of its own.
+			c, _, err := http.NewResponseController(w).Hijack()
+			if err == nil {
+				if tc, ok := c.(*tls.Conn); ok {
+					if tcp, ok := tc.NetConn().(*net.TCPConn); ok {
+						tcp.SetLinger(0)
+						tcp.Close()
+						return true
+					}
+				}
+				c.Close()
+			}
+			return true
+		}
+		hangUp(w)
+		return true
+	})
+	users := f.logIn(t, true, "ann")
+	for _, id := range []string{"u", "reset"} {
+		_, err = users[0].API.Part(context.Background(), transfer.PartRequest{ID: id, N: 1, Length: 1, Body: strings.NewReader("x")})
+		if !errors.Is(err, ErrNoAnswer) || errors.Is(err, ErrNotConnected) {
+			t.Errorf("a connection cut short (%s): %v", id, err)
+		}
 	}
 }

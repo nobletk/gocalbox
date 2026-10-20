@@ -3,7 +3,8 @@
 // CSV file with the columns of the benchmark scripts.
 //
 // By default the engine runs in this process with the real file operations,
-// state file and audit log, but without HTTP and logins. With -url the users
+// state file and audit log, but without HTTP and logins, in the subfolder
+// load of the benchmark folder made with bench/init.sh. With -url the users
 // upload to a running server over HTTPS instead, each logged in over a
 // connection of its own: the users <prefix>00, <prefix>01, … must exist,
 // made with gocalbox users add as contributors with the one password this
@@ -14,6 +15,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -23,16 +25,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/nobletk/gocalbox/bench/lib"
 	"github.com/nobletk/gocalbox/bench/load"
+	"github.com/nobletk/gocalbox/internal/benchmode"
 )
 
 func main() {
-	err := run(os.Args[1:], os.Stdin)
+	err := run(os.Args[1:], os.Stdin, os.Stdout)
 	switch {
 	case errors.Is(err, flag.ErrHelp):
 	case errors.Is(err, errUsage):
@@ -46,9 +49,10 @@ func main() {
 // said why.
 var errUsage = errors.New("usage")
 
-func run(args []string, stdin io.Reader) error {
+func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	fl := flag.NewFlagSet("gocalbox-load", flag.ContinueOnError)
-	work := fl.String("work", filepath.Join("bench", ".work", "load"), "Scratch folder; it must be on the disk being measured, and is emptied before each repetition (in-process only)")
+	benchDir := fl.String("bench-dir", os.Getenv("BENCH_DIR"), "The benchmark folder, made with bench/init.sh on the disk being measured; the engine works in its subfolder load, which is emptied before each repetition (in-process only; default $BENCH_DIR)")
+	work := fl.String("work", "", "Replaced by -bench-dir")
 	users := fl.Int("users", 1, "Simulated users uploading at once")
 	files := fl.Int("files", 1, "Files each user uploads")
 	size := fl.String("size", "64M", "Size of each file, in bytes or with K, M or G (IEC units)")
@@ -62,6 +66,9 @@ func run(args []string, stdin io.Reader) error {
 	ca := fl.String("ca", "", "With -url: the server's CA certificate, ca.crt in its -tls-dir; by default the system's are trusted")
 	transport := fl.String("transport", "https-h2", "With -url: https-h2 (HTTP/2, as browsers use it) or https-h1 (HTTP/1.1)")
 	userPrefix := fl.String("user-prefix", "load", "With -url: the users are this followed by 00, 01, …")
+	resumeAt := fl.Float64("resume-at", 0, "Stop each file once this share of its parts is in, such as 0.5, then resume it by its client key as the browser does; 0 never stops")
+	retryFor := fl.Duration("retry-for", 0, "Try calls that get no answer, or find the server shutting down, again for up to this long, such as 2m; 0 ends the file at once")
+	header := fl.Bool("header", false, "Print the CSV file's first line and exit")
 	if err := fl.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return err
@@ -69,14 +76,33 @@ func run(args []string, stdin io.Reader) error {
 		return errUsage
 	}
 
+	if *header {
+		fmt.Fprintln(stdout, load.Header)
+		return nil
+	}
+	if *work != "" {
+		return errors.New("-work is replaced by -bench-dir, a folder made with bench/init.sh")
+	}
 	bytes, err := parseSize(*size)
 	if err != nil || *users < 1 || *files < 1 || *parallel < 1 || *reps < 1 {
 		return fmt.Errorf("invalid flags: size %q (%v); users, files, parallel and reps must be at least 1", *size, err)
+	}
+	if !(*resumeAt >= 0 && *resumeAt < 1) || *retryFor < 0 {
+		return fmt.Errorf("invalid flags: -resume-at must be at least 0 and below 1, and -retry-for not negative")
 	}
 	set := map[string]bool{}
 	fl.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	if err := checkModes(set, *url != "", *transport); err != nil {
 		return err
+	}
+	if err := benchmode.Init(); err != nil {
+		return err
+	}
+	var bench *lib.Folder
+	if *url == "" {
+		if bench, err = lib.Use(*benchDir); err != nil {
+			return err
+		}
 	}
 	var remote []load.User
 	if *url != "" {
@@ -101,15 +127,11 @@ func run(args []string, stdin io.Reader) error {
 	if err := os.MkdirAll(filepath.Dir(*csvPath), 0o755); err != nil {
 		return err
 	}
-	_, statErr := os.Stat(*csvPath)
-	out, err := os.OpenFile(*csvPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	out, err := openCSV(*csvPath)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-	if os.IsNotExist(statErr) {
-		fmt.Fprintln(out, load.Header)
-	}
 
 	scenario := fmt.Sprintf("engine_upload_%du", *users)
 	if *auditParts {
@@ -118,23 +140,32 @@ func run(args []string, stdin io.Reader) error {
 	if !*auditWait {
 		scenario += "_no_wait"
 	}
+	if *resumeAt > 0 {
+		scenario += fmt.Sprintf("_resume%g", *resumeAt*100)
+	}
+	cfg := load.Config{Users: remote, Files: *files, Size: bytes, Parallel: *parallel, ResumeAt: *resumeAt, RetryFor: *retryFor}
 	for rep := 1; rep <= *reps; rep++ {
 		var res load.Result
 		var server string
 		column := "inprocess"
 		if remote != nil {
 			column = *transport
-			res = load.Run(context.Background(), load.Config{Users: remote, Files: *files, Size: bytes, Parallel: *parallel})
+			res = load.Run(context.Background(), cfg)
 		} else {
-			if err := emptyWork(*work); err != nil {
+			work := filepath.Join(bench.Dir, "load")
+			if err := bench.Remove(work); err != nil {
 				return err
 			}
-			stack, err := load.NewStack(load.StackOptions{Work: *work, Users: *users, AuditWait: *auditWait,
+			if err := os.Mkdir(work, 0o755); err != nil {
+				return err
+			}
+			stack, err := load.NewStack(load.StackOptions{Work: work, Users: *users, AuditWait: *auditWait,
 				AuditParts: *auditParts, MinFree: *minFreeMB << 20})
 			if err != nil {
 				return err
 			}
-			res = load.Run(context.Background(), load.Config{Users: stack.Users, Files: *files, Size: bytes, Parallel: *parallel})
+			cfg.Users = stack.Users
+			res = load.Run(context.Background(), cfg)
 			st := stack.Engine.Stats()
 			server = fmt.Sprintf("; the engine: %d parts, %d duplicates, refused busy %d, too_many_requests %d, too_many_uploads %d",
 				st.PartsReceived, st.Duplicates, st.Busy, st.TooManyRequests, st.TooManyUploads)
@@ -143,19 +174,19 @@ func run(args []string, stdin io.Reader) error {
 			}
 		}
 		fmt.Fprintln(out, res.Row(commit, dirty, scenario, bytes, *users**parallel, rep, column))
-		log.Printf("rep %d: %d of %d files uploaded in %.2fs, %.1f MiB/s, parts p50 %v p99 %v, %s, tried again %s%s",
+		log.Printf("rep %d: %d of %d files uploaded in %.2fs, %.1f MiB/s, parts p50 %v p99 %v, %s, tried again %s, resent %d bytes, %d resumed, CPU %v%s",
 			rep, res.Uploaded(), res.Files, res.Duration.Seconds(), float64(res.Bytes)/(1<<20)/res.Duration.Seconds(),
 			res.Percentile(0.5).Round(time.Microsecond), res.Percentile(0.99).Round(time.Microsecond), res.CodeColumn(),
-			counts(res.Retried), server)
+			cmp.Or(load.Counts(res.Retried), "none"), res.Resent, len(res.Resumes), res.CPU.Round(time.Millisecond), server)
 		if remote != nil {
 			if err := load.Clean(context.Background(), remote); err != nil {
 				return fmt.Errorf("removing what rep %d uploaded: %w", rep, err)
 			}
 		}
 	}
-	if remote == nil {
-		if err := emptyWork(*work); err != nil {
-			log.Printf("cannot empty %s: %v", *work, err)
+	if bench != nil {
+		if err := bench.Remove(filepath.Join(bench.Dir, "load")); err != nil {
+			log.Printf("cannot delete what the engine wrote: %v", err)
 		}
 	}
 	log.Printf("results: %s", *csvPath)
@@ -165,7 +196,7 @@ func run(args []string, stdin io.Reader) error {
 // checkModes refuses the flags of the mode not chosen, which would go
 // unused without a word.
 func checkModes(set map[string]bool, remote bool, transport string) error {
-	other, mode := []string{"work", "audit-wait", "audit-parts", "min-free-mb"}, "the in-process mode; set them on the server"
+	other, mode := []string{"bench-dir", "audit-wait", "audit-parts", "min-free-mb"}, "the in-process mode; set them on the server"
 	if !remote {
 		other, mode = []string{"ca", "transport", "user-prefix"}, "-url"
 	}
@@ -205,47 +236,45 @@ func userNames(prefix string, n int) []string {
 	return names
 }
 
-// counts lists a count of each status, such as "429x1 503x2", or "none".
-func counts(m map[string]int) string {
-	var keys []string
-	for k, v := range m {
-		if v > 0 {
-			keys = append(keys, k)
-		}
+// openCSV opens the CSV file to append to, with its header if it is new.
+// A file with other columns, such as a script's, is refused.
+func openCSV(path string) (*os.File, error) {
+	out, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
 	}
-	if len(keys) == 0 {
-		return "none"
+	first, err := bufio.NewReader(out).ReadString('\n')
+	switch {
+	case err == io.EOF && first == "":
+		_, err = fmt.Fprintln(out, load.Header)
+	case err != nil && err != io.EOF:
+	case strings.TrimRight(first, "\r\n") != load.Header:
+		err = fmt.Errorf("-csv %s has other columns than this command writes; give a new file", path)
+	default:
+		err = endLine(out)
 	}
-	sort.Strings(keys)
-	for i, k := range keys {
-		keys[i] = fmt.Sprintf("%sx%d", k, m[k])
+	if err != nil {
+		out.Close()
+		return nil, err
 	}
-	return strings.Join(keys, " ")
+	return out, nil
 }
 
-// workMark names the file that marks a scratch folder as this command's.
-const workMark = ".gocalbox-load"
-
-// emptyWork empties the scratch folder, which must be missing, empty, or one
-// this command made, so that a mistyped -work can't delete anything else.
-func emptyWork(dir string) error {
-	entries, err := os.ReadDir(dir)
-	switch {
-	case os.IsNotExist(err):
-	case err != nil:
-		return err
-	case len(entries) > 0:
-		if _, err := os.Stat(filepath.Join(dir, workMark)); err != nil {
-			return fmt.Errorf("-work %s holds files this command didn't make; give it a new or empty folder", dir)
-		}
-		if err := os.RemoveAll(dir); err != nil {
-			return err
-		}
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+// endLine ends the file's last line, if it has none, so that the next row
+// starts a line of its own.
+func endLine(f *os.File) error {
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, workMark), nil, 0o644)
+	last := make([]byte, 1)
+	if _, err := f.ReadAt(last, fi.Size()-1); err != nil {
+		return err
+	}
+	if last[0] != '\n' {
+		_, err = f.Write([]byte{'\n'})
+	}
+	return err
 }
 
 func parseSize(s string) (int64, error) {

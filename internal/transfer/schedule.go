@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"math/bits"
+
+	"github.com/nobletk/gocalbox/internal/benchmode"
 )
 
 const (
@@ -23,8 +25,12 @@ const (
 const MaxSize = 1 << 46
 
 // PartSize returns the part size the server uses for a file of size bytes,
-// at most MaxSize.
+// at most MaxSize. A benchmark build may set one part size for every file
+// that it cuts into no more parts than MaxSize allows at MaxPartSize.
 func PartSize(size int64) int64 {
+	if p := benchmode.PartSize(); p > 0 && PartCount(size, p) <= MaxSize/MaxPartSize {
+		return p
+	}
 	if size <= 0 {
 		return MinPartSize
 	}

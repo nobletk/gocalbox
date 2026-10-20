@@ -1,0 +1,85 @@
+# Session 1: loopback, Linux, on PC A (X1, X2, X3, X5, X6 of the benchmark plan).
+# Run on PC A without SERVER_SSH; the client and the server share the machine.
+# X1's and X5's baselines (tusd, SFTP, scp) come with M8a-2.
+#
+# PRE_M6 names the commit before M6 (bench/README.md says how to find it).
+
+server default
+server pre-m6 SERVER_REV=$PRE_M6
+server h2-bench BUILD_TAGS=bench
+server h2-128k BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=128K
+server h2-448k BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=448K
+server h2-1m BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=1M GOCALBOX_BENCH_H2_CONN_WINDOW=16M
+
+# X1: the server's capacity on our own paths, uploads and downloads, over both protocols.
+cell x1-engine-h2-1M   default engine   transport=https-h2 size=1M
+cell x1-engine-h2-64M  default engine   transport=https-h2 size=64M
+cell x1-engine-h2-1G   default engine   transport=https-h2 size=1G
+cell x1-engine-h2-5G   default engine   transport=https-h2 size=5G
+cell x1-engine-h1-1M   default engine   transport=https-h1 size=1M
+cell x1-engine-h1-64M  default engine   transport=https-h1 size=64M
+cell x1-engine-h1-1G   default engine   transport=https-h1 size=1G
+cell x1-engine-h1-5G   default engine   transport=https-h1 size=5G
+cell x1-single-h2-1M   default upload   transport=https-h2 size=1M
+cell x1-single-h2-64M  default upload   transport=https-h2 size=64M
+cell x1-single-h2-1G   default upload   transport=https-h2 size=1G
+cell x1-single-h2-5G   default upload   transport=https-h2 size=5G
+cell x1-single-h1-1M   default upload   transport=https-h1 size=1M
+cell x1-single-h1-64M  default upload   transport=https-h1 size=64M
+cell x1-single-h1-1G   default upload   transport=https-h1 size=1G
+cell x1-single-h1-5G   default upload   transport=https-h1 size=5G
+cell x1-down-h2-64M    default download transport=https-h2 size=64M
+cell x1-down-h2-1G     default download transport=https-h2 size=1G
+cell x1-down-h2-5G     default download transport=https-h2 size=5G
+cell x1-down-h1-64M    default download transport=https-h1 size=64M
+cell x1-down-h1-1G     default download transport=https-h1 size=1G
+cell x1-down-h1-5G     default download transport=https-h1 size=5G
+cell x1-batch-c1       default batch    transport=https-h2 conc=1
+cell x1-batch-c4       default batch    transport=https-h2 conc=4
+cell x1-batch-c16      default batch    transport=https-h2 conc=16
+
+# X2: what the guarantees cost. Auditing, in process: the default, every part recorded,
+# and changes answered before their records are on disk. Then M6's staging and flush:
+# the single-request upload before M6 against now.
+cell x2-audit-default-1G - inprocess size=1G
+cell x2-audit-parts-1G   - inprocess size=1G audit-parts=1
+cell x2-audit-nowait-1G  - inprocess size=1G audit-wait=0
+cell x2-audit-default-1M - inprocess size=1M files=200
+cell x2-audit-parts-1M   - inprocess size=1M files=200 audit-parts=1
+cell x2-audit-nowait-1M  - inprocess size=1M files=200 audit-wait=0
+cell x2-staged-now-64M   default upload transport=https-h2 size=64M
+cell x2-staged-now-1G    default upload transport=https-h2 size=1G
+cell x2-staged-pre-64M   pre-m6  upload transport=https-h2 size=64M
+cell x2-staged-pre-1G    pre-m6  upload transport=https-h2 size=1G
+cell x2-batch-now-c4     default batch  transport=https-h2 conc=4
+cell x2-batch-pre-c4     pre-m6  batch  transport=https-h2 conc=4
+
+# X3: the cost of finishing, in process on the NVMe; complete_p50_ms should stay flat.
+# The USB stick's rows run in session 4.
+cell x3-nvme-1M  - inprocess size=1M
+cell x3-nvme-64M - inprocess size=64M
+cell x3-nvme-1G  - inprocess size=1G
+cell x3-nvme-5G  - inprocess size=5G
+cell x3-nvme-20G - inprocess size=20G reps=3
+cell x3-nvme-50G - inprocess size=50G reps=3
+
+# X5 on loopback: HTTP/2's stream window, 256 KiB being today's, in the benchmark build.
+cell x5-w128-engine  h2-128k  engine   transport=https-h2 size=1G
+cell x5-w256-engine  h2-bench engine   transport=https-h2 size=1G
+cell x5-w448-engine  h2-448k  engine   transport=https-h2 size=1G
+cell x5-w1m-engine   h2-1m    engine   transport=https-h2 size=1G
+cell x5-w128-single  h2-128k  upload   transport=https-h2 size=1G
+cell x5-w256-single  h2-bench upload   transport=https-h2 size=1G
+cell x5-w448-single  h2-448k  upload   transport=https-h2 size=1G
+cell x5-w1m-single   h2-1m    upload   transport=https-h2 size=1G
+cell x5-w128-down    h2-128k  download transport=https-h2 size=1G
+cell x5-w256-down    h2-bench download transport=https-h2 size=1G
+cell x5-w448-down    h2-448k  download transport=https-h2 size=1G
+cell x5-w1m-down     h2-1m    download transport=https-h2 size=1G
+
+# X6 on loopback: the server's capacity for many users, each with 3 files of 256 MiB.
+cell x6-users-1  default engine transport=https-h2 size=256M files=3 users=1
+cell x6-users-2  default engine transport=https-h2 size=256M files=3 users=2
+cell x6-users-4  default engine transport=https-h2 size=256M files=3 users=4
+cell x6-users-8  default engine transport=https-h2 size=256M files=3 users=8
+cell x6-users-16 default engine transport=https-h2 size=256M files=3 users=16

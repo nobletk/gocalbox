@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -33,6 +34,10 @@ type Remote struct {
 // ErrNoAnswer is a request that got no answer from the server: the
 // connection failed, or broke before the answer came.
 var ErrNoAnswer = errors.New("no answer from the server")
+
+// ErrNotConnected is a request that got no answer because no connection to
+// the server could be made, so nothing of it was sent. It is an ErrNoAnswer.
+var ErrNotConnected = errors.New("no connection to the server")
 
 // Refused is an error answer of the server.
 type Refused struct {
@@ -214,6 +219,9 @@ func (a *remote) post(ctx context.Context, path string, body []byte, out any) er
 func (a *remote) do(req *http.Request, out any) error {
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if op := (*net.OpError)(nil); errors.As(err, &op) && op.Op == "dial" {
+			return fmt.Errorf("%w: %w: %v", ErrNoAnswer, ErrNotConnected, err)
+		}
 		return fmt.Errorf("%w: %v", ErrNoAnswer, err)
 	}
 	defer resp.Body.Close()

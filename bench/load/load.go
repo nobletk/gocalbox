@@ -1,8 +1,8 @@
 // Package load drives the resumable upload protocol the way the browser
 // does: one session per file, hashed parts sent with a fixed number in
 // flight per user across all of their files, lowest part numbers first, and
-// a completion with the composite hash. It measures the time and writes the
-// CSV columns of the benchmark scripts.
+// a completion with the composite hash. It measures the time, and writes
+// the benchmark scripts' CSV columns followed by its own.
 package load
 
 import (
@@ -46,6 +46,14 @@ type Config struct {
 	Files    int   // files per user
 	Size     int64 // bytes per file
 	Parallel int   // parts in flight per user, across their files
+	// ResumeAt, between 0 and 1, stops each file once that share of its
+	// parts is accepted, dropping the parts in flight, and resumes it as a
+	// browser does after a reload: create again with the file's client key,
+	// then send the parts the server lacks. 0 doesn't stop.
+	ResumeAt float64
+	// RetryFor is how long a call is tried again while it gets no answer,
+	// or 503 unavailable from a server shutting down; 0 doesn't.
+	RetryFor time.Duration
 }
 
 type Result struct {
@@ -53,15 +61,36 @@ type Result struct {
 	// Codes tells how many of them were uploaded.
 	Files    int
 	Bytes    int64
+	Start    time.Time
 	Duration time.Duration
 	// Codes counts the files by the HTTP status their upload ended with:
 	// 201 for a file uploaded, otherwise the status of the refusal that
 	// stopped it, or 000 for a request that got no answer.
 	Codes map[string]int
-	// Retried counts the refusals that were tried again, by their status:
-	// 503 busy, 429 too_many_requests and 409 part_in_progress.
-	Retried map[string]int
-	Parts   []time.Duration // the latency of every part accepted, its last try only
+	// Retried counts the calls that were tried again, by the status that
+	// refused them: 503 busy or unavailable, 429 too_many_requests, 409
+	// part_in_progress, or 000 for no answer.
+	Retried   map[string]int
+	Parts     []time.Duration // the latency of every part accepted, its last try only
+	Completes []time.Duration // the time of every completion answered, its last try only
+	// Resent counts the bytes of parts sent more than once. A try counts as
+	// sent if it was answered with the part taken or already had, got no
+	// answer once connected, or was cut off when its file stopped; refusals
+	// don't, as the server answers them without taking the part, and nor do
+	// tries that couldn't connect.
+	Resent int64
+	// Resumes is the time from each file's stop to its end, for the files
+	// that stopped and were resumed with the session the server kept.
+	Resumes []time.Duration
+	// Stalled is how long the calls of a user got no answer, at most over
+	// the users.
+	Stalled time.Duration
+	// UserRates is each user's uploaded bytes over the time to its last
+	// file's end, in MiB/s.
+	UserRates []float64
+	// CPU is this process's CPU time over the run, or -1 where it can't be
+	// read. In process, it is the engine's and the users' together.
+	CPU time.Duration
 }
 
 // Uploaded is how many files were uploaded.
@@ -73,12 +102,13 @@ func Run(ctx context.Context, cfg Config) Result {
 	res := Result{Codes: map[string]int{}, Retried: map[string]int{}}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	cpu := processCPU()
 	start := time.Now()
 	for i, u := range cfg.Users {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r := runUser(ctx, u, cfg, i)
+			r := runUser(ctx, u, cfg, i, start)
 			mu.Lock()
 			defer mu.Unlock()
 			for k, v := range r.Codes {
@@ -88,21 +118,39 @@ func Run(ctx context.Context, cfg Config) Result {
 				res.Retried[k] += v
 			}
 			res.Parts = append(res.Parts, r.Parts...)
+			res.Completes = append(res.Completes, r.Completes...)
+			res.Resumes = append(res.Resumes, r.Resumes...)
+			res.Resent += r.Resent
+			res.Stalled = max(res.Stalled, r.Stalled)
+			res.UserRates = append(res.UserRates, r.UserRates...)
 		}()
 	}
 	wg.Wait()
-	res.Duration = time.Since(start)
+	res.Start, res.Duration = start, time.Since(start)
+	res.CPU = -1
+	if end := processCPU(); cpu >= 0 && end >= 0 {
+		res.CPU = end - cpu
+	}
 	res.Files = len(cfg.Users) * cfg.Files
 	res.Bytes = int64(res.Files) * cfg.Size
 	return res
 }
 
 type upload struct {
-	seed   byte
-	c      transfer.Created
-	hashes [][sha256.Size]byte
-	left   int
-	failed error
+	name    string
+	key     string
+	seed    byte
+	c       transfer.Created
+	hashes  [][sha256.Size]byte
+	left    int // jobs not yet done
+	failed  error
+	ctx     context.Context
+	cancel  context.CancelFunc
+	stopAt  int // accepted parts after which the file stops; 0 never
+	done    int // parts accepted since the file's session was made
+	stopped time.Time
+	resumed bool
+	sends   map[int]int // tries that may have carried each part
 }
 
 type job struct {
@@ -110,79 +158,315 @@ type job struct {
 	n  int
 }
 
-func runUser(ctx context.Context, u User, cfg Config, user int) Result {
-	res := Result{Codes: map[string]int{}, Retried: map[string]int{}}
-	var mu sync.Mutex
-	retried := func(err error) {
-		mu.Lock()
-		res.Retried[status(err)]++
-		mu.Unlock()
+// queue holds a user's parts to send, in the order they go out, and how many
+// of the user's files haven't ended.
+type queue struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	jobs     []job
+	open     int
+	producer bool // the files are still being created
+}
+
+func newQueue() *queue {
+	q := &queue{producer: true}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+// push adds jobs at the back, or at the front.
+func (q *queue) push(front bool, js ...job) {
+	q.mu.Lock()
+	if front {
+		q.jobs = append(slices.Clone(js), q.jobs...)
+	} else {
+		q.jobs = append(q.jobs, js...)
 	}
-	jobs := make(chan job)
+	q.mu.Unlock()
+	q.cond.Broadcast()
+}
+
+// pop waits for a job; it returns false once no job is left and none can
+// come.
+func (q *queue) pop() (job, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.jobs) == 0 && (q.producer || q.open > 0) {
+		q.cond.Wait()
+	}
+	if len(q.jobs) == 0 {
+		return job{}, false
+	}
+	j := q.jobs[0]
+	q.jobs = q.jobs[1:]
+	q.cond.Broadcast()
+	return j, true
+}
+
+// drained waits until every job queued has been taken.
+func (q *queue) drained() {
+	q.mu.Lock()
+	for len(q.jobs) > 0 {
+		q.cond.Wait()
+	}
+	q.mu.Unlock()
+}
+
+func (q *queue) opened() { q.mu.Lock(); q.open++; q.mu.Unlock() }
+
+func (q *queue) ended() {
+	q.mu.Lock()
+	q.open--
+	q.mu.Unlock()
+	q.cond.Broadcast()
+}
+
+func (q *queue) finished() {
+	q.mu.Lock()
+	q.producer = false
+	q.mu.Unlock()
+	q.cond.Broadcast()
+}
+
+// userState is what a user's workers share.
+type userState struct {
+	mu        sync.Mutex
+	res       Result
+	downSince time.Time
+	uploaded  int64
+}
+
+func (st *userState) retried(err error) {
+	st.mu.Lock()
+	st.res.Retried[status(err)]++
+	st.mu.Unlock()
+}
+
+// answered notes whether a call got an answer, for the time the server
+// gave none.
+func (st *userState) answered(ok bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	switch {
+	case !ok && st.downSince.IsZero():
+		st.downSince = time.Now()
+	case ok && !st.downSince.IsZero():
+		st.res.Stalled += time.Since(st.downSince)
+		st.downSince = time.Time{}
+	}
+}
+
+func runUser(ctx context.Context, u User, cfg Config, user int, start time.Time) Result {
+	st := &userState{res: Result{Codes: map[string]int{}, Retried: map[string]int{}}}
+	q := newQueue()
+	r := retrier{cfg: cfg, st: st}
+	end := func(up *upload, code string) {
+		if up.cancel != nil {
+			up.cancel()
+		}
+		st.mu.Lock()
+		st.res.Codes[code]++
+		for n, k := range up.sends {
+			if k > 1 {
+				st.res.Resent += int64(k-1) * partLen(cfg.Size, up.c.PartSize, n)
+			}
+		}
+		if code == "201" {
+			st.uploaded += cfg.Size
+			if !up.stopped.IsZero() && up.resumed {
+				st.res.Resumes = append(st.res.Resumes, time.Since(up.stopped))
+			}
+		}
+		st.mu.Unlock()
+		q.ended()
+	}
 	var workers sync.WaitGroup
 	for range max(cfg.Parallel, 1) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			var buf []byte
-			for j := range jobs {
-				mu.Lock()
-				skip := j.up.failed != nil
-				mu.Unlock()
+			for {
+				j, ok := q.pop()
+				if !ok {
+					return
+				}
+				st.mu.Lock()
+				skip := j.up.failed != nil || !j.up.stopped.IsZero() && !j.up.resumed
+				upCtx := j.up.ctx
+				st.mu.Unlock()
 				var d time.Duration
 				var err error
 				if !skip {
 					if ps := j.up.c.PartSize; int64(len(buf)) < ps {
 						buf = make([]byte, ps)
 					}
-					d, err = sendPart(ctx, u.API, cfg.Size, j, buf, retried)
+					d, err = r.sendPart(upCtx, u.API, cfg.Size, j, buf)
 				}
-				mu.Lock()
-				if err != nil && j.up.failed == nil {
-					j.up.failed = err
-				}
-				if err == nil && !skip {
-					res.Parts = append(res.Parts, d)
+				st.mu.Lock()
+				switch {
+				case skip:
+				case err != nil && !j.up.stopped.IsZero() && !j.up.resumed:
+					// Cut off by its file's stop, to be resumed.
+				case err != nil:
+					if j.up.failed == nil {
+						j.up.failed = err
+					}
+				default:
+					st.res.Parts = append(st.res.Parts, d)
+					j.up.done++
+					if j.up.stopAt > 0 && j.up.done >= j.up.stopAt && j.up.stopped.IsZero() {
+						// Under the lock, so that no part fails unnoticed between the
+						// stop and the cut, and no resumed session is cancelled.
+						j.up.stopped = time.Now()
+						j.up.cancel()
+					}
 				}
 				j.up.left--
 				last := j.up.left == 0
-				mu.Unlock()
-				if last {
-					status := finish(ctx, u.API, j.up, retried)
-					mu.Lock()
-					res.Codes[status]++
-					mu.Unlock()
+				st.mu.Unlock()
+				if !last {
+					continue
 				}
+				st.mu.Lock()
+				resume := j.up.failed == nil && !j.up.stopped.IsZero() && !j.up.resumed
+				st.mu.Unlock()
+				if resume {
+					if code, ok := r.resume(ctx, u, cfg, j.up, q); !ok {
+						end(j.up, code)
+					}
+					continue
+				}
+				end(j.up, r.finish(ctx, u.API, j.up))
 			}
 		}()
 	}
 	for f := range cfg.Files {
-		up := &upload{seed: byte(user*31 + f)}
 		name := fmt.Sprintf("load-%03d-%04d.bin", user, f)
-		c, _, err := retry(ctx, func() (transfer.Created, error) {
-			return u.API.Create(ctx, transfer.CreateRequest{Dir: u.Dir, Name: name, Size: cfg.Size})
-		}, retried)
+		up := &upload{name: name, seed: byte(user*31 + f), sends: map[int]int{}}
+		up.key = clientKey(u.Dir, name, cfg.Size, up.seed)
+		q.opened()
+		c, err := r.create(ctx, u, cfg, up)
 		if err != nil {
-			mu.Lock()
-			res.Codes[status(err)]++
-			mu.Unlock()
+			end(up, status(err))
 			continue
 		}
-		up.c, up.hashes, up.left = c, make([][sha256.Size]byte, c.PartCount), c.PartCount
+		r.start(ctx, up, c, cfg)
 		if c.PartCount == 0 {
-			code := finish(ctx, u.API, up, retried)
-			mu.Lock()
-			res.Codes[code]++
-			mu.Unlock()
+			end(up, r.finish(ctx, u.API, up))
 			continue
 		}
-		for n := 1; n <= c.PartCount; n++ {
-			jobs <- job{up: up, n: n}
+		q.push(false, jobsFor(up, nil)...)
+		q.drained()
+	}
+	q.finished()
+	workers.Wait()
+	if !st.downSince.IsZero() {
+		st.res.Stalled += time.Since(st.downSince)
+	}
+	if st.uploaded > 0 {
+		st.res.UserRates = []float64{float64(st.uploaded) / (1 << 20) / time.Since(start).Seconds()}
+	} else {
+		st.res.UserRates = []float64{0}
+	}
+	return st.res
+}
+
+// clientKey identifies a file for resuming it, as the browser's key does.
+func clientKey(dir, name string, size int64, seed byte) string {
+	h := sha256.Sum256(fmt.Appendf(nil, "%s\n%s\n%d\n%d", dir, name, size, seed))
+	return hex.EncodeToString(h[:])
+}
+
+// jobsFor returns a job for each part of up, or for the parts in need only.
+func jobsFor(up *upload, need []int) []job {
+	if need == nil {
+		need = make([]int, up.c.PartCount)
+		for i := range need {
+			need[i] = i + 1
 		}
 	}
-	close(jobs)
-	workers.Wait()
-	return res
+	js := make([]job, len(need))
+	for i, n := range need {
+		js[i] = job{up: up, n: n}
+	}
+	return js
+}
+
+// retrier makes the calls of one user, tried again as cfg says.
+type retrier struct {
+	cfg Config
+	st  *userState
+}
+
+func (r retrier) create(ctx context.Context, u User, cfg Config, up *upload) (transfer.Created, error) {
+	c, _, err := retry(ctx, r, func() (transfer.Created, error) {
+		return u.API.Create(ctx, transfer.CreateRequest{Dir: u.Dir, Name: up.name, Size: cfg.Size, ClientKey: up.key})
+	})
+	return c, err
+}
+
+// start gives up the session c: its parts go out under a context of their
+// own, which the file's stop cancels. A file stops only once.
+func (r retrier) start(ctx context.Context, up *upload, c transfer.Created, cfg Config) {
+	r.st.mu.Lock()
+	defer r.st.mu.Unlock()
+	if up.hashes == nil || len(up.hashes) != c.PartCount {
+		up.hashes = make([][sha256.Size]byte, c.PartCount)
+	}
+	up.c, up.left = c, c.PartCount
+	if up.cancel != nil {
+		up.cancel()
+	}
+	up.ctx, up.cancel = context.WithCancel(ctx)
+	up.stopAt = 0
+	if cfg.ResumeAt > 0 && !up.resumed {
+		up.stopAt = max(1, int(cfg.ResumeAt*float64(c.PartCount)))
+	}
+}
+
+// resume makes the file's session again with its client key and queues the
+// parts the server lacks, first. It returns false, with the status that
+// ended the file, if it couldn't.
+func (r retrier) resume(ctx context.Context, u User, cfg Config, up *upload, q *queue) (string, bool) {
+	c, err := r.create(ctx, u, cfg, up)
+	if err != nil {
+		return status(err), false
+	}
+	r.st.mu.Lock()
+	up.resumed = true
+	r.st.mu.Unlock()
+	var need []int
+	if c.Resumed {
+		have := map[int]bool{}
+		for _, rg := range c.Received {
+			for n := rg[0]; n <= rg[1]; n++ {
+				have[n] = true
+			}
+		}
+		for n := 1; n <= c.PartCount; n++ {
+			if !have[n] {
+				need = append(need, n)
+			}
+		}
+	} else {
+		r.st.mu.Lock()
+		up.stopped = time.Time{}
+		r.st.mu.Unlock()
+	}
+	r.start(ctx, up, c, cfg)
+	if c.Resumed {
+		r.st.mu.Lock()
+		up.left = len(need)
+		r.st.mu.Unlock()
+		if len(need) == 0 {
+			return r.finish(ctx, u.API, up), false
+		}
+		q.push(true, jobsFor(up, need)...)
+		return "", true
+	}
+	q.push(true, jobsFor(up, nil)...)
+	return "", true
 }
 
 // fill writes into b the bytes of the file with the given seed that start
@@ -195,43 +479,91 @@ func fill(b []byte, off int64, seed byte) {
 
 // sendPart sends part j.n, as the server's answer to create cut the file,
 // and returns how long its last try took.
-func sendPart(ctx context.Context, api API, size int64, j job, buf []byte, retried func(error)) (time.Duration, error) {
+func (r retrier) sendPart(ctx context.Context, api API, size int64, j job, buf []byte) (time.Duration, error) {
 	c := j.up.c
 	off := int64(j.n-1) * c.PartSize
 	b := buf[:min(c.PartSize, size-off)]
 	fill(b, off, j.up.seed)
 	h := sha256.Sum256(b)
+	r.st.mu.Lock()
 	j.up.hashes[j.n-1] = h
+	r.st.mu.Unlock()
 	sum := hex.EncodeToString(h[:])
-	_, d, err := retry(ctx, func() (transfer.PartResult, error) {
-		return api.Part(ctx, transfer.PartRequest{ID: c.UploadID, N: j.n, SHA256: sum, Length: int64(len(b)), Body: bytes.NewReader(b)})
-	}, retried)
+	_, d, err := retry(ctx, r, func() (transfer.PartResult, error) {
+		if ctx.Err() != nil {
+			return transfer.PartResult{}, ctx.Err()
+		}
+		res, err := api.Part(ctx, transfer.PartRequest{ID: c.UploadID, N: j.n, SHA256: sum, Length: int64(len(b)), Body: bytes.NewReader(b)})
+		if err == nil || errors.Is(err, ErrNoAnswer) && !errors.Is(err, ErrNotConnected) || ctx.Err() != nil {
+			r.st.mu.Lock()
+			j.up.sends[j.n]++
+			r.st.mu.Unlock()
+		}
+		return res, err
+	})
 	return d, err
 }
 
-func finish(ctx context.Context, api API, up *upload, retried func(error)) string {
-	if up.failed != nil {
-		return status(up.failed)
+// finish completes up, unless one of its parts failed, and returns the
+// status its upload ended with.
+func (r retrier) finish(ctx context.Context, api API, up *upload) string {
+	r.st.mu.Lock()
+	failed := up.failed
+	hashes := slices.Clone(up.hashes)
+	r.st.mu.Unlock()
+	if failed != nil {
+		return status(failed)
 	}
-	_, _, err := retry(ctx, func() (transfer.Result, error) {
-		return api.Complete(ctx, up.c.UploadID, transfer.Composite(up.hashes))
-	}, retried)
+	_, d, err := retry(ctx, r, func() (transfer.Result, error) {
+		return api.Complete(ctx, up.c.UploadID, transfer.Composite(hashes))
+	})
 	if err != nil {
 		return status(err)
 	}
+	r.st.mu.Lock()
+	r.st.res.Completes = append(r.st.res.Completes, d)
+	r.st.mu.Unlock()
 	return "201"
 }
 
+// partLen is the length of part n of a file of size bytes.
+func partLen(size, partSize int64, n int) int64 {
+	off := int64(n-1) * partSize
+	return min(partSize, size-off)
+}
+
 // retry repeats a call the server refused for being busy, with growing
-// pauses, telling retried of each refusal, and returns how long its last
-// try took.
-func retry[T any](ctx context.Context, call func() (T, error), retried func(error)) (T, time.Duration, error) {
+// pauses, and, for up to RetryFor, one that got no answer or found the
+// server shutting down. It tells r of each try repeated, and returns how
+// long the last try took.
+func retry[T any](ctx context.Context, r retrier, call func() (T, error)) (T, time.Duration, error) {
 	wait := 5 * time.Millisecond
+	var down time.Time
 	for {
 		start := time.Now()
 		v, err := call()
 		took := time.Since(start)
-		if !errors.Is(err, transfer.ErrBusy) && !errors.Is(err, transfer.ErrTooManyRequests) && !errors.Is(err, transfer.ErrPartInProgress) {
+		gone := errors.Is(err, ErrNoAnswer) || errors.Is(err, transfer.ErrShuttingDown)
+		if ctx.Err() == nil {
+			r.st.answered(!gone)
+		}
+		switch {
+		case err == nil:
+			return v, took, nil
+		case ctx.Err() != nil:
+			return v, took, err
+		case gone:
+			if r.cfg.RetryFor <= 0 {
+				return v, took, err
+			}
+			if down.IsZero() {
+				down = start
+			}
+			if time.Since(down) > r.cfg.RetryFor {
+				return v, took, err
+			}
+		case errors.Is(err, transfer.ErrBusy), errors.Is(err, transfer.ErrTooManyRequests), errors.Is(err, transfer.ErrPartInProgress):
+		default:
 			return v, took, err
 		}
 		select {
@@ -239,7 +571,7 @@ func retry[T any](ctx context.Context, call func() (T, error), retried func(erro
 			return v, took, err
 		case <-time.After(wait):
 		}
-		retried(err)
+		r.st.retried(err)
 		wait = min(2*wait, time.Second)
 	}
 }
@@ -312,22 +644,30 @@ func (r Result) CodeColumn() string {
 }
 
 // Percentile returns the p-th percentile of the part latencies, p in [0, 1].
-func (r Result) Percentile(p float64) time.Duration {
-	if len(r.Parts) == 0 {
+func (r Result) Percentile(p float64) time.Duration { return Percentile(r.Parts, p) }
+
+// Percentile returns the p-th percentile of ds, p in [0, 1], or 0 for none.
+func Percentile(ds []time.Duration, p float64) time.Duration {
+	if len(ds) == 0 {
 		return 0
 	}
-	l := slices.Clone(r.Parts)
+	l := slices.Clone(ds)
 	slices.Sort(l)
 	return l[min(int(p*float64(len(l))), len(l)-1)]
 }
 
-// Header is the first line of the benchmark scripts' CSV files.
-const Header = "commit,dirty,scenario,size_bytes,files,concurrency,rep,seconds,mib_per_s,durable_upper_seconds,server_cpu_s,http_code,transport"
+// ScriptColumns are the columns of the benchmark scripts' CSV files.
+const ScriptColumns = "commit,dirty,scenario,size_bytes,files,concurrency,rep,seconds,mib_per_s,durable_upper_seconds,server_cpu_s,http_code,transport"
+
+// Header is the first line of the load client's CSV files: the scripts'
+// columns, then its own.
+const Header = ScriptColumns + ",part_p50_ms,part_p99_ms,complete_p50_ms,complete_max_ms,retried,resent_bytes," +
+	"user_min_mib_s,user_max_mib_s,client_cpu_s,resumed,resume_p50_s,resume_max_s,stalled_s,started_unix"
 
 // Row is one line of that CSV. A completion answers only once the file is
 // on disk, so the durable time is the time itself. The server's CPU time
-// isn't measured, and is left empty: in one process it can't be told apart
-// from the client's.
+// isn't measured, and is left empty, and so is the client's in process,
+// where the two can't be told apart.
 func (r Result) Row(commit string, dirty bool, scenario string, size int64, concurrency, rep int, transport string) string {
 	secs := r.Duration.Seconds()
 	mibs := 0.0
@@ -338,6 +678,36 @@ func (r Result) Row(commit string, dirty bool, scenario string, size int64, conc
 	if dirty {
 		d = 1
 	}
-	return fmt.Sprintf("%s,%d,%s,%d,%d,%d,%d,%.6f,%.3f,%.6f,,%s,%s",
-		commit, d, scenario, size, r.Files, concurrency, rep, secs, mibs, secs, r.CodeColumn(), transport)
+	ms := func(d time.Duration) string { return fmt.Sprintf("%.3f", float64(d)/float64(time.Millisecond)) }
+	var lo, hi float64
+	if len(r.UserRates) > 0 {
+		lo, hi = slices.Min(r.UserRates), slices.Max(r.UserRates)
+	}
+	cpu := ""
+	if transport != "inprocess" && r.CPU >= 0 {
+		cpu = fmt.Sprintf("%.3f", r.CPU.Seconds())
+	}
+	return fmt.Sprintf("%s,%d,%s,%d,%d,%d,%d,%.6f,%.3f,%.6f,,%s,%s,%s,%s,%s,%s,%s,%d,%.3f,%.3f,%s,%d,%.3f,%.3f,%.3f,%.6f",
+		commit, d, scenario, size, r.Files, concurrency, rep, secs, mibs, secs, r.CodeColumn(), transport,
+		ms(Percentile(r.Parts, 0.5)), ms(Percentile(r.Parts, 0.99)),
+		ms(Percentile(r.Completes, 0.5)), ms(Percentile(r.Completes, 1)),
+		Counts(r.Retried), r.Resent, lo, hi, cpu,
+		len(r.Resumes), Percentile(r.Resumes, 0.5).Seconds(), Percentile(r.Resumes, 1).Seconds(), r.Stalled.Seconds(),
+		float64(r.Start.UnixMicro())/1e6)
+}
+
+// Counts lists a count of each status, such as "429x1 503x2", or nothing
+// for none.
+func Counts(m map[string]int) string {
+	var keys []string
+	for k, v := range m {
+		if v > 0 {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for i, k := range keys {
+		keys[i] = fmt.Sprintf("%sx%d", k, m[k])
+	}
+	return strings.Join(keys, " ")
 }

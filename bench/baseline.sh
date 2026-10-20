@@ -7,7 +7,9 @@
 # Options (environment variables):
 #   SIZES="64K 1M 16M 256M 1G 5G"  file sizes (IEC units)
 #   REPS=5                          repetitions per measurement
-#   WORK=bench/.work                scratch space; must be on the disk you serve from
+#   BENCH_DIR                       the benchmark folder (required), made with bench/init.sh: an absolute
+#                                   path on the disk you serve from. Everything this script writes but its
+#                                   results lives in it, and it deletes nothing outside it.
 #   DROP_CACHES=1                   drop the page cache before each download (asks for sudo)
 #   LOG_EVENTS=1                    keep the server's console event log on; by default it is
 #                                   turned off where the server allows it, so its cost is not measured
@@ -27,7 +29,6 @@ export LC_ALL=C
 
 SIZES=${SIZES:-"64K 1M 16M 256M 1G 5G"}
 REPS=${REPS:-5}
-WORK=${WORK:-$PWD/bench/.work}
 DROP_CACHES=${DROP_CACHES:-0}
 LOG_EVENTS=${LOG_EVENTS:-0}
 PORT=${PORT:-18080}
@@ -41,6 +42,11 @@ esac
 URL="$SCHEME://localhost:$PORT"
 
 [ -f go.mod ] && [ -d cmd/gocalbox ] || { echo "run from the repository root" >&2; exit 1; }
+[ -z "${WORK:-}" ] || { echo "WORK is replaced by BENCH_DIR, a folder made with bench/init.sh" >&2; exit 1; }
+. bench/lib/safe.sh
+bench_use "${BENCH_DIR:-}" || exit 1
+WORK=$BENCH_DIR/baseline
+DATA=$BENCH_DIR/data
 [ "${BASH_VERSINFO[0]}" -ge 5 ] || { echo "needs bash 5 or later" >&2; exit 1; }
 for tool in curl numfmt awk git go sort uniq; do command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 1; }; done
 case $(sync --help 2>&1 || true) in
@@ -52,18 +58,18 @@ COMMIT=$(git rev-parse --short HEAD)
 DIRTY=0; git diff --quiet HEAD -- . ':!bench' || DIRTY=1
 [ "$DIRTY" = 1 ] && echo "warning: uncommitted changes; results are marked dirty=1" >&2
 STAMP=$(date +%Y%m%d-%H%M%S)
-mkdir -p bench/results "$WORK/data"
+mkdir -p bench/results "$WORK" "$DATA"
 CSV="bench/results/$COMMIT-$STAMP.csv"
 ENV="bench/results/$COMMIT-$STAMP-env.txt"
 ROOT="$WORK/root"; AUDIT="$WORK/audit.jsonl"; CODES="$WORK/codes"; TLS_DIR="$WORK/tls"
-rm -rf "${ROOT:?}" "$AUDIT"; mkdir -p "$ROOT"
+bench_rm "$ROOT" "$AUDIT"; mkdir -p "$ROOT"
 
 # Random, so neither compression nor sparse files flatter the numbers.
 for s in $SIZES; do
-  f="$WORK/data/$s.bin"
+  f="$DATA/$s.bin"
   [ -f "$f" ] || { echo "generating $s"; head -c "$(numfmt --from=iec "$s")" /dev/urandom > "$f"; }
 done
-[ -f "$WORK/data/batch-1M.bin" ] || head -c 1048576 /dev/urandom > "$WORK/data/batch-1M.bin"
+[ -f "$DATA/batch-1M.bin" ] || head -c 1048576 /dev/urandom > "$DATA/batch-1M.bin"
 
 GOVERNOR=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)
 [ "$GOVERNOR" = performance ] || echo "warning: CPU governor is '$GOVERNOR', not 'performance'; results will not be comparable" >&2
@@ -82,7 +88,7 @@ BENCH_PW=
 case $FLAGS in
   *-state*)
     # Without an admin the server starts in setup mode and refuses every file request.
-    STATE="$WORK/state.db"; rm -f "$STATE"
+    STATE="$WORK/state.db"; bench_rm "$STATE"
     BENCH_PW=$(head -c 24 /dev/urandom | base64)
     printf '%s\n' "$BENCH_PW" | "$WORK/gocalbox" users add -username bench -role admin -state "$STATE" -audit-log "$AUDIT" > /dev/null
     SERVER_CMD+=(-state "$STATE") ;;
@@ -151,7 +157,7 @@ row() { echo "$COMMIT,$DIRTY,$*,$TRANSPORT" >> "$CSV"; }
 echo "commit,dirty,scenario,size_bytes,files,concurrency,rep,seconds,mib_per_s,durable_upper_seconds,server_cpu_s,http_code,transport" > "$CSV"
 
 for s in $SIZES; do
-  src="$WORK/data/$s.bin"; bytes=$(stat -c %s "$src")
+  src="$DATA/$s.bin"; bytes=$(stat -c %s "$src")
   for rep in $(seq "$REPS"); do
     sync
     read_cpu; c0=$CPU
@@ -171,15 +177,15 @@ for s in $SIZES; do
     IFS=, read -r code secs < <("${CURL[@]}" -o /dev/null -w '%{http_code},%{time_total}\n' "$URL/files/$s.bin")
     read_cpu; c1=$CPU
     row "download,$bytes,1,1,$rep,$secs,$(rate "$bytes" "$secs"),,$(cpus "$c0" "$c1"),$code"
-    rm -f "$ROOT/$s.bin"
+    bench_rm "$ROOT/$s.bin"
   done
   echo "done: $s"
 done
 
-batch="$WORK/data/batch-1M.bin"
+batch="$DATA/batch-1M.bin"
 for conc in 1 4 16; do
   for rep in $(seq "$REPS"); do
-    rm -rf "${ROOT:?}"/*; sync
+    bench_empty "$ROOT"; sync
     : > "$CODES"
     read_cpu; c0=$CPU; t0=$EPOCHREALTIME
     seq 100 | xargs -P "$conc" -I{} "${CURL[@]}" -o /dev/null -w '%{http_code}\n' -F "myFile=@$batch;filename=f{}.bin" "$URL/api/upload" >> "$CODES" || true
@@ -191,7 +197,7 @@ for conc in 1 4 16; do
   done
   echo "done: 100 x 1M at concurrency $conc"
 done
-rm -rf "${ROOT:?}"/* "$CODES"
+bench_empty "$ROOT"; bench_rm "$CODES"
 
 echo "server peak RSS: $(grep VmHWM /proc/$PID/status | awk '{print $2, $3}')" >> "$ENV"
 echo "audit records: $(wc -l < "$AUDIT")" >> "$ENV"
