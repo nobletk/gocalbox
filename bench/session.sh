@@ -20,9 +20,12 @@
 #                users=1, parallel=4, audit-parts=0, audit-wait=1, resume-at, min-free-mb=1024
 #   Every cell also takes reps=N, its measured repetitions.
 #
-# The runs are grouped by server, since a server restarts between groups:
-# the groups run in a shuffled order, and in each, the warm-ups first and
-# then the measured runs, shuffled. The order is written with the results.
+# The measured runs are spread over rounds, and in each round every server
+# serves a block of runs, the servers in a shuffled order, so that a drift
+# over the session (heat, background work) falls on every server alike. A
+# cell's repetitions are spread evenly over the rounds; its warm-ups open its
+# server's block in the first round. Within a block the runs are shuffled. A
+# server restarts for each of its blocks. The order is written with the results.
 #
 # Options (environment variables):
 #   BENCH_DIR      this machine's benchmark folder (required), made with bench/init.sh. Everything
@@ -39,6 +42,7 @@
 #   SEED=          the shuffle's seed; by default a random one, recorded with the results
 #   REPS=10        measured repetitions of a cell; BIG_REPS=5 for files of 5 GiB and more
 #   WARMUP=1       repetitions of a cell before its measured ones, written with rep 0
+#   ROUNDS=5       rounds the measured runs are spread over; 1 runs each server's runs in one block
 #   DROP_CACHES=1  drop the server's page cache before each download (passwordless sudo there)
 #   IPERF=1        measure the link with iperf3 at the start and the end (needs iperf3 on both)
 #   PLAN_ONLY=1    write the order and stop
@@ -53,6 +57,7 @@ CELLS=${CELLS:-}
 REPS=${REPS:-10}
 BIG_REPS=${BIG_REPS:-5}
 WARMUP=${WARMUP:-1}
+ROUNDS=${ROUNDS:-5}
 DROP_CACHES=${DROP_CACHES:-1}
 IPERF=${IPERF:-1}
 PLAN_ONLY=${PLAN_ONLY:-0}
@@ -70,6 +75,7 @@ bench_use "${BENCH_DIR:-}" || exit 1
 for tool in curl numfmt awk go git shuf openssl sort; do command -v "$tool" > /dev/null || { echo "missing: $tool" >&2; exit 1; }; done
 [ -f "$MATRIX" ] || { echo "no matrix file $MATRIX" >&2; exit 1; }
 for n in REPS BIG_REPS WARMUP; do [[ ${!n} =~ ^[0-9]+$ ]] || { echo "$n must be a number" >&2; exit 1; }; done
+[[ $ROUNDS =~ ^[1-9][0-9]*$ ]] || { echo "ROUNDS must be a number from 1" >&2; exit 1; }
 if [ -n "$SERVER_SSH" ]; then
   : "${SERVER_HOST:?set SERVER_HOST to the server's address as this machine reaches it}"
   : "${SERVER_BENCH:?set SERVER_BENCH to the server's benchmark folder}"
@@ -197,21 +203,36 @@ NAME=$(basename "$MATRIX"); NAME=${NAME%.*}
 RUN="bench/results/session-$NAME-$STAMP"
 CSV="$RUN.csv"; ORDER="$RUN-order.csv"; ENV="$RUN-env.txt"
 PLAN=$WORK/plan-$STAMP
+BLOCK_SAMPLES=$WORK/samples-$STAMP
+BLOCK_LOG=$WORK/log-$STAMP
+BLOCK_REQUESTS=$WORK/requests-$STAMP
+SERVER_ENVS=$SERVER_BENCH/server/env-$STAMP
 : > "$PLAN"
-SERVERS=$(for id in "${CELL_IDS[@]}"; do echo "${CELL_SERVER[$id]}"; done | sort -u | shuffled servers)
-for srv in $SERVERS; do
-  for id in "${CELL_IDS[@]}"; do
-    [ "${CELL_SERVER[$id]}" = "$srv" ] || continue
-    for _ in $(seq "$WARMUP"); do echo "$srv $id 0"; done
-  done | shuffled "warmup-$srv" >> "$PLAN"
-  for id in "${CELL_IDS[@]}"; do
-    [ "${CELL_SERVER[$id]}" = "$srv" ] || continue
-    for r in $(seq "$(reps_of "$id")"); do echo "$srv $id $r"; done
-  done | shuffled "runs-$srv" >> "$PLAN"
+declare -A N_REPS=()
+for id in "${CELL_IDS[@]}"; do N_REPS[$id]=$((10#$(reps_of "$id"))); done
+SERVERS=$(for id in "${CELL_IDS[@]}"; do echo "${CELL_SERVER[$id]}"; done | sort -u)
+for round in $(seq "$ROUNDS"); do
+  for srv in $(shuffled "servers-$round" <<< "$SERVERS"); do
+    if [ "$round" = 1 ]; then
+      for id in "${CELL_IDS[@]}"; do
+        [ "${CELL_SERVER[$id]}" = "$srv" ] || continue
+        for _ in $(seq "$WARMUP"); do echo "$srv $id 0 1"; done
+      done | shuffled "warmup-$srv" >> "$PLAN"
+    fi
+    for id in "${CELL_IDS[@]}"; do
+      [ "${CELL_SERVER[$id]}" = "$srv" ] || continue
+      n=${N_REPS[$id]}
+      # Repetition r of n goes to the round holding the middle of its share of the rounds, so that
+      # fewer repetitions than rounds are spread out rather than bunched at the start.
+      for r in $(seq "$n"); do
+        if [ $(((2 * r - 1) * ROUNDS / (2 * n) + 1)) = "$round" ]; then echo "$srv $id $r $round"; fi
+      done
+    done | shuffled "runs-$srv-$round" >> "$PLAN"
+  done
 done
-echo "seq,server,cell,rep,t0,t1,outcome" > "$ORDER"
+echo "seq,server,cell,rep,round,t0,t1,outcome" > "$ORDER"
 if [ "$PLAN_ONLY" = 1 ]; then
-  awk '{printf "%d,%s,%s,%s,,,planned\n", NR, $1, $2, $3}' "$PLAN" >> "$ORDER"
+  awk '{printf "%d,%s,%s,%s,%s,,,planned\n", NR, $1, $2, $3, $4}' "$PLAN" >> "$ORDER"
   bench_rm "$PLAN"
   echo "seed $SEED: $(($(wc -l < "$ORDER") - 1)) runs; order: $ORDER"
   exit 0
@@ -237,6 +258,8 @@ remote_cat() { local cmd; cmd=$(q cat -- "$1"); remote "$cmd"; }
 server_sh() { local cmd; cmd="cd $(q "$SERVER_REPO") && $(q env "BENCH_DIR=$SERVER_BENCH" bash bench/server.sh "$@")"; remote "$cmd"; }
 
 SERVING=
+SERVER_PID=
+STOPPING=0
 start_server() {
   local srv=$1 log=$SERVER_BENCH/server/console.log state settings pid
   read -r -a settings <<< "${PROFILE_ENV[$srv]}"
@@ -244,15 +267,17 @@ start_server() {
   remote_rm "$SERVER_BENCH/server/run.env" "$SERVER_BENCH/server/ready"
   # A simple command in the background, so that nothing holds this session's output open.
   pid=$(remote "cd $(q "$SERVER_REPO") || exit 1; $(q env "${settings[@]}" "BENCH_DIR=$SERVER_BENCH" "PORT=$PORT" "BIND=$BIND" \
-    "LOAD_USERS=${PROFILE_USERS[$srv]}" nohup bash bench/server.sh) > $(q "$log") 2>&1 < /dev/null & echo \$!")
+    "LOAD_USERS=${PROFILE_USERS[$srv]}" "ENV_DIR=$SERVER_ENVS" nohup bash bench/server.sh) > $(q "$log") 2>&1 < /dev/null & echo \$!")
   [[ $pid =~ ^[0-9]+$ ]] || { echo "cannot start bench/server.sh for server $srv" >&2; exit 1; }
   SERVING=$srv
+  SERVER_PID=
+  STOPPING=0
   state=starting
   for _ in $(seq 3000); do
     state=$(remote "$(q test -f "$SERVER_BENCH/server/ready") && echo ready || { kill -0 $pid 2> /dev/null && echo starting || echo gone; }")
     case $state in
       ready) break ;;
-      gone) SERVING=; echo "bench/server.sh for server $srv stopped:" >&2; remote_cat "$log" | tail -20 >&2; exit 1 ;;
+      gone) echo "bench/server.sh for server $srv stopped:" >&2; remote_cat "$log" | tail -20 >&2; exit 1 ;;
     esac
     sleep 0.2
   done
@@ -281,18 +306,39 @@ start_server() {
 # server_alive succeeds while the block's server runs.
 server_alive() { remote "kill -0 $SERVER_PID 2> /dev/null"; }
 
-# stop_server stops the server and keeps its environment file, samples,
-# log and request log with the session's results, as far as they exist.
+# stop_server stops the server and adds its environment file, samples, log
+# and request log to the server's files with the session's results, as far
+# as they exist. The block's own samples stay in $BLOCK_SAMPLES for its rows.
+# A sample's fourth field, and the line before each environment, give the block's round.
+# The server is forgotten only once its files are fetched, so that a session
+# interrupted while stopping it stops it again on its way out and keeps them;
+# they are added to the results after that, so that they are added once.
 stop_server() {
-  local srv=$SERVING
+  local srv=$SERVING f again=$STOPPING
   [ -n "$srv" ] || return 0
+  STOPPING=1
+  # A second stop, from a session interrupted during the first, waits for the first to end.
+  if [ "$again" = 1 ]; then
+    server_sh stop > /dev/null 2>&1 || true
+  elif ! server_sh stop && [ -n "$SERVER_PID" ]; then
+    echo "warning: server $srv had stopped before the end of its runs" >&2
+  fi
+  # Collected from the session's own folder, so that the environment of a server that never got
+  # as far as telling where it is isn't left behind.
+  while IFS= read -r f; do
+    { echo "round: $ROUND"; remote_cat "$f" || true; } >> "$RUN-server-$srv-env.txt"
+    remote_rm "$f" || true
+  done < <(remote "find $(q "$SERVER_ENVS") -maxdepth 1 -type f -name 'server-*-env.txt' 2> /dev/null | sort || true")
+  if [ -z "${SRV_ENV:-}" ]; then SERVING=; return 0; fi
+  remote_cat "$SRV_SAMPLES" > "$BLOCK_SAMPLES" || true
+  remote_cat "$SRV_LOG" > "$BLOCK_LOG" || true
+  : > "$BLOCK_REQUESTS"
+  if [ -n "${SRV_REQUESTS:-}" ]; then remote_cat "$SRV_REQUESTS" > "$BLOCK_REQUESTS" || true; fi
   SERVING=
-  server_sh stop || echo "warning: server $srv had stopped before the end of its runs" >&2
-  [ -n "${SRV_ENV:-}" ] || return 0
-  remote_cat "$SERVER_REPO/$SRV_ENV" > "$RUN-server-$srv-env.txt" || true
-  remote_cat "$SRV_SAMPLES" > "$RUN-server-$srv-samples.csv" || true
-  remote_cat "$SRV_LOG" > "$RUN-server-$srv.log" || true
-  if [ -n "${SRV_REQUESTS:-}" ]; then remote_cat "$SRV_REQUESTS" > "$RUN-server-$srv-requests.jsonl" || true; fi
+  awk -v n="$ROUND" '{print $0 "," n}' "$BLOCK_SAMPLES" >> "$RUN-server-$srv-samples.csv" || true
+  cat -- "$BLOCK_LOG" >> "$RUN-server-$srv.log" || true
+  if [ -n "${SRV_REQUESTS:-}" ]; then cat -- "$BLOCK_REQUESTS" >> "$RUN-server-$srv-requests.jsonl" || true; fi
+  bench_rm "$BLOCK_LOG" "$BLOCK_REQUESTS"
 }
 trap 'stop_server || true; close_ssh' EXIT
 PLACED=()
@@ -397,7 +443,8 @@ run_cell() {
       t1=$EPOCHREALTIME
       if [ "$code" != 200 ]; then OUTCOME="answered $code"
       elif [ "$got" != "$bytes" ]; then code="$code wrong_size"; OUTCOME="got $got of $bytes bytes"
-      elif [ -f "$sum" ] && [ "$(cat "$sum")" != "$(cat "$(data "$size").sha256")" ]; then code="$code wrong_file"; OUTCOME="got other bytes"; fi
+      elif [ -f "$sum" ] && [ "$(cat "$sum")" != "$(cat "$(data "$size").sha256")" ]; then code="$code wrong_file"; OUTCOME="got other bytes"
+      elif [ -n "${MISPLACED[$size]:-}" ]; then code="$code wrong_file"; OUTCOME="the file placed for it isn't the source's bytes"; fi
       bench_rm "$sum"
       row "$id" "$bytes" 1 1 "$rep" "$secs" "" "$code" "$transport" "$t0" "$t1" ;;
     batch)
@@ -421,7 +468,7 @@ run_cell() {
 
 # place_downloads uploads the files the server's download cells fetch.
 place_downloads() {
-  local srv=$1 id size src code ARGS
+  local srv=$1 id size src code sum ARGS
   for id in "${CELL_IDS[@]}"; do
     [ "${CELL_SERVER[$id]}" = "$srv" ] && [ "${CELL_TOOL[$id]}" = download ] || continue
     ARGS=${CELL_ARGS[$id]}; size=$(value size 0); src=$(data "$size")
@@ -430,6 +477,12 @@ place_downloads() {
     code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' -F "myFile=@$src;filename=d-$size.bin" "$URL/api/upload" || true)
     [ "$code" = 201 ] || { echo "cannot place the $size file for downloads on server $srv: $code" >&2; exit 1; }
     PLACED+=("$size")
+    # Later blocks have no warm-up to hash what their downloads get, so the placed file is checked.
+    sum=$(remote "$(q sha256sum -- "$SRV_ROOT/d-$size.bin")" | cut -d' ' -f1 || true)
+    if [ "$sum" != "$(cat "$src.sha256")" ]; then
+      MISPLACED[$size]=1
+      echo "warning: the $size file placed for downloads on server $srv isn't the source's bytes" | tee -a "$ENV" >&2
+    fi
   done
 }
 
@@ -469,7 +522,7 @@ link_rates; UP0=$UP; DOWN0=$DOWN
   echo "session: $MATRIX   seed: $SEED   started: $(date -Is)"
   echo "client commit: $(git rev-parse --short HEAD) (dirty=$(git diff --quiet HEAD -- . ':!bench' && echo 0 || echo 1))"
   echo "server: ${SERVER_SSH:-this machine} at $SERVER_HOST:$PORT, repository $SERVER_REPO, benchmark folder $SERVER_BENCH"
-  echo "reps: $REPS, $BIG_REPS from 5 GiB; warm-ups: $WARMUP; drop caches before downloads: $DROP_CACHES"
+  echo "reps: $REPS, $BIG_REPS from 5 GiB; warm-ups: $WARMUP; rounds: $ROUNDS; drop caches before downloads: $DROP_CACHES"
   echo "cells: ${CELLS:-all}"
   echo "iperf3 at the start, Mbit/s: to the server $UP0, from the server $DOWN0"
   echo "--- this machine"
@@ -494,8 +547,11 @@ end_block() {
     if [ -n "$left" ]; then
       echo "warning: runs on server $CURRENT left files in its served folder: $(echo $left)" | tee -a "$ENV" >&2
     fi
+    # The server's CPU is sampled every 0.1 s, and a run's CPU time is read from the samples on
+    # either side of it: the block's last run needs one taken after it.
+    sleep 0.3
     stop_server
-    samples=$RUN-server-$CURRENT-samples.csv
+    samples=$BLOCK_SAMPLES
     [ -s "$samples" ] || samples=/dev/null
   fi
   # Rows are written before anything is deleted; a block whose rows can't be
@@ -514,23 +570,32 @@ end_block() {
       if (n > 0 && $2 != "" && $3 != "") f[11] = sprintf("%.4f", cpu_at($3 + 0) - cpu_at($2 + 0))
       line = f[1]; for (i = 2; i <= m; i++) line = line "," f[i]; print line
     }' "$samples" "$RAW" >> "$CSV" || { echo "warning: the rows of server $CURRENT are kept in $RAW" >&2; CURRENT=; return 1; }
-  bench_rm "$RAW"
+  bench_rm "$RAW" "$BLOCK_SAMPLES"
   CURRENT=
 }
 
 TOTAL=$(wc -l < "$PLAN")
 SEQ=0
 CURRENT=
+ROUND=
 RAW=
 PLACED=()
+declare -A MISPLACED=()
 FAILED=0
-trap 'end_block || true; close_ssh; bench_rm "$PLAN" || true' EXIT
-while read -r srv id rep <&3; do
-  if [ "$srv" != "$CURRENT" ]; then
+# drop_envs deletes the folder of the servers' environment files once nothing is left in it.
+drop_envs() {
+  local d; d=$(q "$SERVER_ENVS")
+  if remote "[ -d $d ] && [ -z \"\$(ls -A $d)\" ]"; then remote_rm "$SERVER_ENVS"; fi
+}
+trap 'end_block || true; drop_envs || true; close_ssh; bench_rm "$PLAN" || true' EXIT
+while read -r srv id rep round <&3; do
+  if [ "$srv" != "$CURRENT" ] || [ "$round" != "$ROUND" ]; then
     end_block
     CURRENT=$srv
+    ROUND=$round
     RAW=$WORK/raw-$STAMP; : > "$RAW"
     PLACED=()
+    MISPLACED=()
     unset "${!SRV_@}"
     SRV_COMMIT=; SRV_DIRTY=
     GONE=0
@@ -543,7 +608,7 @@ while read -r srv id rep <&3; do
   fi
   SEQ=$((SEQ + 1))
   if [ "$GONE" = 1 ]; then
-    echo "$SEQ,$srv,$id,$rep,,,skipped: the server had stopped" >> "$ORDER"
+    echo "$SEQ,$srv,$id,$rep,$round,,,skipped: the server had stopped" >> "$ORDER"
     FAILED=$((FAILED + 1))
     continue
   fi
@@ -551,16 +616,17 @@ while read -r srv id rep <&3; do
   run_cell "$id" "$rep"
   t1=$EPOCHREALTIME
   # The order is a CSV: an outcome holds no comma.
-  echo "$SEQ,$srv,$id,$rep,$t0,$t1,${OUTCOME//,/;}" >> "$ORDER"
+  echo "$SEQ,$srv,$id,$rep,$round,$t0,$t1,${OUTCOME//,/;}" >> "$ORDER"
   [ "$OUTCOME" = ok ] || { FAILED=$((FAILED + 1)); echo "warning: $id rep $rep: $OUTCOME" >&2; }
   if [ "$OUTCOME" != ok ] && [ "$srv" != - ] && ! server_alive; then
     GONE=1
-    echo "warning: server $srv stopped; the rest of its runs are skipped" | tee -a "$ENV" >&2
+    echo "warning: server $srv stopped; the rest of its block's runs are skipped" | tee -a "$ENV" >&2
   fi
   echo "[$SEQ/$TOTAL] $id rep $rep: $OUTCOME"
 done 3< "$PLAN"
 end_block
 bench_rm "$PLAN" "$LOAD" "$WORK/server-ca.crt" "$WORK/session-header"
+drop_envs
 
 link_rates
 {

@@ -2,14 +2,17 @@ package lib
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nobletk/gocalbox/bench/load"
 )
@@ -60,13 +63,16 @@ func planOf(t *testing.T, dir, matrix string, env ...string) []string {
 		t.Fatalf("session.sh: %s", out)
 	}
 	order := strings.Split(strings.TrimSpace(output(t, strings.Replace(out, "; order: ", "\norder: ", 1), "order")), "\n")
+	if order[0] != "seq,server,cell,rep,round,t0,t1,outcome" {
+		t.Fatalf("order header %q", order[0])
+	}
 	var runs []string
 	for _, line := range order[1:] {
 		f := strings.Split(line, ",")
-		if f[6] != "planned" {
+		if len(f) != 8 || f[7] != "planned" {
 			t.Fatalf("order line %s", line)
 		}
-		runs = append(runs, f[1]+" "+f[2]+" "+f[3])
+		runs = append(runs, f[1]+" "+f[2]+" "+f[3]+" "+f[4])
 	}
 	return runs
 }
@@ -81,8 +87,9 @@ cell u1 a upload size=64K reps=2
 cell ip - inprocess size=1M
 `
 
-// The order depends on the seed alone: the servers' groups, each with its
-// warm-ups first, then its measured runs, every cell as often as asked.
+// The order depends on the seed alone. The measured runs are spread over
+// the rounds, each cell's evenly; in each round every server serves one
+// block; a server's warm-ups open its first block.
 func TestTheSessionsOrder(t *testing.T) {
 	needBash(t)
 	for _, tool := range []string{"shuf", "openssl", "numfmt"} {
@@ -92,9 +99,9 @@ func TestTheSessionsOrder(t *testing.T) {
 	}
 	keepResults(t)
 	dir := benchDir(t)
-	first := planOf(t, dir, planMatrix, "SEED=7", "REPS=4", "BIG_REPS=2", "WARMUP=1")
-	again := planOf(t, dir, planMatrix, "SEED=7", "REPS=4", "BIG_REPS=2", "WARMUP=1")
-	other := planOf(t, dir, planMatrix, "SEED=8", "REPS=4", "BIG_REPS=2", "WARMUP=1")
+	first := planOf(t, dir, planMatrix, "SEED=7", "REPS=4", "BIG_REPS=2", "WARMUP=1", "ROUNDS=4")
+	again := planOf(t, dir, planMatrix, "SEED=7", "REPS=4", "BIG_REPS=2", "WARMUP=1", "ROUNDS=4")
+	other := planOf(t, dir, planMatrix, "SEED=8", "REPS=4", "BIG_REPS=2", "WARMUP=1", "ROUNDS=4")
 	if !slices.Equal(first, again) {
 		t.Errorf("the same seed gave\n%q\nand\n%q", first, again)
 	}
@@ -110,27 +117,136 @@ func TestTheSessionsOrder(t *testing.T) {
 	if fmt.Sprint(count) != fmt.Sprint(want) {
 		t.Errorf("runs %v, want %v", count, want)
 	}
-	// Each server's runs are together, its warm-ups first.
-	seen := map[string]bool{}
-	last, measured := "", false
-	for _, r := range first {
-		f := strings.Fields(r)
-		if f[0] != last {
-			if seen[f[0]] {
-				t.Fatalf("server %s's runs are split: %q", f[0], first)
+	// The round of each run, as the rounds should spread them: e1 and ip have a
+	// repetition in each of the 4 rounds, e2 and u1 one in rounds 2 and 4.
+	round := map[string]string{"e1 1": "1", "e1 2": "2", "e1 3": "3", "e1 4": "4", "ip 1": "1", "ip 2": "2", "ip 3": "3", "ip 4": "4",
+		"e2 1": "2", "e2 2": "4", "u1 1": "2", "u1 2": "4"}
+	checkRounds(t, first, round, 4)
+	checkRounds(t, other, round, 4)
+	// Each round shuffles the servers again.
+	reordered := false
+	for seed := 1; seed <= 6 && !reordered; seed++ {
+		seen := map[string][]string{}
+		for _, r := range planOf(t, dir, planMatrix, fmt.Sprintf("SEED=%d", seed), "REPS=4", "BIG_REPS=2", "WARMUP=0", "ROUNDS=4") {
+			f := strings.Fields(r)
+			if !slices.Contains(seen[f[3]], f[0]) {
+				seen[f[3]] = append(seen[f[3]], f[0])
 			}
-			seen[f[0]], last, measured = true, f[0], false
 		}
-		if f[2] != "0" {
-			measured = true
-		} else if measured {
-			t.Fatalf("a warm-up after a measured run: %q", first)
-		}
+		reordered = !slices.Equal(seen["1"], seen["3"])
+	}
+	if !reordered {
+		t.Error("rounds 1 and 3 had their servers in the same order for seeds 1 to 6")
+	}
+	// One round puts each server's runs in one block, its warm-ups first.
+	single := planOf(t, dir, planMatrix, "SEED=7", "REPS=4", "BIG_REPS=2", "WARMUP=1", "ROUNDS=1")
+	checkRounds(t, single, map[string]string{}, 1)
+	if len(single) != len(first) {
+		t.Errorf("%d runs in one round, %d in four", len(single), len(first))
 	}
 	only := planOf(t, dir, planMatrix, "SEED=7", "REPS=1", "BIG_REPS=1", "WARMUP=0", "CELLS=e,ip")
 	slices.Sort(only)
-	if strings.Join(only, ";") != "- ip 1;a e1 1;b e2 1" {
+	if strings.Join(only, ";") != "- ip 1 3;a e1 1 3;b e2 1 3" {
 		t.Errorf("CELLS=e,ip: %q", only)
+	}
+	// Fewer repetitions than rounds, and a cell with none measured.
+	sparse := planOf(t, dir, planMatrix, "SEED=7", "REPS=3", "BIG_REPS=0", "WARMUP=1", "ROUNDS=6", "CELLS=e,ip")
+	checkRounds(t, sparse, map[string]string{"e1 1": "2", "e1 2": "4", "e1 3": "6", "ip 1": "2", "ip 2": "4", "ip 3": "6"}, 6)
+	if len(sparse) != 9 {
+		t.Errorf("%d runs: %q", len(sparse), sparse)
+	}
+	for _, rounds := range []string{"0", "x", "-1", "5x", "1.5", ""} {
+		m := filepath.Join(t.TempDir(), "m.txt")
+		write(t, m, planMatrix)
+		out, ok := scriptArgs(t, []string{"session.sh", m}, "", "BENCH_DIR="+dir, "PLAN_ONLY=1", "SERVER_SSH=", "ROUNDS="+rounds)
+		if rounds == "" {
+			if !ok || !strings.Contains(out, "runs; order: ") {
+				t.Errorf("ROUNDS unset: %s", out)
+			}
+			continue
+		}
+		if ok || !strings.Contains(out, "ROUNDS must be a number from 1") {
+			t.Errorf("ROUNDS=%s: %s", rounds, out)
+		}
+	}
+	// Five rounds by default.
+	five := planOf(t, dir, planMatrix, "SEED=7", "REPS=5", "WARMUP=0", "CELLS=e1")
+	checkRounds(t, five, map[string]string{"e1 1": "1", "e1 2": "2", "e1 3": "3", "e1 4": "4", "e1 5": "5"}, 5)
+	// Repetitions written with a leading zero are decimal.
+	zeros := planOf(t, dir, strings.Replace(planMatrix, "reps=2", "reps=08", 1), "SEED=7", "REPS=010", "BIG_REPS=09", "WARMUP=0", "ROUNDS=3")
+	count = map[string]int{}
+	for _, r := range zeros {
+		count[strings.Fields(r)[1]]++
+	}
+	if want := map[string]int{"e1": 10, "e2": 9, "u1": 8, "ip": 10}; fmt.Sprint(count) != fmt.Sprint(want) {
+		t.Errorf("runs %v, want %v", count, want)
+	}
+}
+
+// Within a block the runs are shuffled, and each round shuffles its blocks anew.
+func TestTheRunsOfABlockAreShuffled(t *testing.T) {
+	needBash(t)
+	for _, tool := range []string{"shuf", "openssl", "numfmt"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("no %s", tool)
+		}
+	}
+	keepResults(t)
+	dir := benchDir(t)
+	matrix := "server a\ncell x a engine size=1M\ncell y a engine size=1M\ncell z a engine size=1M\n"
+	unsorted, renewed := false, false
+	for seed := 1; seed <= 8 && !(unsorted && renewed); seed++ {
+		cells := map[string]string{}
+		var blocks []string
+		for _, r := range planOf(t, dir, matrix, fmt.Sprintf("SEED=%d", seed), "REPS=4", "WARMUP=0", "ROUNDS=2") {
+			f := strings.Fields(r)
+			cells[f[3]] += f[1]
+			blocks = append(blocks, f[3]+" "+f[1]+" "+f[2])
+		}
+		unsorted = unsorted || !slices.IsSorted(blocks)
+		renewed = renewed || cells["1"] != cells["2"]
+	}
+	if !unsorted {
+		t.Error("for seeds 1 to 8, every block ran its cells in order")
+	}
+	if !renewed {
+		t.Error("for seeds 1 to 8, both rounds ran their cells in the same order")
+	}
+}
+
+// checkRounds checks a plan's rounds: a warm-up's is the first, a measured
+// run's the one given, or the first with one round; the rounds never go
+// back; each server serves one block in a round; and no warm-up of a server
+// follows a measured run of it.
+func checkRounds(t *testing.T, plan []string, round map[string]string, rounds int) {
+	t.Helper()
+	at, last := 1, ""
+	seen := map[string]int{}
+	measured := map[string]bool{}
+	for _, r := range plan {
+		f := strings.Fields(r)
+		want, ok := round[f[1]+" "+f[2]]
+		if f[2] == "0" || rounds == 1 {
+			want, ok = "1", true
+		}
+		n, _ := strconv.Atoi(f[3])
+		if !ok || f[3] != want || n < at || n > rounds {
+			t.Fatalf("%q, after round %d, should be in round %s: %q", r, at, want, plan)
+		}
+		if n > at {
+			at, last = n, ""
+		}
+		if f[0] != last {
+			if seen[f[0]] == at {
+				t.Fatalf("server %s serves two blocks in round %d: %q", f[0], at, plan)
+			}
+			seen[f[0]], last = at, f[0]
+		}
+		if f[2] != "0" {
+			measured[f[0]] = true
+		} else if measured[f[0]] {
+			t.Fatalf("a warm-up of server %s after a measured run: %q", f[0], plan)
+		}
 	}
 }
 
@@ -244,13 +360,28 @@ func checkSession(t *testing.T, out string, dirs ...string) {
 		t.Errorf("%d runs in the order, %d rows", len(order)-1, len(csv)-1)
 	}
 	// Each run has its row, with its cell and repetition.
+	if order[0] != "seq,server,cell,rep,round,t0,t1,outcome" {
+		t.Errorf("order header %q", order[0])
+	}
 	var runs, rows []string
+	block := map[string]string{}
+	served := map[string][]string{}
 	for _, line := range order[1:] {
-		if !strings.HasSuffix(line, ",ok") || strings.Count(line, ",") != 6 {
+		if !strings.HasSuffix(line, ",ok") || strings.Count(line, ",") != 7 {
 			t.Errorf("run %s", line)
 		}
 		f := strings.Split(line, ",")
 		runs = append(runs, f[2]+" "+f[3])
+		block[f[2]+" "+f[3]] = f[1] + " " + f[4]
+		if f[1] != "-" && !slices.Contains(served[f[1]], f[4]) {
+			served[f[1]] = append(served[f[1]], f[4])
+		}
+	}
+	// A server starts for each of its blocks, one per round it has runs in.
+	for srv, rounds := range served {
+		if n := strings.Count(out, "server "+srv+": starting\n"); n != len(rounds) {
+			t.Errorf("server %s started %d times for its runs in rounds %q", srv, n, rounds)
+		}
 	}
 	for _, line := range csv[1:] {
 		row := strings.Split(line, ",")
@@ -264,19 +395,66 @@ func checkSession(t *testing.T, out string, dirs ...string) {
 	_, rest, _ := strings.Cut(out, "results: ")
 	base, _, _ := strings.Cut(rest, "\n")
 	base = filepath.Join("..", "..", strings.TrimSuffix(strings.TrimSpace(base), ".csv"))
+	// The servers' own environment files stay out of the results, which keep them in the session's.
+	stamp := base[len(base)-len("20060102-150405"):]
+	envs, _ := filepath.Glob(filepath.Join("..", "..", "bench", "results", "server-*-env.txt"))
+	for _, f := range envs {
+		name := strings.TrimSuffix(filepath.Base(f), "-env.txt")
+		if name[len(name)-len(stamp):] >= stamp {
+			t.Errorf("a server's environment file in the results: %s", f)
+		}
+	}
+	// Each server's samples, by the block of runs, the server and round, they were taken in.
 	samples := map[string][][2]float64{}
 	servers, _ := filepath.Glob(base + "-server-*-env.txt")
 	for _, f := range servers {
 		b, _ := os.ReadFile(f)
-		if !strings.Contains(string(b), "server: ") || !strings.Contains(string(b), "load users: ") {
-			t.Errorf("%s is incomplete:\n%s", f, b)
-		}
 		name := strings.TrimSuffix(strings.TrimPrefix(f, base+"-server-"), "-env.txt")
+		var rounds []string
+		for _, part := range strings.Split(string(b), "round: ")[1:] {
+			r, env, _ := strings.Cut(part, "\n")
+			if !strings.HasPrefix(env, "server: ") || !strings.Contains(env, "load users: ") {
+				t.Errorf("%s is incomplete in round %s:\n%s", f, r, b)
+			}
+			rounds = append(rounds, r)
+		}
 		sb, _ := os.ReadFile(base + "-server-" + name + "-samples.csv")
+		var sampled []string
 		for _, line := range strings.Split(strings.TrimSpace(string(sb)), "\n") {
 			var tm, cpu float64
-			if _, err := fmt.Sscanf(strings.ReplaceAll(line, ",", " "), "%f %f", &tm, &cpu); err == nil {
-				samples[name] = append(samples[name], [2]float64{tm, cpu})
+			var rss, round int
+			if _, err := fmt.Sscanf(strings.ReplaceAll(line, ",", " "), "%f %f %d %d", &tm, &cpu, &rss, &round); err != nil || round < 1 {
+				t.Errorf("sample of server %s: %q", name, line)
+				continue
+			}
+			key := fmt.Sprintf("%s %d", name, round)
+			if len(samples[key]) == 0 {
+				sampled = append(sampled, fmt.Sprint(round))
+			}
+			samples[key] = append(samples[key], [2]float64{tm, cpu})
+		}
+		if len(rounds) == 0 || !slices.Equal(rounds, sampled) || !slices.Equal(rounds, served[name]) {
+			t.Errorf("server %s: environments of rounds %q, samples of rounds %q, runs in rounds %q", name, rounds, sampled, served[name])
+		}
+		lb, _ := os.ReadFile(base + "-server-" + name + ".log")
+		if n := strings.Count(string(lb), "Starting server on "); n != len(rounds) {
+			t.Errorf("server %s's log holds %d starts, not %d", name, n, len(rounds))
+		}
+		// A benchmark build's request log holds requests of each of its blocks.
+		if rb, err := os.ReadFile(base + "-server-" + name + "-requests.jsonl"); err == nil {
+			for _, r := range rounds {
+				s := samples[name+" "+r]
+				in := false
+				for _, line := range strings.Split(strings.TrimSpace(string(rb)), "\n") {
+					var req struct{ Start time.Time }
+					if json.Unmarshal([]byte(line), &req) == nil {
+						at := float64(req.Start.UnixNano()) / 1e9
+						in = in || len(s) > 0 && s[0][0] <= at && at <= s[len(s)-1][0]
+					}
+				}
+				if !in {
+					t.Errorf("server %s's request log has nothing of its block in round %s", name, r)
+				}
 			}
 		}
 	}
@@ -317,12 +495,17 @@ func checkSession(t *testing.T, out string, dirs ...string) {
 			fmt.Sscan(col(row, "started_unix"), &start)
 			fmt.Sscan(col(row, "seconds"), &secs)
 			fmt.Sscan(cpu, &got)
-			for _, s := range samples {
-				if len(s) > 0 && s[0][0] <= start && start <= s[len(s)-1][0] {
+			var in []string
+			for key, s := range samples {
+				if s[0][0] <= start && start <= s[len(s)-1][0] {
+					in = append(in, key)
 					if want := cpuAt(s, start+secs) - cpuAt(s, start); math.Abs(got-want) > 1e-6 {
 						t.Errorf("server CPU %s for a run from %.6f for %.6f s; the samples say %.4f", cpu, start, secs, want)
 					}
 				}
+			}
+			if run := col(row, "scenario") + " " + col(row, "rep"); len(in) != 1 || in[0] != block[run] {
+				t.Errorf("run %s of server and round %s falls among the samples of %q", run, block[run], in)
 			}
 			busy = busy || got > 0
 		}
@@ -336,7 +519,7 @@ func checkSession(t *testing.T, out string, dirs ...string) {
 			t.Errorf("the environment file has no %q", want)
 		}
 	}
-	for _, warning := range []string{"left files in its served folder", "the rest of its runs are skipped"} {
+	for _, warning := range []string{"left files in its served folder", "the rest of its block's runs are skipped"} {
 		if strings.Contains(env, warning) {
 			t.Errorf("the environment file says %q:\n%s", warning, env)
 		}
@@ -352,6 +535,9 @@ func checkSession(t *testing.T, out string, dirs ...string) {
 			if e.Name() != "load.log" {
 				t.Errorf("left in the session folder: %s", e.Name())
 			}
+		}
+		if envs, _ := filepath.Glob(filepath.Join(dir, "server", "env-*")); len(envs) > 0 {
+			t.Errorf("left in the server's folder: %q", envs)
 		}
 		if root, err := os.ReadDir(filepath.Join(dir, "server", "root")); err == nil {
 			for _, e := range root {
@@ -389,6 +575,11 @@ func TestASessionWithTheServerHere(t *testing.T) {
 	}
 	_, rest, _ := strings.Cut(out, "results: ")
 	csv, _, _ := strings.Cut(rest, "\n")
+	// The warm-ups run in the first of the default rounds, the one measured run in the third.
+	b, _ := os.ReadFile(filepath.Join("..", "..", strings.TrimSuffix(csv, ".csv")+"-server-plain-env.txt"))
+	if n := strings.Count(string(b), "server: "); n != 2 {
+		t.Errorf("server plain served %d blocks, not 2", n)
+	}
 	for _, f := range []string{"server-plain-env.txt", "server-bench-requests.jsonl", "server-plain-samples.csv", "server-bench.log"} {
 		if !exists(filepath.Join("..", "..", strings.TrimSuffix(csv, ".csv")+"-"+f)) {
 			t.Errorf("no %s with the results", f)
@@ -471,8 +662,8 @@ func TestASessionOverSSH(t *testing.T) {
 }
 
 // A transfer that moved other bytes than the source's is marked, in its row
-// and in the order: every upload, and a download's warm-up, which hashes
-// what it got.
+// and in the order: every upload; a download's warm-up, which hashes what it
+// got; and every download of a file placed for it that isn't the source's.
 func TestASessionMarksAWrongTransfer(t *testing.T) {
 	sessionTools(t)
 	keepResults(t)
@@ -487,7 +678,7 @@ func TestASessionMarksAWrongTransfer(t *testing.T) {
 	write(t, matrix, "server s\nserver small SERVER_FLAGS=-max-upload-mb=1\ncell up s upload size=64K\ncell down s download size=64K\ncell big small engine size=2M\ncell short s download size=1K\n")
 	out, ok := scriptArgs(t, []string{"session.sh", matrix}, "", "BENCH_DIR="+dir, "PORT=18394", "REPS=1", "WARMUP=1",
 		"DROP_CACHES=0", "IPERF=0", "SERVER_SSH=", "SERVER_HOST=", "CELLS=")
-	if !ok || !strings.Contains(out, "warning: 7 runs were not ok") {
+	if !ok || !strings.Contains(out, "warning: 8 runs were not ok") || !strings.Contains(out, "warning: the 64K file placed for downloads on server s isn't the source's bytes") {
 		t.Fatalf("session.sh: %s", out)
 	}
 	header := strings.Split(load.Header, ",")
@@ -496,18 +687,84 @@ func TestASessionMarksAWrongTransfer(t *testing.T) {
 		row := strings.Split(line, ",")
 		codes[row[slices.Index(header, "scenario")]+" "+row[slices.Index(header, "rep")]] = row[slices.Index(header, "http_code")]
 	}
-	want := map[string]string{"up 0": "201 wrong_file", "up 1": "201 wrong_file", "down 0": "200 wrong_file", "down 1": "200", "big 0": "413x1", "big 1": "413x1",
+	want := map[string]string{"up 0": "201 wrong_file", "up 1": "201 wrong_file", "down 0": "200 wrong_file", "down 1": "200 wrong_file", "big 0": "413x1", "big 1": "413x1",
 		"short 0": "200 wrong_size", "short 1": "200 wrong_size"}
 	if fmt.Sprint(codes) != fmt.Sprint(want) {
 		t.Errorf("codes %v, want %v", codes, want)
 	}
 	order := output(t, out, "order")
 	for _, line := range strings.Split(strings.TrimSpace(order), "\n") {
-		if strings.Count(line, ",") != 6 {
-			t.Errorf("an order line of other than 7 fields: %s", line)
+		if strings.Count(line, ",") != 7 {
+			t.Errorf("an order line of other than 8 fields: %s", line)
 		}
 	}
-	if strings.Count(order, ",stored ") != 2 || strings.Count(order, ",got other bytes") != 1 || strings.Count(order, ",answered 413x1") != 2 || strings.Count(order, ",got 1000 of 1024 bytes") != 2 {
+	if strings.Count(order, ",stored ") != 2 || strings.Count(order, ",got other bytes") != 1 || strings.Count(order, ",the file placed for it isn't the source's bytes") != 1 || strings.Count(order, ",answered 413x1") != 2 || strings.Count(order, ",got 1000 of 1024 bytes") != 2 {
 		t.Errorf("order:\n%s", order)
+	}
+}
+
+// A benchmark folder whose path has a space in it.
+func TestASessionInAFolderWithASpace(t *testing.T) {
+	sessionTools(t)
+	keepResults(t)
+	dir := filepath.Join(t.TempDir(), "with space", "bench")
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, ok := safe(t, t.TempDir(), "init", dir); !ok {
+		t.Fatalf("init: %s", out)
+	}
+	matrix := filepath.Join(t.TempDir(), "m.txt")
+	write(t, matrix, "server a\ncell e a engine size=32M files=2\ncell d a download size=64K\n")
+	out, ok := scriptArgs(t, []string{"session.sh", matrix}, "", "BENCH_DIR="+dir, "PORT=18386", "REPS=2", "WARMUP=1", "ROUNDS=2",
+		"DROP_CACHES=0", "IPERF=0", "SERVER_SSH=", "SERVER_HOST=", "CELLS=")
+	if !ok {
+		t.Fatalf("session.sh: %s", out)
+	}
+	checkSession(t, out, dir)
+}
+
+// A file placed for downloads that isn't the source's marks the downloads
+// of its own block only.
+func TestOnlyTheBlockOfAWrongPlacementIsMarked(t *testing.T) {
+	sessionTools(t)
+	keepResults(t)
+	dir := benchDir(t)
+	content := strings.Repeat("z", 64<<10)
+	sum := filepath.Join(dir, "data", "fixed-64K.bin.sha256")
+	write(t, filepath.Join(dir, "data", "fixed-64K.bin"), content)
+	write(t, sum, strings.Repeat("0", 64)+"\n")
+	// Once the first block's warm-up has run, the source's SHA-256 is right again.
+	go func() {
+		results := filepath.Join("..", "..", "bench", "results")
+		for deadline := time.Now().Add(2 * time.Minute); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			orders, _ := filepath.Glob(filepath.Join(results, "session-placed-*-order.csv"))
+			if len(orders) == 0 {
+				continue
+			}
+			if b, _ := os.ReadFile(orders[len(orders)-1]); strings.Count(string(b), "\n") >= 2 {
+				os.WriteFile(sum, []byte(fmt.Sprintf("%x\n", sha256.Sum256([]byte(content)))), 0o644)
+				return
+			}
+		}
+	}()
+	matrix := filepath.Join(t.TempDir(), "placed.txt")
+	write(t, matrix, "server s\ncell down s download size=64K\n")
+	out, ok := scriptArgs(t, []string{"session.sh", matrix}, "", "BENCH_DIR="+dir, "PORT=18387", "REPS=1", "WARMUP=1",
+		"DROP_CACHES=0", "IPERF=0", "SERVER_SSH=", "SERVER_HOST=", "CELLS=")
+	if !ok || strings.Count(out, "placed for downloads on server s isn't the source's bytes") != 1 {
+		t.Fatalf("session.sh: %s", out)
+	}
+	header := strings.Split(load.Header, ",")
+	codes := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(output(t, out, "results")), "\n")[1:] {
+		row := strings.Split(line, ",")
+		codes[row[slices.Index(header, "rep")]] = row[slices.Index(header, "http_code")]
+	}
+	if fmt.Sprint(codes) != fmt.Sprint(map[string]string{"0": "200 wrong_file", "1": "200"}) {
+		t.Errorf("codes %v", codes)
+	}
+	if env := output(t, out, "environment"); !strings.Contains(env, "isn't the source's bytes") {
+		t.Error("the warning isn't in the environment file")
 	}
 }

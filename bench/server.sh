@@ -28,6 +28,8 @@
 #                            $BENCH_DIR/server/requests.jsonl
 #   LOAD_USERS=0             contributors load00, load01, … for bench/session.sh's load client, with
 #                            one random password in $BENCH_DIR/server/run.env
+#   ENV_DIR=bench/results    where the environment file goes; bench/session.sh has it written into the
+#                            benchmark folder and adds it to the session's results
 set -euo pipefail
 export LC_ALL=C
 
@@ -39,7 +41,7 @@ SERVER_FLAGS=${SERVER_FLAGS:-}
 SERVER_REV=${SERVER_REV:-}
 BUILD_TAGS=${BUILD_TAGS:-}
 LOAD_USERS=${LOAD_USERS:-0}
-RESULTS=bench/results
+ENV_DIR=${ENV_DIR:-bench/results}
 
 [ -f go.mod ] && [ -d cmd/gocalbox ] || { echo "run from the repository root" >&2; exit 1; }
 [ -z "${WORK:-}" ] || { echo "WORK is replaced by BENCH_DIR, a folder made with bench/init.sh" >&2; exit 1; }
@@ -135,9 +137,9 @@ else
 fi
 STAMP=$(date +%Y%m%d-%H%M%S)
 TICK=$(getconf CLK_TCK)
-ENV="$RESULTS/server-$COMMIT-$STAMP-env.txt"
+ENV="$ENV_DIR/server-$COMMIT-$STAMP-env.txt"
 
-mkdir -p "$RESULTS"
+mkdir -p "$ENV_DIR"
 bench_rm "$ROOT" "$AUDIT" "$SAMPLES" "$REQUESTS"; mkdir -p "$ROOT"
 GOVERNOR=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)
 [ "$GOVERNOR" = performance ] || echo "warning: CPU governor is '$GOVERNOR', not 'performance'; results will not be comparable" >&2
@@ -160,7 +162,7 @@ case $FLAGS in
 esac
 SCHEME=http
 CA=
-CURL=(curl -fs)
+CURL=(curl -fs --max-time 2)
 case $FLAGS in
   *-tls-dir*) SERVER_CMD+=(-tls-dir "$TLS_DIR"); SCHEME=https; CA="$TLS_DIR/ca.crt"; CURL+=(--cacert "$CA") ;;
 esac
@@ -222,6 +224,8 @@ bench_rm "$WORK/run.env"
 PID=
 SAMP_PID=
 finish() {
+  # A second stop while this runs mustn't cut it short: the environment file and the pid files come last.
+  trap '' INT TERM
   [ -n "$SAMP_PID" ] && kill "$SAMP_PID" 2>/dev/null || true
   [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
   [ -n "$PID" ] && wait "$PID" 2>/dev/null || true

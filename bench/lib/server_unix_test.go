@@ -157,3 +157,43 @@ exec `+goTool+` "${args[@]}"
 		t.Errorf("a build that ignores the tag: %v, %s", err, sout())
 	}
 }
+
+// server.sh writes its environment file into ENV_DIR when given one, as
+// session.sh asks, and into bench/results otherwise.
+func TestServerShWritesItsEnvironmentWhereAsked(t *testing.T) {
+	serverTools(t)
+	keepResults(t)
+	results := filepath.Join("..", "..", "bench", "results")
+	envs := func(dir string) []string { m, _ := filepath.Glob(filepath.Join(dir, "server-*-env.txt")); return m }
+	before := len(envs(results))
+	dir := benchDir(t)
+	asked := filepath.Join(dir, "server", "envs")
+	for _, c := range []struct {
+		env  []string
+		into string
+	}{
+		{[]string{"ENV_DIR=" + asked}, asked},
+		{nil, results},
+	} {
+		was := len(envs(c.into))
+		cmd, out := serverSh(t, "", append([]string{"BENCH_DIR=" + dir, "PORT=18390", "BIND=127.0.0.1"}, c.env...)...)
+		waitFor(t, "the server", func() bool { return exists(filepath.Join(dir, "server", "ready")) })
+		// Reaped as it ends: stop waits until its process is gone.
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		if o, ok := scriptArgs(t, []string{"server.sh", "stop"}, "", "BENCH_DIR="+dir); !ok {
+			t.Fatalf("stop: %s", o)
+		}
+		<-done
+		got := envs(c.into)
+		if len(got) != was+1 {
+			t.Fatalf("%v: %d environment files in %s, not %d: %s", c.env, len(got), c.into, was+1, out())
+		}
+		if b, _ := os.ReadFile(got[len(got)-1]); !strings.Contains(string(b), "server: ") || !strings.Contains(out(), "environment written to ") {
+			t.Errorf("%v: %s\n%s", c.env, b, out())
+		}
+		if c.into == asked && len(envs(results)) != before {
+			t.Errorf("ENV_DIR given, but an environment file went to the results")
+		}
+	}
+}
