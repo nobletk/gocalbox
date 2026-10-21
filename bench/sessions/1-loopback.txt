@@ -64,6 +64,7 @@ cell x3-nvme-20G - inprocess size=20G reps=3
 cell x3-nvme-50G - inprocess size=50G reps=3
 
 # X5 on loopback: HTTP/2's stream window, 256 KiB being today's, in the benchmark build.
+# The server's windows limit only what it receives, so only uploads are measured.
 cell x5-w128-engine  h2-128k  engine   transport=https-h2 size=1G
 cell x5-w256-engine  h2-bench engine   transport=https-h2 size=1G
 cell x5-w448-engine  h2-448k  engine   transport=https-h2 size=1G
@@ -72,10 +73,6 @@ cell x5-w128-single  h2-128k  upload   transport=https-h2 size=1G
 cell x5-w256-single  h2-bench upload   transport=https-h2 size=1G
 cell x5-w448-single  h2-448k  upload   transport=https-h2 size=1G
 cell x5-w1m-single   h2-1m    upload   transport=https-h2 size=1G
-cell x5-w128-down    h2-128k  download transport=https-h2 size=1G
-cell x5-w256-down    h2-bench download transport=https-h2 size=1G
-cell x5-w448-down    h2-448k  download transport=https-h2 size=1G
-cell x5-w1m-down     h2-1m    download transport=https-h2 size=1G
 
 # X6 on loopback: the server's capacity for many users, each with 3 files of 256 MiB.
 cell x6-users-1  default engine transport=https-h2 size=256M files=3 users=1

@@ -1,13 +1,12 @@
 # X13: the roles swapped, the server on PC B and the client on PC A, on the wired LAN.
-# X1's 1 GiB and 5 GiB rows; if they match session 2's, the client never limits the numbers.
+# The same cells as X5's first six in session 2; if they match session 2's, the client
+# never limits the numbers.
 
 server default
 
-cell x13-engine-h2-1G default engine   transport=https-h2 size=1G
-cell x13-engine-h2-5G default engine   transport=https-h2 size=5G
-cell x13-engine-h1-1G default engine   transport=https-h1 size=1G
-cell x13-engine-h1-5G default engine   transport=https-h1 size=5G
-cell x13-single-h2-1G default upload   transport=https-h2 size=1G
-cell x13-single-h2-5G default upload   transport=https-h2 size=5G
-cell x13-down-h2-1G   default download transport=https-h2 size=1G
-cell x13-down-h2-5G   default download transport=https-h2 size=5G
+cell x13-engine-h1 default engine   transport=https-h1 size=1G
+cell x13-engine-h2 default engine   transport=https-h2 size=1G
+cell x13-single-h1 default upload   transport=https-h1 size=1G
+cell x13-single-h2 default upload   transport=https-h2 size=1G
+cell x13-down-h1   default download transport=https-h1 size=1G
+cell x13-down-h2   default download transport=https-h2 size=1G
