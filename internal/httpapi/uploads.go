@@ -133,6 +133,7 @@ func (a *api) handleUploadPart(w http.ResponseWriter, r *http.Request) {
 		SHA256: r.Header.Get(PartChecksumHeader),
 		Length: r.ContentLength,
 		Body:   r.Body,
+		Wait:   pauseStalls(r),
 	})
 	if err != nil {
 		writeUploadError(w, r, err)

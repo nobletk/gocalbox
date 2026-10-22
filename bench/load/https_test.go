@@ -566,7 +566,7 @@ func TestARetryCutShortIsNotCounted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
 	st := &userState{res: Result{Retried: map[string]int{}}}
-	_, _, err := retry(ctx, retrier{st: st}, func() (int, error) {
+	_, _, err := retry(ctx, retrier{st: st}, true, func() (int, error) {
 		calls++
 		cancel()
 		return 0, transfer.ErrBusy
@@ -645,5 +645,27 @@ func TestANoAnswerSaysWhetherItConnected(t *testing.T) {
 		if !errors.Is(err, ErrNoAnswer) || errors.Is(err, ErrNotConnected) {
 			t.Errorf("a connection cut short (%s): %v", id, err)
 		}
+	}
+}
+
+func TestRetryAfterIsReadFromTheAnswer(t *testing.T) {
+	for _, c := range []struct {
+		header string
+		want   time.Duration
+	}{{"3", 3 * time.Second}, {"0", 0}, {"", 0}, {"soon", 0}} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if c.header != "" {
+				w.Header().Set("Retry-After", c.header)
+			}
+			w.WriteHeader(503)
+			w.Write([]byte(`{"error":{"code":"busy","message":"x"}}`))
+		}))
+		a := &remote{url: ts.URL, client: ts.Client()}
+		err := a.post(context.Background(), "/x", nil, nil)
+		var rf *Refused
+		if !errors.As(err, &rf) || rf.RetryAfter != c.want {
+			t.Errorf("Retry-After %q: %#v, want a refusal asking for %v", c.header, err, c.want)
+		}
+		ts.Close()
 	}
 }

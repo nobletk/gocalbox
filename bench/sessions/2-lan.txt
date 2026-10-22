@@ -5,7 +5,7 @@
 # CELLS=x4-,x5-,x7-,x8-.
 #
 # Over a 1 Gbps link the link sets the rate, so X4 uses 1 GiB files only, and X6 runs
-# 1, 4 and 16 users; session 1 runs X6's whole range on loopback.
+# 1, 4, 16 and 24 users; session 1 runs X6's whole range on loopback.
 
 server default
 server h2-bench BUILD_TAGS=bench
@@ -50,6 +50,8 @@ cell x5-w1m-single   h2-1m    upload   transport=https-h2 size=1G
 cell x6-users-1  default engine size=256M files=3 users=1
 cell x6-users-4  default engine size=256M files=3 users=4
 cell x6-users-16 default engine size=256M files=3 users=16
+# 24 users send 96 parts at once: more than the server's 32 in flight and 32 waiting.
+cell x6-users-24 default engine size=256M files=3 users=24
 
 # X7, the client's part: each file stops at 10, 50 or 90% and resumes by its client key.
 cell x7-stop-10 default engine size=5G resume-at=0.1 retry-for=2m

@@ -80,3 +80,5 @@ cell x6-users-2  default engine transport=https-h2 size=256M files=3 users=2
 cell x6-users-4  default engine transport=https-h2 size=256M files=3 users=4
 cell x6-users-8  default engine transport=https-h2 size=256M files=3 users=8
 cell x6-users-16 default engine transport=https-h2 size=256M files=3 users=16
+# 24 users send 96 parts at once: more than the server's 32 in flight and 32 waiting.
+cell x6-users-24 default engine transport=https-h2 size=256M files=3 users=24

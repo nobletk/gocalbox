@@ -5,6 +5,8 @@
 package transfer
 
 import (
+	"cmp"
+	"container/list"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -170,7 +172,10 @@ type Config struct {
 	// JanitorEvery is the janitor's period: 30 seconds by default, and no
 	// janitor at all when negative.
 	JanitorEvery time.Duration
-	Now          func() time.Time
+	// AdmitWait is how long a part waits for a server-wide slot: 10 seconds
+	// when zero.
+	AdmitWait time.Duration
+	Now       func() time.Time
 
 	// prepare, when set, runs once the engine is made and before it
 	// recovers anything, so that tests can set its hooks.
@@ -199,9 +204,8 @@ type Engine struct {
 
 	// root is the staging folder; the engine reaches staging only through
 	// it. served is the served folder, which recovery only reads.
-	root     *os.Root
-	served   *os.Root
-	inflight chan struct{}
+	root   *os.Root
+	served *os.Root
 
 	// mu guards the session map and the counters. It is never held
 	// together with a session's lock.
@@ -209,11 +213,20 @@ type Engine struct {
 	sessions  map[string]*session
 	open      map[string]int
 	openTotal int
-	userParts map[string]int
-	closed    bool
-	finished  bool
-	active    int
-	drained   chan struct{}
+	// userParts counts each user's parts being received or waiting for a
+	// slot; slots counts the server-wide slots taken, and queue holds the
+	// parts waiting for one, in arrival order. Once stopping is set, no part
+	// waits; stopWaiting is closed then.
+	userParts   map[string]int
+	slots       int
+	queue       list.List
+	stopping    bool
+	stopWaiting chan struct{}
+	admitWait   time.Duration
+	closed      bool
+	finished    bool
+	active      int
+	drained     chan struct{}
 
 	counters counters
 
@@ -249,25 +262,27 @@ func New(cfg Config) (*Engine, error) {
 		return nil, errors.New("transfer: Files, Registry, Events and Root are required")
 	}
 	e := &Engine{
-		files:      cfg.Files,
-		reg:        cfg.Registry,
-		pub:        cfg.Events,
-		audit:      cfg.Audit,
-		ledger:     cfg.Ledger,
-		lim:        cfg.Limits.withDefaults(),
-		auditParts: cfg.AuditParts,
-		now:        cfg.Now,
-		sessions:   map[string]*session{},
-		open:       map[string]int{},
-		userParts:  map[string]int{},
-		drained:    make(chan struct{}),
-		wake:       make(chan struct{}, 1),
-		syncFile:   (*os.File).Sync,
-		syncDir:    syncDir,
-		writeLog:   (*os.File).WriteAt,
-		writeAt:    func(f *os.File, off int64) io.Writer { return io.NewOffsetWriter(f, off) },
-		partSize:   PartSize,
-		served:     cfg.Root,
+		files:       cfg.Files,
+		reg:         cfg.Registry,
+		pub:         cfg.Events,
+		audit:       cfg.Audit,
+		ledger:      cfg.Ledger,
+		lim:         cfg.Limits.withDefaults(),
+		auditParts:  cfg.AuditParts,
+		now:         cfg.Now,
+		sessions:    map[string]*session{},
+		open:        map[string]int{},
+		userParts:   map[string]int{},
+		stopWaiting: make(chan struct{}),
+		admitWait:   cmp.Or(cfg.AdmitWait, admitWait),
+		drained:     make(chan struct{}),
+		wake:        make(chan struct{}, 1),
+		syncFile:    (*os.File).Sync,
+		syncDir:     syncDir,
+		writeLog:    (*os.File).WriteAt,
+		writeAt:     func(f *os.File, off int64) io.Writer { return io.NewOffsetWriter(f, off) },
+		partSize:    PartSize,
+		served:      cfg.Root,
 	}
 	if cfg.prepare != nil {
 		cfg.prepare(e)
@@ -275,7 +290,6 @@ func New(cfg Config) (*Engine, error) {
 	if e.now == nil {
 		e.now = func() time.Time { return time.Now().Round(0).UTC() }
 	}
-	e.inflight = make(chan struct{}, e.lim.MaxInflight)
 	switch {
 	case cfg.Staging == nil:
 		e.off = errors.New("no staging folder")
@@ -321,6 +335,7 @@ func (e *Engine) Off() error { return e.off }
 // and closes nothing, since what still runs may use the files; calling it
 // again finishes the job. Sessions stay on disk.
 func (e *Engine) Close(ctx context.Context) error {
+	e.BeginShutdown()
 	e.mu.Lock()
 	if e.finished {
 		e.mu.Unlock()
@@ -507,31 +522,6 @@ func (e *Engine) closeSlot(s *session) {
 		s.counted = false
 		e.uncount(s.rec.Owner)
 	}
-}
-
-// admit takes a slot for one part being received, without waiting.
-func (e *Engine) admit(user string) (release func(), err error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.userParts[user] >= e.lim.MaxInflightUser {
-		e.counters.tooManyRequests.Add(1)
-		return nil, ErrTooManyRequests
-	}
-	select {
-	case e.inflight <- struct{}{}:
-	default:
-		e.counters.busy.Add(1)
-		return nil, ErrBusy
-	}
-	e.userParts[user]++
-	return func() {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		if e.userParts[user]--; e.userParts[user] <= 0 {
-			delete(e.userParts, user)
-		}
-		<-e.inflight
-	}, nil
 }
 
 // windowFor is the most space a session holds at a time.

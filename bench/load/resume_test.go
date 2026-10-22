@@ -33,9 +33,11 @@ type keyedServer struct {
 	// hold, in the first session, answers its hold-th part only once
 	// another part has come, which then waits until it is cut off and
 	// answers with the context's error, as the engine in process does, or
-	// with ErrNoAnswer if noAnswer is set, as the HTTPS client does.
+	// with ErrNoAnswer if noAnswer is set, as the HTTPS client does, or
+	// busy if cutBusy is set, as a refusal that crossed the cut.
 	hold     int
 	noAnswer bool
+	cutBusy  bool
 	held     chan struct{}
 	heldOne  sync.Once
 	// downUntil makes every call get no answer until then.
@@ -108,6 +110,9 @@ func (f *keyedServer) Part(ctx context.Context, req transfer.PartRequest) (trans
 		<-ctx.Done()
 		if f.noAnswer {
 			return transfer.PartResult{}, fmt.Errorf("%w: %v", ErrNoAnswer, ctx.Err())
+		}
+		if f.cutBusy {
+			return transfer.PartResult{}, &Refused{Status: 503, Code: "busy"}
 		}
 		return transfer.PartResult{}, ctx.Err()
 	}

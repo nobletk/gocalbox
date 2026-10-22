@@ -44,6 +44,8 @@ type Refused struct {
 	Status  int
 	Code    string
 	Message string
+	// RetryAfter is the wait the answer's Retry-After header asks for.
+	RetryAfter time.Duration
 }
 
 func (r *Refused) Error() string { return fmt.Sprintf("%d %s: %s", r.Status, r.Code, r.Message) }
@@ -241,7 +243,11 @@ func (a *remote) do(req *http.Request, out any) error {
 		if out != nil && len(e.Result) > 0 {
 			json.Unmarshal(e.Result, out)
 		}
-		return &Refused{Status: resp.StatusCode, Code: e.Error.Code, Message: e.Error.Message}
+		rf := &Refused{Status: resp.StatusCode, Code: e.Error.Code, Message: e.Error.Message}
+		if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && secs > 0 {
+			rf.RetryAfter = time.Duration(secs) * time.Second
+		}
+		return rf
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {

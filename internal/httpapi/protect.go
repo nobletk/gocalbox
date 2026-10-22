@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"io"
 	"log"
 	"net/http"
@@ -65,19 +66,59 @@ func limitBodyStalls(timeout time.Duration, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body != nil && r.Body != http.NoBody {
 			rc := http.NewResponseController(w)
-			if rc.SetReadDeadline(time.Now().Add(timeout)) == nil {
-				r.Body = &stallLimitedBody{ReadCloser: r.Body, rc: rc, timeout: timeout}
+			deadline := time.Now().Add(timeout)
+			if rc.SetReadDeadline(deadline) == nil {
+				clock := &stallClock{rc: rc, timeout: timeout, deadline: deadline}
+				r.Body = &stallLimitedBody{ReadCloser: r.Body, clock: clock}
+				r = r.WithContext(context.WithValue(r.Context(), stallClockKey{}, clock))
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
+type stallClockKey struct{}
+
+// stallClock is the read deadline of one request's body, used only from its
+// handler's goroutine.
+type stallClock struct {
+	rc       *http.ResponseController
+	timeout  time.Duration
+	deadline time.Time
+	paused   bool
+}
+
+func (c *stallClock) restart() {
+	c.deadline = time.Now().Add(c.timeout)
+	c.rc.SetReadDeadline(c.deadline)
+}
+
+// pauseStalls returns the function that stops the request's body-stall
+// clock while its handler chooses not to read, and starts it again when it
+// is called with false; nil when no clock runs.
+func pauseStalls(r *http.Request) func(paused bool) {
+	c, _ := r.Context().Value(stallClockKey{}).(*stallClock)
+	if c == nil {
+		return nil
+	}
+	return func(paused bool) {
+		switch {
+		// A deadline already passed stays passed: over HTTP/1.1 the body is cut
+		// only at its next read.
+		case paused && time.Now().Before(c.deadline):
+			c.paused = true
+			c.rc.SetReadDeadline(time.Time{})
+		case !paused && c.paused:
+			c.paused = false
+			c.restart()
+		}
+	}
+}
+
 type stallLimitedBody struct {
 	io.ReadCloser
-	rc      *http.ResponseController
-	timeout time.Duration
-	got     int64
+	clock *stallClock
+	got   int64
 }
 
 func (b *stallLimitedBody) Read(p []byte) (int, error) {
@@ -87,7 +128,7 @@ func (b *stallLimitedBody) Read(p []byte) (int, error) {
 	// background read, and a new one would cancel the request's context.
 	if b.got >= bodyProgress && err == nil {
 		b.got = 0
-		b.rc.SetReadDeadline(time.Now().Add(b.timeout))
+		b.clock.restart()
 	}
 	return n, err
 }

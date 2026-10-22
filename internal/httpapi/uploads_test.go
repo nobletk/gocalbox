@@ -695,6 +695,7 @@ func TestRefusalsToComeBackLaterSayWhen(t *testing.T) {
 	e := newUploadEnv(t, func(c *transfer.Config) {
 		c.Limits.MaxInflight, c.Limits.MaxInflightUser = 2, 1
 		c.Limits.MaxSessions, c.Limits.MaxSessionsTotal = 2, 4
+		c.AdmitWait = 200 * time.Millisecond
 	})
 	p := newPayload(1000, 9)
 	a := e.create("alice", "public", "a.bin", p, "")

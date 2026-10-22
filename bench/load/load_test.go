@@ -140,10 +140,11 @@ func TestCodeColumn(t *testing.T) {
 func newState() *userState { return &userState{res: Result{Retried: map[string]int{}}} }
 
 func TestRetryWaitsOutBusyAnswers(t *testing.T) {
+	fastRetries(t, 5*time.Millisecond)
 	for _, busy := range []*transfer.Error{transfer.ErrBusy, transfer.ErrTooManyRequests, transfer.ErrPartInProgress} {
 		calls := 0
 		st := newState()
-		v, _, err := retry(context.Background(), retrier{st: st}, func() (int, error) {
+		v, _, err := retry(context.Background(), retrier{st: st}, true, func() (int, error) {
 			if calls++; calls < 3 {
 				return 0, busy
 			}
@@ -156,7 +157,7 @@ func TestRetryWaitsOutBusyAnswers(t *testing.T) {
 	}
 	calls := 0
 	st := newState()
-	if _, _, err := retry(context.Background(), retrier{st: st}, func() (int, error) { calls++; return 0, transfer.ErrChecksumMismatch }); err == nil || calls != 1 || len(st.res.Retried) != 0 {
+	if _, _, err := retry(context.Background(), retrier{st: st}, true, func() (int, error) { calls++; return 0, transfer.ErrChecksumMismatch }); err == nil || calls != 1 || len(st.res.Retried) != 0 {
 		t.Errorf("a refusal was retried: %v, %d calls, %v", err, calls, st.res.Retried)
 	}
 }

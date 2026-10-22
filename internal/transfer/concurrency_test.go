@@ -177,8 +177,8 @@ func TestManyUsersAndSessionsAtOnce(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if en.e.openTotal != 0 || len(en.e.open) != 0 || len(en.e.userParts) != 0 || len(en.e.inflight) != 0 || en.ledger.Reserved() != 0 {
-		t.Errorf("open %d %v, parts %v %d, reserved %d", en.e.openTotal, en.e.open, en.e.userParts, len(en.e.inflight), en.ledger.Reserved())
+	if en.e.openTotal != 0 || len(en.e.open) != 0 || len(en.e.userParts) != 0 || en.e.slots != 0 || en.e.queue.Len() != 0 || en.ledger.Reserved() != 0 {
+		t.Errorf("open %d %v, parts %v %d, reserved %d", en.e.openTotal, en.e.open, en.e.userParts, en.e.slots, en.ledger.Reserved())
 	}
 }
 

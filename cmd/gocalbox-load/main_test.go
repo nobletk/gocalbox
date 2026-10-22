@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/nobletk/gocalbox/bench/lib"
 	"github.com/nobletk/gocalbox/bench/load"
@@ -445,5 +446,14 @@ func TestTheCommandRefuses(t *testing.T) {
 	var out strings.Builder
 	if err := run([]string{"-header", "-users", "0"}, strings.NewReader(""), &out); err != nil || out.String() != load.Header+"\n" {
 		t.Errorf("-header: %q, %v", out.String(), err)
+	}
+}
+
+func TestTheLogLineSaysWhatTheEngineDid(t *testing.T) {
+	got := engineSummary(transfer.Stats{PartsReceived: 1, Duplicates: 2, Busy: 3, WaitTimeouts: 4, QueueFull: 5,
+		TooManyRequests: 6, TooManyUploads: 7, Waited: 8, WaitTime: 9 * time.Millisecond})
+	want := "the engine: 1 parts, 2 duplicates, refused busy 3 (4 waits ran out, 5 found the queue full), too_many_requests 6, too_many_uploads 7; 8 parts waited for a slot, 9ms in all"
+	if got != want {
+		t.Errorf("%s\nwant %s", got, want)
 	}
 }

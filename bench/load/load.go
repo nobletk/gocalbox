@@ -156,6 +156,10 @@ type upload struct {
 type job struct {
 	up *upload
 	n  int
+	// again marks a part sent again after the server refused it for its
+	// load; it waits until notBefore without holding a place.
+	again     bool
+	notBefore time.Time
 }
 
 // queue holds a user's parts to send, in the order they go out, and how many
@@ -186,21 +190,39 @@ func (q *queue) push(front bool, js ...job) {
 	q.cond.Broadcast()
 }
 
-// pop waits for a job; it returns false once no job is left and none can
-// come.
+// pop waits for the first job whose time has come; it returns false once no
+// job is left and none can come.
 func (q *queue) pop() (job, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for len(q.jobs) == 0 && (q.producer || q.open > 0) {
+	for {
+		now := time.Now()
+		var next time.Time
+		for i, j := range q.jobs {
+			if !j.notBefore.After(now) {
+				q.jobs = slices.Delete(q.jobs, i, i+1)
+				q.cond.Broadcast()
+				return j, true
+			}
+			if next.IsZero() || j.notBefore.Before(next) {
+				next = j.notBefore
+			}
+		}
+		if len(q.jobs) == 0 && !q.producer && q.open == 0 {
+			return job{}, false
+		}
+		if !next.IsZero() {
+			t := time.AfterFunc(next.Sub(now), func() {
+				q.mu.Lock()
+				q.cond.Broadcast()
+				q.mu.Unlock()
+			})
+			q.cond.Wait()
+			t.Stop()
+			continue
+		}
 		q.cond.Wait()
 	}
-	if len(q.jobs) == 0 {
-		return job{}, false
-	}
-	j := q.jobs[0]
-	q.jobs = q.jobs[1:]
-	q.cond.Broadcast()
-	return j, true
 }
 
 // drained waits until every job queued has been taken.
@@ -259,7 +281,7 @@ func (st *userState) answered(ok bool) {
 func runUser(ctx context.Context, u User, cfg Config, user int, start time.Time) Result {
 	st := &userState{res: Result{Codes: map[string]int{}, Retried: map[string]int{}}}
 	q := newQueue()
-	r := retrier{cfg: cfg, st: st}
+	r := retrier{cfg: cfg, st: st, pool: newPool(max(cfg.Parallel, 1))}
 	end := func(up *upload, code string) {
 		if up.cancel != nil {
 			up.cancel()
@@ -301,7 +323,18 @@ func runUser(ctx context.Context, u User, cfg Config, user int, start time.Time)
 					if ps := j.up.c.PartSize; int64(len(buf)) < ps {
 						buf = make([]byte, ps)
 					}
-					d, err = r.sendPart(upCtx, u.API, cfg.Size, j, buf)
+					var window int
+					if window, err = r.pool.acquire(upCtx, j.again); err == nil {
+						d, err = r.sendPart(upCtx, u.API, cfg.Size, j, buf)
+						refused := err != nil && upCtx.Err() == nil && loadRefusal(err)
+						r.pool.release(window, err == nil, refused)
+						if refused {
+							st.retried(err)
+							j.again, j.notBefore = true, time.Now().Add(spread(retryAfter(err)))
+							q.push(true, j)
+							continue
+						}
+					}
 				}
 				st.mu.Lock()
 				switch {
@@ -393,14 +426,16 @@ func jobsFor(up *upload, need []int) []job {
 	return js
 }
 
-// retrier makes the calls of one user, tried again as cfg says.
+// retrier makes the calls of one user, tried again as cfg says, its parts
+// within its pool.
 type retrier struct {
-	cfg Config
-	st  *userState
+	cfg  Config
+	st   *userState
+	pool *pool
 }
 
 func (r retrier) create(ctx context.Context, u User, cfg Config, up *upload) (transfer.Created, error) {
-	c, _, err := retry(ctx, r, func() (transfer.Created, error) {
+	c, _, err := retry(ctx, r, true, func() (transfer.Created, error) {
 		return u.API.Create(ctx, transfer.CreateRequest{Dir: u.Dir, Name: up.name, Size: cfg.Size, ClientKey: up.key})
 	})
 	return c, err
@@ -489,7 +524,7 @@ func (r retrier) sendPart(ctx context.Context, api API, size int64, j job, buf [
 	j.up.hashes[j.n-1] = h
 	r.st.mu.Unlock()
 	sum := hex.EncodeToString(h[:])
-	_, d, err := retry(ctx, r, func() (transfer.PartResult, error) {
+	_, d, err := retry(ctx, r, false, func() (transfer.PartResult, error) {
 		if ctx.Err() != nil {
 			return transfer.PartResult{}, ctx.Err()
 		}
@@ -514,7 +549,7 @@ func (r retrier) finish(ctx context.Context, api API, up *upload) string {
 	if failed != nil {
 		return status(failed)
 	}
-	_, d, err := retry(ctx, r, func() (transfer.Result, error) {
+	_, d, err := retry(ctx, r, true, func() (transfer.Result, error) {
 		return api.Complete(ctx, up.c.UploadID, transfer.Composite(hashes))
 	})
 	if err != nil {
@@ -532,12 +567,19 @@ func partLen(size, partSize int64, n int) int64 {
 	return min(partSize, size-off)
 }
 
-// retry repeats a call the server refused for being busy, with growing
+// maxBackOff bounds the growing pauses after refusals for the server's load.
+var maxBackOff = 8 * time.Second
+
+// retry repeats a call that found its part in progress, with growing
 // pauses, and, for up to RetryFor, one that got no answer or found the
-// server shutting down. It tells r of each try repeated, and returns how
+// server shutting down. With load set, it also repeats a call the server
+// refused for its load, after the wait the refusal asks for, doubled for
+// each refusal in a row; without it, such a refusal is returned, for the
+// part's pool to deal with. It tells r of each try repeated, and returns how
 // long the last try took.
-func retry[T any](ctx context.Context, r retrier, call func() (T, error)) (T, time.Duration, error) {
+func retry[T any](ctx context.Context, r retrier, load bool, call func() (T, error)) (T, time.Duration, error) {
 	wait := 5 * time.Millisecond
+	var backOff time.Duration
 	var down time.Time
 	for {
 		start := time.Now()
@@ -562,14 +604,22 @@ func retry[T any](ctx context.Context, r retrier, call func() (T, error)) (T, ti
 			if time.Since(down) > r.cfg.RetryFor {
 				return v, took, err
 			}
-		case errors.Is(err, transfer.ErrBusy), errors.Is(err, transfer.ErrTooManyRequests), errors.Is(err, transfer.ErrPartInProgress):
+		case loadRefusal(err):
+			if !load {
+				return v, took, err
+			}
+			backOff = min(max(2*backOff, retryAfter(err)), maxBackOff)
+			if !pause(ctx, spread(backOff)) {
+				return v, took, err
+			}
+			r.st.retried(err)
+			continue
+		case errors.Is(err, transfer.ErrPartInProgress):
 		default:
 			return v, took, err
 		}
-		select {
-		case <-ctx.Done():
+		if !pause(ctx, wait) {
 			return v, took, err
-		case <-time.After(wait):
 		}
 		r.st.retried(err)
 		wait = min(2*wait, time.Second)

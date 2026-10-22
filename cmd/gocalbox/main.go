@@ -93,7 +93,7 @@ func run() error {
 	uploadTombstoneTTL := flag.Duration("upload-tombstone-ttl", defaults.TombstoneTTL, "How long a finished resumable upload still answers a client that repeats a call")
 	uploadMaxSessions := flag.Int("upload-max-sessions", defaults.MaxSessions, "Resumable uploads one user may have open at once")
 	uploadMaxSessionsTotal := flag.Int("upload-max-sessions-total", defaults.MaxSessionsTotal, "Resumable uploads open at once on the server")
-	uploadMaxInflight := flag.Int("upload-max-inflight", defaults.MaxInflight, "Parts of resumable uploads being received at once on the server")
+	uploadMaxInflight := flag.Int("upload-max-inflight", defaults.MaxInflight, "Parts of resumable uploads being received at once on the server; as many more may wait up to 10s for a slot")
 	verifyLog := flag.String("verify-audit", "", "Verify the integrity of this audit log file and exit")
 	verifyFile := flag.String("verify-upload", "", "Check this stored file against its upload.completed record and exit; needs -part-size and -composite")
 	partSize := flag.Int64("part-size", 0, "With -verify-upload: the part size in bytes, part_size in the upload's record")
@@ -214,6 +214,9 @@ func run() error {
 		<-ctx.Done()
 		stop()
 		log.Printf("Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...")
+		// Before the HTTP server waits for its handlers: parts waiting for an
+		// upload slot would hold that wait for up to their whole timeout.
+		a.uploads.BeginShutdown()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {

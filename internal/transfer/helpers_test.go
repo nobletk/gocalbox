@@ -410,6 +410,9 @@ func withEngine(f func(*Engine)) option {
 // testPartSize keeps the tests' files small: parts of 4 KiB.
 const testPartSize = 4 << 10
 
+// testAdmitWait keeps a wait for a slot that runs out short.
+const testAdmitWait = 200 * time.Millisecond
+
 // withFree adds a ledger measuring free bytes of the test's choosing, with
 // no reserve.
 func withFree(free int64) option {
@@ -457,7 +460,10 @@ func (en *env) start(opts ...option) {
 	en.root, en.files, en.bus = root, newFakeFiles(root), &recBus{}
 	en.audit = &fakeAudit{pub: en.bus}
 	cfg := Config{Root: root, Staging: st, Files: en.files, Registry: en.reg, Events: en.bus, Audit: en.audit,
-		JanitorEvery: -1, Now: en.clock.now, prepare: func(e *Engine) { e.partSize = func(int64) int64 { return testPartSize } }}
+		JanitorEvery: -1, Now: en.clock.now, prepare: func(e *Engine) {
+			e.partSize = func(int64) int64 { return testPartSize }
+			e.admitWait = testAdmitWait
+		}}
 	for _, o := range opts {
 		o(&cfg, en)
 	}

@@ -440,8 +440,7 @@ func TestStallLimitExtendsOnProgressButNeverAfterTheEnd(t *testing.T) {
 	rec := &deadlineRecorder{ResponseWriter: httptest.NewRecorder()}
 	body := &stallLimitedBody{
 		ReadCloser: io.NopCloser(&chunks{sizes: []int{40 << 10, 40 << 10, 10 << 10, 70 << 10}}),
-		rc:         http.NewResponseController(rec),
-		timeout:    time.Second,
+		clock:      &stallClock{rc: http.NewResponseController(rec), timeout: time.Second},
 	}
 	buf := make([]byte, 128<<10)
 	for {

@@ -89,8 +89,14 @@ func TestStatsCountWhatTheEngineDoes(t *testing.T) {
 		Busy:            2,
 		TooManyRequests: 1,
 		TooManyUploads:  1,
+		Waited:          1, // bob's first part, which waited for a slot and was then refused
+		WaitTimeouts:    1,
 	}
-	if s := en.e.Stats(); s != want {
+	s := en.e.Stats()
+	if s.WaitTime < testAdmitWait || s.WaitTime > 10*testAdmitWait {
+		t.Errorf("the wait took %v, want about %v", s.WaitTime, testAdmitWait)
+	}
+	if s.WaitTime = 0; s != want {
 		t.Errorf("stats\n got %+v\nwant %+v", s, want)
 	}
 }

@@ -723,7 +723,8 @@ func TestE2EUploadFlagsReachTheEngine(t *testing.T) {
 		t.Fatal(err)
 	}
 	near("-upload-max-age below -upload-first-part-ttl", c.ExpiresAt, 150*time.Minute)
-	if _, err := alice.create(source{dir: "users/alice", name: "d.bin", data: []byte("x"), modified: time.Now()}); err != nil {
+	d, err := alice.create(source{dir: "users/alice", name: "d.bin", data: []byte("x"), modified: time.Now()})
+	if err != nil {
 		t.Errorf("a second upload with -upload-max-sessions=2: %v", err)
 	}
 	if _, err := alice.create(source{dir: "users/alice", name: "e.bin", data: []byte("x"), modified: time.Now()}); codeOf(err) != "too_many_uploads" {
@@ -767,14 +768,78 @@ func TestE2EUploadFlagsReachTheEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := alice.part(kc.UploadID, 1, k.data); codeOf(err) != "busy" {
-		t.Errorf("-upload-max-inflight=1 with a part on its way: %v", err)
+	// The one slot is taken: alice's part waits for it, and the queue, as
+	// long as the slots, is then full.
+	waiting := make(chan error, 1)
+	go func() { waiting <- alice.part(kc.UploadID, 1, k.data) }()
+	time.Sleep(500 * time.Millisecond)
+	if err := alice.part(d.UploadID, 1, []byte("x")); codeOf(err) != "busy" {
+		t.Errorf("-upload-max-inflight=1 with a part on its way and one waiting: %v", err)
 	}
 	go func() { pw.Write(h.data[1:]); pw.Close() }()
 	if err := within(t, "bob's part", sent); err != nil {
 		t.Errorf("bob's part: %v", err)
 	}
+	if err := within(t, "alice's waiting part", waiting); err != nil {
+		t.Errorf("alice's part, once bob's ended: %v", err)
+	}
 	s.stop(syscall.SIGTERM)
+}
+
+// A part waiting for a slot when the server is told to stop is answered at
+// once, while the part in flight finishes.
+func TestE2EShutdownAnswersAWaitingPart(t *testing.T) {
+	s := startServer(t, "-upload-max-inflight=1")
+	bob := addUsersLater(t, s, "bob")
+	alice := addUsersLater(t, s, "alice")
+	h := source{dir: "users/bob", name: "h.bin", data: randomData(t, 1000), modified: time.Now()}
+	hc, err := bob.create(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.CloseWithError(errors.New("the test ended")) })
+	held := make(chan error, 1)
+	go func() {
+		sum := digest(h.data)
+		held <- bob.send("POST", "/api/upload/part?id="+hc.UploadID+"&n=1", "application/octet-stream", pr, int64(len(h.data)),
+			map[string]string{httpapi.PartChecksumHeader: hex.EncodeToString(sum[:])}, nil)
+	}()
+	go pw.Write(h.data[:1])
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		var st transfer.Status
+		if err := bob.call("/api/upload/status", httpapi.UploadStatusRequest{UploadID: hc.UploadID}, &st); err == nil && slices.Equal(st.InFlight, []int{1}) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("bob's part never arrived")
+		}
+	}
+	a := source{dir: "users/alice", name: "a.bin", data: randomData(t, 1000), modified: time.Now()}
+	ac, err := alice.create(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan error, 1)
+	go func() { waiting <- alice.part(ac.UploadID, 1, a.data) }()
+	time.Sleep(500 * time.Millisecond)
+
+	exited := make(chan error, 1)
+	start := time.Now()
+	go func() { exited <- s.stop(syscall.SIGTERM) }()
+	if err := within(t, "alice's waiting part", waiting); codeOf(err) != "unavailable" {
+		t.Errorf("a part waiting at shutdown: %v\n%s", err, s.out)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("the waiting part was answered %v after the signal", took)
+	}
+	go func() { pw.Write(h.data[1:]); pw.Close() }()
+	if err := within(t, "bob's part", held); err != nil {
+		t.Errorf("the part in flight at shutdown: %v\n%s", err, s.out)
+	}
+	if err := within(t, "the server's exit", exited); err != nil {
+		t.Errorf("exit: %v\n%s", err, s.out)
+	}
 }
 
 // addUsersLater adds a contributor to a running server through the admin
@@ -1078,5 +1143,12 @@ func TestE2EMaxUploadMBBoundsResumableUploads(t *testing.T) {
 	}
 	if err := s.stop(syscall.SIGTERM); err != nil {
 		t.Fatalf("exit: %v", err)
+	}
+}
+
+func TestE2EHelpSaysPartsMayWaitForASlot(t *testing.T) {
+	out, _ := runToCompletion(t, "-h")
+	if !strings.Contains(out, "as many more may wait up to 10s for a slot") {
+		t.Errorf("-h doesn't say that parts may wait for a slot:\n%s", out)
 	}
 }

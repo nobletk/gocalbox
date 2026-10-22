@@ -23,6 +23,10 @@ type PartRequest struct {
 	// Length is the body's length when the client declared it, or -1.
 	Length int64
 	Body   io.Reader
+	// Wait, when set, is called with true as the part starts waiting for a
+	// server-wide slot and with false as the wait ends, so that the caller
+	// can stop counting the time against the body's stall limit.
+	Wait func(waiting bool)
 }
 
 type PartResult struct {
@@ -65,11 +69,23 @@ func (e *Engine) Part(ctx context.Context, req PartRequest) (PartResult, error) 
 	if err != nil {
 		return PartResult{}, e.refusePart(ctx, s, req.N, err)
 	}
-	release, err := e.admit(s.rec.Owner)
+	release, waited, err := e.admit(ctx, s.rec.Owner, req.Wait)
 	if err != nil {
 		return PartResult{}, err
 	}
 	defer release()
+	if waited {
+		// The user's rights and the session may have changed while it waited.
+		if err := e.files.MayUpload(ctx, s.rec.Folder); err != nil {
+			return PartResult{}, e.refusePart(ctx, s, req.N, err)
+		}
+		s.mu.Lock()
+		expected, dup, err = s.check(req)
+		s.mu.Unlock()
+		if err != nil {
+			return PartResult{}, e.refusePart(ctx, s, req.N, err)
+		}
+	}
 	if dup {
 		return e.duplicate(ctx, s, req, expected)
 	}

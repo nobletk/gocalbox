@@ -32,6 +32,7 @@ import (
 	"github.com/nobletk/gocalbox/bench/lib"
 	"github.com/nobletk/gocalbox/bench/load"
 	"github.com/nobletk/gocalbox/internal/benchmode"
+	"github.com/nobletk/gocalbox/internal/transfer"
 )
 
 func main() {
@@ -166,9 +167,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 			}
 			cfg.Users = stack.Users
 			res = load.Run(context.Background(), cfg)
-			st := stack.Engine.Stats()
-			server = fmt.Sprintf("; the engine: %d parts, %d duplicates, refused busy %d, too_many_requests %d, too_many_uploads %d",
-				st.PartsReceived, st.Duplicates, st.Busy, st.TooManyRequests, st.TooManyUploads)
+			server = "; " + engineSummary(stack.Engine.Stats())
 			if err := stack.Close(); err != nil {
 				log.Printf("closing the stack: %v", err)
 			}
@@ -303,4 +302,11 @@ func gitState() (string, bool) {
 	}
 	dirty := exec.Command("git", "diff", "--quiet", "HEAD", "--", ".", ":!bench").Run() != nil
 	return strings.TrimSpace(string(rev)), dirty
+}
+
+// engineSummary is what the log line of a repetition says of the engine
+// run in process.
+func engineSummary(st transfer.Stats) string {
+	return fmt.Sprintf("the engine: %d parts, %d duplicates, refused busy %d (%d waits ran out, %d found the queue full), too_many_requests %d, too_many_uploads %d; %d parts waited for a slot, %v in all",
+		st.PartsReceived, st.Duplicates, st.Busy, st.WaitTimeouts, st.QueueFull, st.TooManyRequests, st.TooManyUploads, st.Waited, st.WaitTime.Round(time.Millisecond))
 }
