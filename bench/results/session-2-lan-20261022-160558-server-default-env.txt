@@ -1,0 +1,150 @@
+round: 1
+server: 11fa366 (dirty=0)   started: 20261022-160619
+build tags: none
+benchmark settings: none
+host: nobletk-laptop   date: 2026-10-22T16:22:49+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench/server/root
+  file system: /dev/nvme0n1p7 ext4 rw,noatime
+  free: 1043147153408 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  enp8s0f4u1u4: up, 1000 Mb/s, 192.168.1.137/24 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f/64 fe80::942b:a835:bb8e:4157/64
+  wlp5s0: down, ? Mb/s, 
+  wifi wlp5s0: 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 1043154161664 bytes
+server command: '/mnt/storage/gocalbox-bench/server/gocalbox' '-host' '0.0.0.0' '-port' '18080' '-root' '/mnt/storage/gocalbox-bench/server/root' '-audit-log' '/mnt/storage/gocalbox-bench/server/audit.jsonl' '-max-upload-mb' '0' '-tls-dir' '/mnt/storage/gocalbox-bench/server/tls' '-log-events=false' '-state' '/mnt/storage/gocalbox-bench/server/state.db'
+console event log: off
+scheme: https
+load users: 24
+server peak RSS (kB): 237412
+audit records: 1808
+round: 2
+server: 11fa366 (dirty=0)   started: 20261022-162250
+build tags: none
+benchmark settings: none
+host: nobletk-laptop   date: 2026-10-22T16:33:50+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench/server/root
+  file system: /dev/nvme0n1p7 ext4 rw,noatime
+  free: 1043149426688 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  enp8s0f4u1u4: up, 1000 Mb/s, 192.168.1.137/24 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f/64 fe80::942b:a835:bb8e:4157/64
+  wlp5s0: down, ? Mb/s, 
+  wifi wlp5s0: 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 1043154161664 bytes
+server command: '/mnt/storage/gocalbox-bench/server/gocalbox' '-host' '0.0.0.0' '-port' '18080' '-root' '/mnt/storage/gocalbox-bench/server/root' '-audit-log' '/mnt/storage/gocalbox-bench/server/audit.jsonl' '-max-upload-mb' '0' '-tls-dir' '/mnt/storage/gocalbox-bench/server/tls' '-log-events=false' '-state' '/mnt/storage/gocalbox-bench/server/state.db'
+console event log: off
+scheme: https
+load users: 24
+server peak RSS (kB): 228560
+audit records: 1223
+round: 3
+server: 11fa366 (dirty=0)   started: 20261022-163352
+build tags: none
+benchmark settings: none
+host: nobletk-laptop   date: 2026-10-22T16:44:52+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench/server/root
+  file system: /dev/nvme0n1p7 ext4 rw,noatime
+  free: 1043149418496 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  enp8s0f4u1u4: up, 1000 Mb/s, 192.168.1.137/24 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f/64 fe80::942b:a835:bb8e:4157/64
+  wlp5s0: down, ? Mb/s, 
+  wifi wlp5s0: 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 1043154165760 bytes
+server command: '/mnt/storage/gocalbox-bench/server/gocalbox' '-host' '0.0.0.0' '-port' '18080' '-root' '/mnt/storage/gocalbox-bench/server/root' '-audit-log' '/mnt/storage/gocalbox-bench/server/audit.jsonl' '-max-upload-mb' '0' '-tls-dir' '/mnt/storage/gocalbox-bench/server/tls' '-log-events=false' '-state' '/mnt/storage/gocalbox-bench/server/state.db'
+console event log: off
+scheme: https
+load users: 24
+server peak RSS (kB): 226672
+audit records: 1223
+round: 4
+server: 11fa366 (dirty=0)   started: 20261022-164453
+build tags: none
+benchmark settings: none
+host: nobletk-laptop   date: 2026-10-22T16:55:56+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench/server/root
+  file system: /dev/nvme0n1p7 ext4 rw,noatime
+  free: 1043149406208 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  enp8s0f4u1u4: up, 1000 Mb/s, 192.168.1.137/24 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f/64 fe80::942b:a835:bb8e:4157/64
+  wlp5s0: down, ? Mb/s, 
+  wifi wlp5s0: 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 1043154161664 bytes
+server command: '/mnt/storage/gocalbox-bench/server/gocalbox' '-host' '0.0.0.0' '-port' '18080' '-root' '/mnt/storage/gocalbox-bench/server/root' '-audit-log' '/mnt/storage/gocalbox-bench/server/audit.jsonl' '-max-upload-mb' '0' '-tls-dir' '/mnt/storage/gocalbox-bench/server/tls' '-log-events=false' '-state' '/mnt/storage/gocalbox-bench/server/state.db'
+console event log: off
+scheme: https
+load users: 24
+server peak RSS (kB): 197940
+audit records: 1223
+round: 5
+server: 11fa366 (dirty=0)   started: 20261022-165557
+build tags: none
+benchmark settings: none
+host: nobletk-laptop   date: 2026-10-22T17:06:57+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench/server/root
+  file system: /dev/nvme0n1p7 ext4 rw,noatime
+  free: 1043149438976 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  enp8s0f4u1u4: up, 1000 Mb/s, 192.168.1.137/24 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f/64 fe80::942b:a835:bb8e:4157/64
+  wlp5s0: down, ? Mb/s, 
+  wifi wlp5s0: 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 1043154169856 bytes
+server command: '/mnt/storage/gocalbox-bench/server/gocalbox' '-host' '0.0.0.0' '-port' '18080' '-root' '/mnt/storage/gocalbox-bench/server/root' '-audit-log' '/mnt/storage/gocalbox-bench/server/audit.jsonl' '-max-upload-mb' '0' '-tls-dir' '/mnt/storage/gocalbox-bench/server/tls' '-log-events=false' '-state' '/mnt/storage/gocalbox-bench/server/state.db'
+console event log: off
+scheme: https
+load users: 24
+server peak RSS (kB): 209392
+audit records: 1223
