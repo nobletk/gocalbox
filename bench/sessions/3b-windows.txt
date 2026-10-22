@@ -1,0 +1,28 @@
+# Session 3b: HTTP/2's two receive windows, over Wi-Fi; the server on PC A on the cable, the
+# client on PC B on Wi-Fi, as in session 3. It extends X5.
+#
+# Session 3's 1 MiB cells raised both windows at once, 1 MiB per stream and 16 MiB per
+# connection. These servers change one window at a time: today's 256 KiB and 4 MiB, each
+# raised alone, and both raised.
+
+server h2-bench    BUILD_TAGS=bench
+server h2-256k-16m BUILD_TAGS=bench GOCALBOX_BENCH_H2_CONN_WINDOW=16M
+server h2-1m-4m    BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=1M
+server h2-1m       BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=1M GOCALBOX_BENCH_H2_CONN_WINDOW=16M
+
+# The engine, 4 parts in flight: the two windows crossed. HTTP/1.1, which has neither, is the
+# ceiling the same night.
+cell w-engine-h1        h2-bench    engine transport=https-h1 size=1G
+cell w-256k-4m-engine   h2-bench    engine transport=https-h2 size=1G
+cell w-256k-16m-engine  h2-256k-16m engine transport=https-h2 size=1G
+cell w-1m-4m-engine     h2-1m-4m    engine transport=https-h2 size=1G
+cell w-1m-16m-engine    h2-1m       engine transport=https-h2 size=1G
+
+# One part in flight: one stream's rate, at each stream window.
+cell w-256k-4m-par1     h2-bench    engine transport=https-h2 size=1G parallel=1
+cell w-1m-16m-par1      h2-1m       engine transport=https-h2 size=1G parallel=1
+
+# The single-request upload, one stream: with a 1 MiB stream window, does the connection's
+# window matter? Session 3 has it at 256 KiB with 4 MiB.
+cell w-1m-4m-single     h2-1m-4m    upload transport=https-h2 size=1G
+cell w-1m-16m-single    h2-1m       upload transport=https-h2 size=1G
