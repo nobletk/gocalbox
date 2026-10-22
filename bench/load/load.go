@@ -156,20 +156,24 @@ func Run(ctx context.Context, cfg Config) Result {
 	return res
 }
 
-// fault calls a run's fault once, and keeps when.
+// fault calls a run's fault once, and keeps when, and how many files had
+// begun by then. Files are told apart by their count, not their time:
+// Windows' clock can give a file and the fault the same instant.
 type fault struct {
-	once sync.Once
-	call func() error
-	mu   sync.Mutex
-	at   time.Time
-	err  error
-	done chan struct{}
+	once   sync.Once
+	call   func() error
+	mu     sync.Mutex
+	begun  int
+	at     time.Time
+	atFile int
+	err    error
+	done   chan struct{}
 }
 
 func (f *fault) fire() {
 	f.once.Do(func() {
 		f.mu.Lock()
-		f.at = time.Now()
+		f.at, f.atFile = time.Now(), f.begun
 		f.mu.Unlock()
 		go func() {
 			defer close(f.done)
@@ -184,9 +188,24 @@ func (f *fault) when() time.Time {
 	return f.at
 }
 
+// begin counts a file begun, and returns its number, from 1.
+func (f *fault) begin() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.begun++
+	return f.begun
+}
+
+// before says whether file number n had begun when the fault came.
+func (f *fault) before(n int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.at.IsZero() && n <= f.atFile
+}
+
 type upload struct {
 	name    string
-	began   time.Time
+	file    int // its number among the run's files, from 1, when the run has a fault
 	key     string
 	seed    byte
 	c       transfer.Created
@@ -348,8 +367,8 @@ func runUser(ctx context.Context, u User, cfg Config, user int, start time.Time,
 				st.res.Resumes = append(st.res.Resumes, time.Since(up.stopped))
 			}
 			if flt != nil {
-				if at := flt.when(); !at.IsZero() && up.began.Before(at) {
-					st.res.Resumes = append(st.res.Resumes, time.Since(at))
+				if flt.before(up.file) {
+					st.res.Resumes = append(st.res.Resumes, time.Since(flt.when()))
 				}
 			}
 		}
@@ -433,7 +452,10 @@ func runUser(ctx context.Context, u User, cfg Config, user int, start time.Time,
 	}
 	for f := range cfg.Files {
 		name := fmt.Sprintf("load-%03d-%04d.bin", user, f)
-		up := &upload{name: name, began: time.Now(), seed: byte(user*31 + f), sends: map[int]int{}}
+		up := &upload{name: name, seed: byte(user*31 + f), sends: map[int]int{}}
+		if flt != nil {
+			up.file = flt.begin()
+		}
 		up.key = clientKey(u.Dir, name, cfg.Size, up.seed)
 		q.opened()
 		c, err := r.create(ctx, u, cfg, up)
