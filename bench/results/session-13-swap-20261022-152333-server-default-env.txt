@@ -1,0 +1,145 @@
+round: 1
+server: 8303f03 (dirty=0)   started: 20261022-152355
+build tags: none
+benchmark settings: none
+host: nobletkpc   date: 2026-10-22T15:27:00+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 7 9700X 8-Core Processor   cpus: 16
+memory: 30.5 GiB
+cpu governor: performance
+clock synchronised: yes
+folder: /home/nobletk/gocalbox-bench/server/root
+  file system: /dev/mapper/root[/@home] btrfs rw,relatime,compress=zstd:3,ssd,space_cache=v2,subvolid=257,subvol=/@home
+  free: 277168881664 bytes
+  disk: NAME="nvme1n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="1.8T" MODEL="Samsung SSD 980 PRO 2TB"
+network:
+  enp10s0: up, 1000 Mb/s, 192.168.1.233/24 2001:4c4e:248c:7300:902:105d:1d9a:8991/64 fe80::6f5e:4b08:b936:5f5f/64
+  wlp9s0: up, ? Mb/s, 192.168.1.12/24 2001:4c4e:248c:7300:3c5:59a2:abb9:d968/64 fe80::1e2a:5619:6e4c:efa0/64
+  wifi wlp9s0: SSID: Telekom-Noble; freq: 5220.0; signal: -58 dBm; rx bitrate: 1361.2 MBit/s 160MHz HE-MCS 7 HE-NSS 2 HE-GI 1 HE-DCM 0; tx bitrate: 1225.1 MBit/s 160MHz HE-MCS 7 HE-NSS 2 HE-GI 2 HE-DCM 0; 
+go: go version go1.27.2-X:nodwarf5 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 278242721792 bytes
+server command: '/home/nobletk/gocalbox-bench/server/gocalbox' '-host' '0.0.0.0' '-port' '18080' '-root' '/home/nobletk/gocalbox-bench/server/root' '-audit-log' '/home/nobletk/gocalbox-bench/server/audit.jsonl' '-max-upload-mb' '0' '-tls-dir' '/home/nobletk/gocalbox-bench/server/tls' '-log-events=false' '-state' '/home/nobletk/gocalbox-bench/server/state.db'
+console event log: off
+scheme: https
+load users: 1
+server peak RSS (kB): 99392
+audit records: 50
+round: 2
+server: 8303f03 (dirty=0)   started: 20261022-152700
+build tags: none
+benchmark settings: none
+host: nobletkpc   date: 2026-10-22T15:29:07+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 7 9700X 8-Core Processor   cpus: 16
+memory: 30.5 GiB
+cpu governor: performance
+clock synchronised: yes
+folder: /home/nobletk/gocalbox-bench/server/root
+  file system: /dev/mapper/root[/@home] btrfs rw,relatime,compress=zstd:3,ssd,space_cache=v2,subvolid=257,subvol=/@home
+  free: 277168918528 bytes
+  disk: NAME="nvme1n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="1.8T" MODEL="Samsung SSD 980 PRO 2TB"
+network:
+  enp10s0: up, 1000 Mb/s, 192.168.1.233/24 2001:4c4e:248c:7300:902:105d:1d9a:8991/64 fe80::6f5e:4b08:b936:5f5f/64
+  wlp9s0: up, ? Mb/s, 192.168.1.12/24 2001:4c4e:248c:7300:3c5:59a2:abb9:d968/64 fe80::1e2a:5619:6e4c:efa0/64
+  wifi wlp9s0: SSID: Telekom-Noble; freq: 5220.0; signal: -57 dBm; rx bitrate: 1441.3 MBit/s 160MHz HE-MCS 7 HE-NSS 2 HE-GI 0 HE-DCM 0; tx bitrate: 1441.3 MBit/s 160MHz HE-MCS 7 HE-NSS 2 HE-GI 0 HE-DCM 0; 
+go: go version go1.27.2-X:nodwarf5 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 277168881664 bytes
+server command: '/home/nobletk/gocalbox-bench/server/gocalbox' '-host' '0.0.0.0' '-port' '18080' '-root' '/home/nobletk/gocalbox-bench/server/root' '-audit-log' '/home/nobletk/gocalbox-bench/server/audit.jsonl' '-max-upload-mb' '0' '-tls-dir' '/home/nobletk/gocalbox-bench/server/tls' '-log-events=false' '-state' '/home/nobletk/gocalbox-bench/server/state.db'
+console event log: off
+scheme: https
+load users: 1
+server peak RSS (kB): 83108
+audit records: 36
+round: 3
+server: 8303f03 (dirty=0)   started: 20261022-152908
+build tags: none
+benchmark settings: none
+host: nobletkpc   date: 2026-10-22T15:31:15+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 7 9700X 8-Core Processor   cpus: 16
+memory: 30.5 GiB
+cpu governor: performance
+clock synchronised: yes
+folder: /home/nobletk/gocalbox-bench/server/root
+  file system: /dev/mapper/root[/@home] btrfs rw,relatime,compress=zstd:3,ssd,space_cache=v2,subvolid=257,subvol=/@home
+  free: 277168918528 bytes
+  disk: NAME="nvme1n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="1.8T" MODEL="Samsung SSD 980 PRO 2TB"
+network:
+  enp10s0: up, 1000 Mb/s, 192.168.1.233/24 2001:4c4e:248c:7300:902:105d:1d9a:8991/64 fe80::6f5e:4b08:b936:5f5f/64
+  wlp9s0: up, ? Mb/s, 192.168.1.12/24 2001:4c4e:248c:7300:3c5:59a2:abb9:d968/64 fe80::1e2a:5619:6e4c:efa0/64
+  wifi wlp9s0: SSID: Telekom-Noble; freq: 5220.0; signal: -57 dBm; rx bitrate: 1441.3 MBit/s 160MHz HE-MCS 7 HE-NSS 2 HE-GI 0 HE-DCM 0; tx bitrate: 1729.6 MBit/s 160MHz HE-MCS 8 HE-NSS 2 HE-GI 0 HE-DCM 0; 
+go: go version go1.27.2-X:nodwarf5 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 277168918528 bytes
+server command: '/home/nobletk/gocalbox-bench/server/gocalbox' '-host' '0.0.0.0' '-port' '18080' '-root' '/home/nobletk/gocalbox-bench/server/root' '-audit-log' '/home/nobletk/gocalbox-bench/server/audit.jsonl' '-max-upload-mb' '0' '-tls-dir' '/home/nobletk/gocalbox-bench/server/tls' '-log-events=false' '-state' '/home/nobletk/gocalbox-bench/server/state.db'
+console event log: off
+scheme: https
+load users: 1
+server peak RSS (kB): 100652
+audit records: 36
+round: 4
+server: 8303f03 (dirty=0)   started: 20261022-153115
+build tags: none
+benchmark settings: none
+host: nobletkpc   date: 2026-10-22T15:33:22+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 7 9700X 8-Core Processor   cpus: 16
+memory: 30.5 GiB
+cpu governor: performance
+clock synchronised: yes
+folder: /home/nobletk/gocalbox-bench/server/root
+  file system: /dev/mapper/root[/@home] btrfs rw,relatime,compress=zstd:3,ssd,space_cache=v2,subvolid=257,subvol=/@home
+  free: 277168934912 bytes
+  disk: NAME="nvme1n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="1.8T" MODEL="Samsung SSD 980 PRO 2TB"
+network:
+  enp10s0: up, 1000 Mb/s, 192.168.1.233/24 2001:4c4e:248c:7300:902:105d:1d9a:8991/64 fe80::6f5e:4b08:b936:5f5f/64
+  wlp9s0: up, ? Mb/s, 192.168.1.12/24 2001:4c4e:248c:7300:3c5:59a2:abb9:d968/64 fe80::1e2a:5619:6e4c:efa0/64
+  wifi wlp9s0: SSID: Telekom-Noble; freq: 5220.0; signal: -57 dBm; rx bitrate: 1361.2 MBit/s 160MHz HE-MCS 7 HE-NSS 2 HE-GI 1 HE-DCM 0; tx bitrate: 1729.6 MBit/s 160MHz HE-MCS 8 HE-NSS 2 HE-GI 0 HE-DCM 0; 
+go: go version go1.27.2-X:nodwarf5 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 277168918528 bytes
+server command: '/home/nobletk/gocalbox-bench/server/gocalbox' '-host' '0.0.0.0' '-port' '18080' '-root' '/home/nobletk/gocalbox-bench/server/root' '-audit-log' '/home/nobletk/gocalbox-bench/server/audit.jsonl' '-max-upload-mb' '0' '-tls-dir' '/home/nobletk/gocalbox-bench/server/tls' '-log-events=false' '-state' '/home/nobletk/gocalbox-bench/server/state.db'
+console event log: off
+scheme: https
+load users: 1
+server peak RSS (kB): 91852
+audit records: 36
+round: 5
+server: 8303f03 (dirty=0)   started: 20261022-153322
+build tags: none
+benchmark settings: none
+host: nobletkpc   date: 2026-10-22T15:35:29+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 7 9700X 8-Core Processor   cpus: 16
+memory: 30.5 GiB
+cpu governor: performance
+clock synchronised: yes
+folder: /home/nobletk/gocalbox-bench/server/root
+  file system: /dev/mapper/root[/@home] btrfs rw,relatime,compress=zstd:3,ssd,space_cache=v2,subvolid=257,subvol=/@home
+  free: 277168947200 bytes
+  disk: NAME="nvme1n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="1.8T" MODEL="Samsung SSD 980 PRO 2TB"
+network:
+  enp10s0: up, 1000 Mb/s, 192.168.1.233/24 2001:4c4e:248c:7300:902:105d:1d9a:8991/64 fe80::6f5e:4b08:b936:5f5f/64
+  wlp9s0: up, ? Mb/s, 192.168.1.12/24 2001:4c4e:248c:7300:3c5:59a2:abb9:d968/64 fe80::1e2a:5619:6e4c:efa0/64
+  wifi wlp9s0: SSID: Telekom-Noble; freq: 5220.0; signal: -56 dBm; rx bitrate: 1441.3 MBit/s 160MHz HE-MCS 7 HE-NSS 2 HE-GI 0 HE-DCM 0; tx bitrate: 1729.6 MBit/s 160MHz HE-MCS 8 HE-NSS 2 HE-GI 0 HE-DCM 0; 
+go: go version go1.27.2-X:nodwarf5 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 277168934912 bytes
+server command: '/home/nobletk/gocalbox-bench/server/gocalbox' '-host' '0.0.0.0' '-port' '18080' '-root' '/home/nobletk/gocalbox-bench/server/root' '-audit-log' '/home/nobletk/gocalbox-bench/server/audit.jsonl' '-max-upload-mb' '0' '-tls-dir' '/home/nobletk/gocalbox-bench/server/tls' '-log-events=false' '-state' '/home/nobletk/gocalbox-bench/server/state.db'
+console event log: off
+scheme: https
+load users: 1
+server peak RSS (kB): 99592
+audit records: 36

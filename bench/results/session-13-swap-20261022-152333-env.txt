@@ -1,0 +1,46 @@
+session: bench/sessions/13-swap.txt   seed: 3505102015   started: 2026-10-22T15:23:54+02:00
+client commit: 8303f03 (dirty=0)
+server: nobletk@192.168.1.233 at 192.168.1.233:18080, repository /home/nobletk/Personal/Projects/gocalbox, benchmark folder /home/nobletk/gocalbox-bench
+reps: 10, 5 from 5 GiB; warm-ups: 1; rounds: 5; drop caches before downloads: 1
+cells: all
+iperf3 at the start, Mbit/s: to the server 941, from the server 941
+--- this machine
+host: nobletk-laptop   date: 2026-10-22T15:23:54+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench
+  file system: /dev/nvme0n1p7 ext4 rw,noatime
+  free: 1043141996544 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  enp8s0f4u1u4: up, 1000 Mb/s, 192.168.1.137/24 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f/64 fe80::942b:a835:bb8e:4157/64
+  wlp5s0: down, ? Mb/s, 
+  wifi wlp5s0: 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+--- the matrix
+# X13: the roles swapped, the server on PC B and the client on PC A, on the wired LAN.
+# The same cells as X5's first six in session 2; if they match session 2's, the client
+# never limits the numbers.
+
+server default
+
+cell x13-engine-h1 default engine   transport=https-h1 size=1G
+cell x13-engine-h2 default engine   transport=https-h2 size=1G
+cell x13-single-h1 default upload   transport=https-h1 size=1G
+cell x13-single-h2 default upload   transport=https-h2 size=1G
+cell x13-down-h1   default download transport=https-h1 size=1G
+cell x13-down-h2   default download transport=https-h2 size=1G
+iperf3 at the end, Mbit/s: to the server 941, from the server 941
+finished: 2026-10-22T15:35:51+02:00   runs: 66   not ok: 0
+--- this machine's network at the end
+network:
+  enp8s0f4u1u4: up, 1000 Mb/s, 192.168.1.137/24 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f/64 fe80::942b:a835:bb8e:4157/64
+  wlp5s0: down, ? Mb/s, 
+  wifi wlp5s0: 
