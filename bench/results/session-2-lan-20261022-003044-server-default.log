@@ -1,0 +1,60 @@
+2026/10/22 00:38:56 Starting server on https://0.0.0.0:18080
+2026/10/22 00:38:56 Sandboxing directory: /mnt/storage/gocalbox-bench/server/root
+2026/10/22 00:38:56 Accepted host names: localhost, 127.0.0.1, ::1, 192.168.1.137, 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f, fe80::942b:a835:bb8e:4157, nobletk-laptop, nobletk-laptop.local
+2026/10/22 00:38:56 Audit log: /mnt/storage/gocalbox-bench/server/audit.jsonl (6 existing records)
+2026/10/22 00:38:56 State file: /mnt/storage/gocalbox-bench/server/state.db
+2026/10/22 00:38:56 Free space: 971.5 GiB on the served volume; uploads leave at least 1024 MiB free
+2026/10/22 00:38:56 HTTPS certificate from the local CA, renewed automatically, for: localhost, nobletk-laptop.local, 127.0.0.1, ::1, 192.168.1.137, fe80::942b:a835:bb8e:4157
+2026/10/22 00:38:56 Not in the HTTPS certificate: 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f, nobletk-laptop. The local CA signs only LAN names and private addresses; use -tls-cert to serve under others
+2026/10/22 00:38:56 Local CA: /mnt/storage/gocalbox-bench/server/tls/ca.crt (valid until 2036-10-18)
+2026/10/22 00:38:56 Local CA SHA-256 fingerprint: 2D:B8:41:F3:98:CF:D9:B9:C9:9B:0E:89:06:83:32:6E:30:F9:15:DE:29:42:DD:AF:4B:58:9E:C4:53:5B:C2:4E
+2026/10/22 00:38:56 Install the local CA once on each device: open https://192.168.1.137:18080/ca.crt, accept the warning this one time, and check that the fingerprint the installer shows matches the one above
+2026/10/22 01:06:39 Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...
+2026/10/22 01:45:20 Starting server on https://0.0.0.0:18080
+2026/10/22 01:45:20 Sandboxing directory: /mnt/storage/gocalbox-bench/server/root
+2026/10/22 01:45:20 Accepted host names: localhost, 127.0.0.1, ::1, 192.168.1.137, 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f, fe80::942b:a835:bb8e:4157, nobletk-laptop, nobletk-laptop.local
+2026/10/22 01:45:20 Audit log: /mnt/storage/gocalbox-bench/server/audit.jsonl (6 existing records)
+2026/10/22 01:45:20 State file: /mnt/storage/gocalbox-bench/server/state.db
+2026/10/22 01:45:20 Free space: 971.5 GiB on the served volume; uploads leave at least 1024 MiB free
+2026/10/22 01:45:20 HTTPS certificate from the local CA, renewed automatically, for: localhost, nobletk-laptop.local, 127.0.0.1, ::1, 192.168.1.137, fe80::942b:a835:bb8e:4157
+2026/10/22 01:45:20 Not in the HTTPS certificate: 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f, nobletk-laptop. The local CA signs only LAN names and private addresses; use -tls-cert to serve under others
+2026/10/22 01:45:20 Local CA: /mnt/storage/gocalbox-bench/server/tls/ca.crt (valid until 2036-10-18)
+2026/10/22 01:45:20 Local CA SHA-256 fingerprint: 2D:B8:41:F3:98:CF:D9:B9:C9:9B:0E:89:06:83:32:6E:30:F9:15:DE:29:42:DD:AF:4B:58:9E:C4:53:5B:C2:4E
+2026/10/22 01:45:20 Install the local CA once on each device: open https://192.168.1.137:18080/ca.crt, accept the warning this one time, and check that the fingerprint the installer shows matches the one above
+2026/10/22 02:05:11 Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...
+2026/10/22 02:24:41 Starting server on https://0.0.0.0:18080
+2026/10/22 02:24:41 Sandboxing directory: /mnt/storage/gocalbox-bench/server/root
+2026/10/22 02:24:41 Accepted host names: localhost, 127.0.0.1, ::1, 192.168.1.137, 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f, fe80::942b:a835:bb8e:4157, nobletk-laptop, nobletk-laptop.local
+2026/10/22 02:24:41 Audit log: /mnt/storage/gocalbox-bench/server/audit.jsonl (6 existing records)
+2026/10/22 02:24:41 State file: /mnt/storage/gocalbox-bench/server/state.db
+2026/10/22 02:24:41 Free space: 971.5 GiB on the served volume; uploads leave at least 1024 MiB free
+2026/10/22 02:24:41 HTTPS certificate from the local CA, renewed automatically, for: localhost, nobletk-laptop.local, 127.0.0.1, ::1, 192.168.1.137, fe80::942b:a835:bb8e:4157
+2026/10/22 02:24:41 Not in the HTTPS certificate: 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f, nobletk-laptop. The local CA signs only LAN names and private addresses; use -tls-cert to serve under others
+2026/10/22 02:24:41 Local CA: /mnt/storage/gocalbox-bench/server/tls/ca.crt (valid until 2036-10-18)
+2026/10/22 02:24:41 Local CA SHA-256 fingerprint: 2D:B8:41:F3:98:CF:D9:B9:C9:9B:0E:89:06:83:32:6E:30:F9:15:DE:29:42:DD:AF:4B:58:9E:C4:53:5B:C2:4E
+2026/10/22 02:24:41 Install the local CA once on each device: open https://192.168.1.137:18080/ca.crt, accept the warning this one time, and check that the fingerprint the installer shows matches the one above
+2026/10/22 02:45:05 Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...
+2026/10/22 02:53:39 Starting server on https://0.0.0.0:18080
+2026/10/22 02:53:39 Sandboxing directory: /mnt/storage/gocalbox-bench/server/root
+2026/10/22 02:53:39 Accepted host names: localhost, 127.0.0.1, ::1, 192.168.1.137, 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f, fe80::942b:a835:bb8e:4157, nobletk-laptop, nobletk-laptop.local
+2026/10/22 02:53:39 Audit log: /mnt/storage/gocalbox-bench/server/audit.jsonl (6 existing records)
+2026/10/22 02:53:39 State file: /mnt/storage/gocalbox-bench/server/state.db
+2026/10/22 02:53:39 Free space: 971.5 GiB on the served volume; uploads leave at least 1024 MiB free
+2026/10/22 02:53:39 HTTPS certificate from the local CA, renewed automatically, for: localhost, nobletk-laptop.local, 127.0.0.1, ::1, 192.168.1.137, fe80::942b:a835:bb8e:4157
+2026/10/22 02:53:39 Not in the HTTPS certificate: 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f, nobletk-laptop. The local CA signs only LAN names and private addresses; use -tls-cert to serve under others
+2026/10/22 02:53:39 Local CA: /mnt/storage/gocalbox-bench/server/tls/ca.crt (valid until 2036-10-18)
+2026/10/22 02:53:39 Local CA SHA-256 fingerprint: 2D:B8:41:F3:98:CF:D9:B9:C9:9B:0E:89:06:83:32:6E:30:F9:15:DE:29:42:DD:AF:4B:58:9E:C4:53:5B:C2:4E
+2026/10/22 02:53:39 Install the local CA once on each device: open https://192.168.1.137:18080/ca.crt, accept the warning this one time, and check that the fingerprint the installer shows matches the one above
+2026/10/22 03:14:01 Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...
+2026/10/22 03:52:48 Starting server on https://0.0.0.0:18080
+2026/10/22 03:52:48 Sandboxing directory: /mnt/storage/gocalbox-bench/server/root
+2026/10/22 03:52:48 Accepted host names: localhost, 127.0.0.1, ::1, 192.168.1.137, 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f, fe80::942b:a835:bb8e:4157, nobletk-laptop, nobletk-laptop.local
+2026/10/22 03:52:48 Audit log: /mnt/storage/gocalbox-bench/server/audit.jsonl (6 existing records)
+2026/10/22 03:52:48 State file: /mnt/storage/gocalbox-bench/server/state.db
+2026/10/22 03:52:48 Free space: 971.5 GiB on the served volume; uploads leave at least 1024 MiB free
+2026/10/22 03:52:48 HTTPS certificate from the local CA, renewed automatically, for: localhost, nobletk-laptop.local, 127.0.0.1, ::1, 192.168.1.137, fe80::942b:a835:bb8e:4157
+2026/10/22 03:52:48 Not in the HTTPS certificate: 2001:4c4e:248c:7300:516b:ec8b:e389:2c9f, nobletk-laptop. The local CA signs only LAN names and private addresses; use -tls-cert to serve under others
+2026/10/22 03:52:48 Local CA: /mnt/storage/gocalbox-bench/server/tls/ca.crt (valid until 2036-10-18)
+2026/10/22 03:52:48 Local CA SHA-256 fingerprint: 2D:B8:41:F3:98:CF:D9:B9:C9:9B:0E:89:06:83:32:6E:30:F9:15:DE:29:42:DD:AF:4B:58:9E:C4:53:5B:C2:4E
+2026/10/22 03:52:48 Install the local CA once on each device: open https://192.168.1.137:18080/ca.crt, accept the warning this one time, and check that the fingerprint the installer shows matches the one above
+2026/10/22 04:13:01 Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...
