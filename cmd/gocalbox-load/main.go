@@ -69,6 +69,8 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	userPrefix := fl.String("user-prefix", "load", "With -url: the users are this followed by 00, 01, …")
 	resumeAt := fl.Float64("resume-at", 0, "Stop each file once this share of its parts is in, such as 0.5, then resume it by its client key as the browser does; 0 never stops")
 	retryFor := fl.Duration("retry-for", 0, "Try calls that get no answer, or find the server shutting down, again for up to this long, such as 2m; 0 ends the file at once")
+	faultAt := fl.Float64("fault-at", 0, "With -url: run -fault-cmd once in each repetition, as soon as a file has this share of its parts in, such as 0.5, while the parts go on")
+	faultCmd := fl.String("fault-cmd", "", "With -fault-at: the command to run, with bash -c, such as one that kills the server and starts it again")
 	header := fl.Bool("header", false, "Print the CSV file's first line and exit")
 	if err := fl.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -90,6 +92,9 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	}
 	if !(*resumeAt >= 0 && *resumeAt < 1) || *retryFor < 0 {
 		return fmt.Errorf("invalid flags: -resume-at must be at least 0 and below 1, and -retry-for not negative")
+	}
+	if !(*faultAt >= 0 && *faultAt < 1) || (*faultAt > 0) != (*faultCmd != "") || *faultAt > 0 && *resumeAt > 0 {
+		return fmt.Errorf("invalid flags: -fault-at must be at least 0 and below 1, given with -fault-cmd, and not with -resume-at")
 	}
 	set := map[string]bool{}
 	fl.Visit(func(f *flag.Flag) { set[f.Name] = true })
@@ -144,7 +149,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	if *resumeAt > 0 {
 		scenario += fmt.Sprintf("_resume%g", *resumeAt*100)
 	}
+	if *faultAt > 0 {
+		scenario += fmt.Sprintf("_fault%g", *faultAt*100)
+	}
 	cfg := load.Config{Users: remote, Files: *files, Size: bytes, Parallel: *parallel, ResumeAt: *resumeAt, RetryFor: *retryFor}
+	if *faultAt > 0 {
+		cfg.FaultAt, cfg.Fault = *faultAt, runFault(*faultCmd)
+	}
 	for rep := 1; rep <= *reps; rep++ {
 		var res load.Result
 		var server string
@@ -172,15 +183,26 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 				log.Printf("closing the stack: %v", err)
 			}
 		}
-		fmt.Fprintln(out, res.Row(commit, dirty, scenario, bytes, *users**parallel, rep, column))
+		var faultErr error
+		switch {
+		case cfg.FaultAt > 0 && !res.Faulted:
+			faultErr = fmt.Errorf("rep %d: no file reached %g of its parts, so the fault didn't happen", rep, cfg.FaultAt)
+		case res.FaultErr != nil:
+			faultErr = fmt.Errorf("rep %d: the fault: %w", rep, res.FaultErr)
+		default:
+			fmt.Fprintln(out, res.Row(commit, dirty, scenario, bytes, *users**parallel, rep, column))
+		}
 		log.Printf("rep %d: %d of %d files uploaded in %.2fs, %.1f MiB/s, parts p50 %v p99 %v, %s, tried again %s, resent %d bytes, %d resumed, CPU %v%s",
 			rep, res.Uploaded(), res.Files, res.Duration.Seconds(), float64(res.Bytes)/(1<<20)/res.Duration.Seconds(),
 			res.Percentile(0.5).Round(time.Microsecond), res.Percentile(0.99).Round(time.Microsecond), res.CodeColumn(),
 			cmp.Or(load.Counts(res.Retried), "none"), res.Resent, len(res.Resumes), res.CPU.Round(time.Millisecond), server)
 		if remote != nil {
 			if err := load.Clean(context.Background(), remote); err != nil {
-				return fmt.Errorf("removing what rep %d uploaded: %w", rep, err)
+				return errors.Join(faultErr, fmt.Errorf("removing what rep %d uploaded: %w", rep, err))
 			}
+		}
+		if faultErr != nil {
+			return faultErr
 		}
 	}
 	if bench != nil {
@@ -197,7 +219,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 func checkModes(set map[string]bool, remote bool, transport string) error {
 	other, mode := []string{"bench-dir", "audit-wait", "audit-parts", "min-free-mb"}, "the in-process mode; set them on the server"
 	if !remote {
-		other, mode = []string{"ca", "transport", "user-prefix"}, "-url"
+		other, mode = []string{"ca", "transport", "user-prefix", "fault-at", "fault-cmd"}, "-url"
 	}
 	var named []string
 	for _, f := range other {
@@ -309,4 +331,18 @@ func gitState() (string, bool) {
 func engineSummary(st transfer.Stats) string {
 	return fmt.Sprintf("the engine: %d parts, %d duplicates, refused busy %d (%d waits ran out, %d found the queue full), too_many_requests %d, too_many_uploads %d; %d parts waited for a slot, %v in all",
 		st.PartsReceived, st.Duplicates, st.Busy, st.WaitTimeouts, st.QueueFull, st.TooManyRequests, st.TooManyUploads, st.Waited, st.WaitTime.Round(time.Millisecond))
+}
+
+// runFault returns the fault that runs cmd with bash -c, its output going to
+// this command's standard error. The session quotes cmd with bash's printf %q,
+// whose quoting of other than ASCII another sh can't read.
+func runFault(cmd string) func() error {
+	return func() error {
+		c := exec.Command("bash", "-c", cmd)
+		c.Stdout, c.Stderr = os.Stderr, os.Stderr
+		start := time.Now()
+		err := c.Run()
+		log.Printf("the fault took %v", time.Since(start).Round(time.Millisecond))
+		return err
+	}
 }

@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -386,6 +388,103 @@ func TestTheCommandWaitsOutAServerShuttingDown(t *testing.T) {
 	}
 }
 
+// -fault-cmd runs once in each repetition, and the row counts the time from
+// it to the file's end; a fault that fails, or never comes, writes no row and
+// stops the command, after cleaning up.
+func TestTheCommandRunsItsFault(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil || runtime.GOOS == "windows" {
+		t.Skip("the fault runs with bash, on Linux")
+	}
+	f := newFakeServer(t)
+	dir := t.TempDir()
+	header := strings.Split(load.Header, ",")
+	csv, ran := filepath.Join(dir, "out.csv"), filepath.Join(dir, "ran")
+	remote := []string{"-url", f.srv.URL, "-ca", f.caFile, "-csv", csv, "-size", "10", "-retry-for", "1m"}
+	if err := run(append(remote, "-reps", "2", "-fault-at", "0.5", "-fault-cmd", "echo x >> "+ran), strings.NewReader("pw\n"), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(ran); string(b) != "x\nx\n" {
+		t.Errorf("the fault ran %q", b)
+	}
+	rows := readCSV(t, csv)
+	// What the fault prints goes to standard error, with the load client's log, and none to standard output.
+	stdout, stderr := capture(t, func() {
+		if err := run(append(remote, "-reps", "1", "-fault-at", "0.5", "-fault-cmd", "echo fault-said"), strings.NewReader("pw\n"), io.Discard); err != nil {
+			t.Error(err)
+		}
+	})
+	if strings.Contains(stdout, "fault-said") || !strings.Contains(stderr, "fault-said") {
+		t.Errorf("standard output %q, standard error %q", stdout, stderr)
+	}
+	// The session quotes the command with bash's printf %q, which writes other than ASCII as $'\ooo'.
+	accented := filepath.Join(dir, "ran-\u00e9")
+	quoted := "$'" + strings.ReplaceAll(dir, "'", `\'`) + `/ran-\303\251'`
+	if err := run(append(remote, "-reps", "1", "-fault-at", "0.5", "-fault-cmd", "echo y >> "+quoted), strings.NewReader("pw\n"), io.Discard); err != nil {
+		t.Errorf("a command quoted by bash: %v", err)
+	}
+	if b, _ := os.ReadFile(accented); string(b) != "y\n" {
+		t.Errorf("a command quoted by bash wrote %q", b)
+	}
+	os.Remove(csv)
+	for _, row := range rows {
+		if row[2] != "engine_upload_1u_fault50" || row[11] != "201" || row[slices.Index(header, "resumed")] != "1" {
+			t.Errorf("row %q", row)
+		}
+	}
+	if len(rows) != 2 {
+		t.Errorf("%d rows", len(rows))
+	}
+
+	os.Remove(csv)
+	f.mu.Lock()
+	f.calls = nil
+	f.mu.Unlock()
+	err := run(append(remote, "-reps", "2", "-fault-at", "0.5", "-fault-cmd", "exit 3"), strings.NewReader("pw\n"), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "rep 1: the fault: exit status 3") {
+		t.Errorf("a failed fault: %v", err)
+	}
+	if _, err := os.Stat(csv); err == nil && len(readCSV(t, csv)) != 0 {
+		t.Errorf("a failed fault's row: %q", readCSV(t, csv))
+	}
+	f.mu.Lock()
+	if creates, deletes := slices.Index(f.calls, "/api/upload/create"), slices.Index(f.calls, "/api/fs/delete"); creates < 0 || deletes < creates ||
+		strings.Count(strings.Join(f.calls, " "), "/api/upload/create") != 1 {
+		t.Errorf("calls after a failed fault: %q", f.calls)
+	}
+	f.unavailable = 1
+	f.mu.Unlock()
+	err = run([]string{"-url", f.srv.URL, "-ca", f.caFile, "-csv", csv, "-size", "10", "-reps", "1", "-fault-at", "0.5", "-fault-cmd", "echo y >> " + ran},
+		strings.NewReader("pw\n"), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "rep 1: no file reached 0.5 of its parts, so the fault didn't happen") {
+		t.Errorf("a fault that never came: %v", err)
+	}
+	if b, _ := os.ReadFile(ran); string(b) != "x\nx\n" {
+		t.Errorf("the fault ran %q", b)
+	}
+	f.mu.Lock()
+	f.refuseDeletes = true
+	f.mu.Unlock()
+	err = run(append(remote, "-reps", "1", "-fault-at", "0.5", "-fault-cmd", "exit 3"), strings.NewReader("pw\n"), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "the fault: exit status 3") || !strings.Contains(err.Error(), "removing what rep 1 uploaded") {
+		t.Errorf("a failed fault and a refused delete: %v", err)
+	}
+}
+
+// capture runs f with os.Stdout and os.Stderr going to files, and returns what each got.
+func capture(t *testing.T, f func()) (stdout, stderr string) {
+	t.Helper()
+	dir := t.TempDir()
+	out, _ := os.Create(filepath.Join(dir, "out"))
+	errf, _ := os.Create(filepath.Join(dir, "err"))
+	oldOut, oldErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = out, errf
+	defer func() { os.Stdout, os.Stderr = oldOut, oldErr; out.Close(); errf.Close() }()
+	f()
+	o, _ := os.ReadFile(out.Name())
+	e, _ := os.ReadFile(errf.Name())
+	return string(o), string(e)
+}
+
 func TestTheCommandRunsTheEngineInProcess(t *testing.T) {
 	csv := filepath.Join(t.TempDir(), "out.csv")
 	if err := run([]string{"-bench-dir", benchDir(t), "-csv", csv, "-size", "10", "-reps", "1", "-min-free-mb", "0", "-audit-parts", "-audit-wait=false"}, strings.NewReader(""), io.Discard); err != nil {
@@ -419,6 +518,12 @@ func TestTheCommandRefuses(t *testing.T) {
 		{[]string{"-size", "1T"}, "", "invalid flags"},
 		{[]string{"-users", "0"}, "", "invalid flags"},
 		{[]string{"-ca", f.caFile}, "", "-ca: only for -url"},
+		{append(remote, "-fault-at", "1", "-fault-cmd", "true"), "pw\n", "-fault-at must be at least 0 and below 1"},
+		{append(remote, "-fault-at", "NaN", "-fault-cmd", "true"), "pw\n", "-fault-at must be"},
+		{append(remote, "-fault-at", "0.5"), "pw\n", "given with -fault-cmd"},
+		{append(remote, "-fault-cmd", "true"), "pw\n", "given with -fault-cmd"},
+		{append(remote, "-fault-at", "0.5", "-fault-cmd", "true", "-resume-at", "0.5"), "pw\n", "not with -resume-at"},
+		{[]string{"-fault-at", "0.5", "-fault-cmd", "true"}, "", "-fault-at, -fault-cmd: only for -url"},
 	} {
 		if err := run(c.args, strings.NewReader(c.stdin), io.Discard); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%q: %v, want %q", c.args, err, c.want)

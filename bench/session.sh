@@ -12,9 +12,20 @@
 #   cell ID SERVER TOOL [KEY=VALUE ...]
 #                                 a measurement, against the server SERVER, or - for none.
 #     engine     resumable uploads with the load client: transport=https-h2|https-h1, size,
-#                files=1, users=1, parallel=4, resume-at, retry-for
+#                files=1, users=1, parallel=4, resume-at, retry-for, and a fault: fault=kill|cut
+#                with fault-at, a share such as 0.5, and retry-for. Once a file has that share of
+#                its parts in, kill has bench/server.sh crash the server (SIGKILL) and start it
+#                again, and cut drops this machine's traffic to the server for cut-for=10 seconds
+#                (1 to 60), through NETCUT; the parts go on meanwhile. The row's resumed columns
+#                hold the time from the fault to the file's end.
 #     upload     one single-request upload with curl: transport, size
 #     download   one download with curl: transport, size
+#     seek       seeks=100 Range requests of chunk=1M at random offsets in one download's file,
+#                one after another on one connection, after the server's page cache is dropped:
+#                transport, size. Each must answer 206 with its bytes; a warm-up also checks
+#                their content. The row's part_p50_ms and part_p99_ms hold the seeks' times,
+#                and its seconds their sum; every seek is in the session's -seeks.csv, with its
+#                offset, time to the first byte and time to the last.
 #     batch      files=100 single-request uploads of 1 MiB at once: transport, conc=1
 #     inprocess  the load client with the engine in this process (server -): size, files=1,
 #                users=1, parallel=4, audit-parts=0, audit-wait=1, resume-at, min-free-mb=1024
@@ -46,6 +57,9 @@
 #   DROP_CACHES=1  drop the server's page cache before each download (passwordless sudo there)
 #   IPERF=1        measure the link with iperf3 at the start and the end (needs iperf3 on both)
 #   PLAN_ONLY=1    write the order and stop
+#   NETCUT=/usr/local/sbin/gocalbox-netcut
+#                  bench/lib/netcut.sh, installed as root, which this script runs with sudo -n
+#                  for cut cells; SERVER_HOST must then be the server's IP address
 set -Eeuo pipefail
 trap 'echo "session.sh: failed at line $LINENO" >&2' ERR
 export LC_ALL=C
@@ -61,6 +75,7 @@ ROUNDS=${ROUNDS:-5}
 DROP_CACHES=${DROP_CACHES:-1}
 IPERF=${IPERF:-1}
 PLAN_ONLY=${PLAN_ONLY:-0}
+NETCUT=${NETCUT:-/usr/local/sbin/gocalbox-netcut}
 IPERF_PORT=${IPERF_PORT:-5201}
 
 [ -f go.mod ] && [ -d cmd/gocalbox ] || { echo "run from the repository root" >&2; exit 1; }
@@ -98,9 +113,10 @@ declare -A PROFILE_ENV=() PROFILE_USERS=() CELL_SERVER=() CELL_TOOL=() CELL_ARGS
 CELL_IDS=()
 SERVER_VARS=" BUILD_TAGS SERVER_REV SERVER_FLAGS LOG_EVENTS GOCALBOX_BENCH_H2_CONN_WINDOW GOCALBOX_BENCH_H2_STREAM_WINDOW GOCALBOX_BENCH_PART_SIZE "
 declare -A TOOL_KEYS=(
-  [engine]=" transport size files users parallel resume-at retry-for reps "
+  [engine]=" transport size files users parallel resume-at retry-for fault fault-at cut-for reps "
   [upload]=" transport size reps "
   [download]=" transport size reps "
+  [seek]=" transport size seeks chunk reps "
   [batch]=" transport conc files reps "
   [inprocess]=" size files users parallel audit-parts audit-wait resume-at min-free-mb reps "
 )
@@ -109,6 +125,17 @@ bad() { echo "$MATRIX:$LINE_NO: $*" >&2; exit 1; }
 value() { local kv; for kv in $ARGS; do [ "${kv%%=*}" = "$1" ] && { echo "${kv#*=}"; return; }; done; echo "$2"; }
 is_size() { [[ $1 =~ ^[0-9]+[KMG]?$ ]]; }
 is_count() { [[ $1 =~ ^[1-9][0-9]*$ ]]; }
+# is_ip ADDRESS succeeds for the addresses bench/lib/netcut.sh takes.
+is_ip() {
+  local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' g n=0
+  [[ $1 =~ ^$octet(\.$octet){3}$ ]] && return 0
+  [[ $1 = *:* && $1 =~ ^[0-9A-Fa-f:]+$ && $1 != *:::* && $1 != *::*::* ]] || return 1
+  local -a groups
+  IFS=: read -r -a groups <<< "$1"
+  for g in "${groups[@]}"; do n=$((n + 1)); [ "${#g}" -le 4 ] || return 1; done
+  if [[ $1 = *::* ]]; then [ "$n" -le 8 ]; else [ "$n" -eq 8 ]; fi
+}
+CUTS=0
 
 check_cell() {
   local kv k v
@@ -119,16 +146,30 @@ check_cell() {
     case $k in
       transport) [[ $v = https-h2 || $v = https-h1 ]] || bad "transport must be https-h2 or https-h1" ;;
       size) is_size "$v" || bad "size must be bytes, or a number with K, M or G" ;;
-      files | users | parallel | conc | min-free-mb) is_count "$v" || bad "$k must be a number from 1" ;;
+      files | users | parallel | conc | min-free-mb | seeks) is_count "$v" || bad "$k must be a number from 1" ;;
+      chunk) is_size "$v" && [ "$(numfmt --from=iec "$v")" -gt 0 ] || bad "chunk must be bytes, or a number with K, M or G, above 0" ;;
       reps) [[ $v =~ ^[0-9]+$ ]] || bad "reps must be a number" ;;
       audit-parts | audit-wait) [[ $v = 0 || $v = 1 ]] || bad "$k must be 0 or 1" ;;
-      resume-at) [[ $v =~ ^0?\.[0-9]+$ ]] || bad "resume-at must be a share such as 0.5" ;;
+      resume-at | fault-at) [[ $v =~ ^0?\.[0-9]*[1-9][0-9]*$ ]] || bad "$k must be a share above 0 and below 1, such as 0.5" ;;
+      fault) [[ $v = kill || $v = cut ]] || bad "fault must be kill or cut" ;;
+      cut-for) [[ $v =~ ^[1-9][0-9]?$ ]] && [ "$v" -le 60 ] || bad "cut-for must be seconds from 1 to 60" ;;
       retry-for) [[ $v =~ ^[0-9]+(ms|s|m)$ ]] || bad "retry-for must be a duration such as 30s" ;;
     esac
   done
   case $TOOL in
-    engine | upload | download | inprocess) is_size "$(value size x)" || bad "$TOOL needs a size" ;;
+    engine | upload | download | seek | inprocess) is_size "$(value size x)" || bad "$TOOL needs a size" ;;
   esac
+  if [ "$TOOL" = seek ]; then
+    [ "$(numfmt --from=iec "$(value chunk 1M)")" -le "$(numfmt --from=iec "$(value size 0)")" ] || bad "chunk must be at most the size"
+  fi
+  if [ -n "$(value fault '')" ]; then
+    [ -n "$(value fault-at '')" ] || bad "a fault needs fault-at"
+    [ -n "$(value retry-for '')" ] || bad "a fault needs retry-for, for the calls it leaves unanswered"
+    [ -z "$(value resume-at '')" ] || bad "a fault can't be combined with resume-at"
+  elif [ -n "$(value fault-at '')" ]; then
+    bad "fault-at needs a fault"
+  fi
+  [ -z "$(value cut-for '')" ] || [ "$(value fault '')" = cut ] || bad "cut-for needs fault=cut"
   if [ "$TOOL" = inprocess ]; then
     [ "$SERVER" = - ] || bad "an inprocess cell runs without a server; give - as its server"
     [ -z "$SERVER_SSH" ] || bad "an inprocess cell measures this machine, so it runs only with the server here, without SERVER_SSH"
@@ -166,7 +207,7 @@ while read -r -a WORDS || [ "${#WORDS[@]}" -gt 0 ]; do
       ID=${WORDS[1]}; SERVER=${WORDS[2]}; TOOL=${WORDS[3]}; ARGS="${WORDS[*]:4}"
       [[ $ID =~ ^[A-Za-z0-9._-]+$ ]] || bad "a cell needs an ID of letters, digits, . _ and -"
       [ -z "${CELL_TOOL[$ID]+x}" ] || bad "cell $ID again"
-      [ -n "${TOOL_KEYS[$TOOL]+x}" ] || bad "no tool $TOOL: engine, upload, download, batch or inprocess"
+      [ -n "${TOOL_KEYS[$TOOL]+x}" ] || bad "no tool $TOOL: engine, upload, download, seek, batch or inprocess"
       check_cell
       if [ -n "$CELLS" ]; then
         keep=0
@@ -175,6 +216,12 @@ while read -r -a WORDS || [ "${#WORDS[@]}" -gt 0 ]; do
         [ "$keep" = 1 ] || continue
       fi
       CELL_IDS+=("$ID"); CELL_SERVER[$ID]=$SERVER; CELL_TOOL[$ID]=$TOOL; CELL_ARGS[$ID]=$ARGS
+      # Checked only for the cells that run, so that a matrix's other cells run without them.
+      if [ "$(value fault '')" = cut ]; then
+        [ -n "$SERVER_SSH" ] || bad "a cut drops this machine's traffic to the server, so it runs only with SERVER_SSH"
+        is_ip "$SERVER_HOST" || bad "a cut drops the traffic to one address, so SERVER_HOST must be the server's IP address"
+        CUTS=1
+      fi
       if [ "$TOOL" = engine ] && [ "$(value users 1)" -gt "${PROFILE_USERS[$SERVER]}" ]; then
         PROFILE_USERS[$SERVER]=$(value users 1)
       fi ;;
@@ -239,6 +286,15 @@ if [ "$PLAN_ONLY" = 1 ]; then
 fi
 
 # --- The server -------------------------------------------------------------
+
+if [ "$CUTS" = 1 ]; then
+  { [ -f "$NETCUT" ] && [ "$(stat -c %u -- "$NETCUT")" = 0 ]; } ||
+    { echo "cut cells need $NETCUT: bench/lib/netcut.sh installed as root (bench/README.md)" >&2; exit 1; }
+  # A cut of 1 s of a documentation address, which nothing uses, tries sudo, nft and the script.
+  out=$(sudo -n "$NETCUT" 192.0.2.1 1 2>&1) ||
+    { echo "cut cells need sudo to run $NETCUT without a password (bench/README.md): $out" >&2; exit 1; }
+  cmp -s -- "$NETCUT" bench/lib/netcut.sh || echo "warning: $NETCUT differs from bench/lib/netcut.sh; install it again" >&2
+fi
 
 if [ -n "$SERVER_SSH" ]; then
   SSH=(ssh -o BatchMode=yes -o ControlPath="${XDG_RUNTIME_DIR:-/tmp}/gocalbox-session-$$.sock")
@@ -363,12 +419,13 @@ data() {
 
 curl_for() { CURL=(curl -sS --cacert "$WORK/server-ca.crt" -H "@$WORK/session-header"); case $1 in https-h2) CURL+=(--http2) ;; *) CURL+=(--http1.1) ;; esac; }
 rate() { awk -v b="$1" -v s="$2" 'BEGIN {printf "%.3f", (s > 0) ? b / 1048576 / s : 0}'; }
-EMPTY=$(printf ',%.0s' $(seq 13))
-# row SCENARIO SIZE FILES CONC REP SECONDS DURABLE CODE TRANSPORT T0 T1 writes a curl run's row, with the
-# load client's columns empty but its start, for the server's CPU to be joined to by time.
+EMPTY=$(printf ',%.0s' $(seq 11))
+# row SCENARIO SIZE FILES CONC REP SECONDS DURABLE CODE TRANSPORT T0 T1 [P50 P99] writes a curl run's row,
+# with the load client's columns empty but its start, for the server's CPU to be joined to by time, and
+# its part latencies, if given.
 row() {
-  printf '%s,%s,%s,%s,%s,%s,%s,%.6f,%s,%s,,%s,%s%s,%s|%s|%s\n' "$SRV_COMMIT" "$SRV_DIRTY" "$1" "$2" "$3" "$4" "$5" "$6" \
-    "$(rate "$(($2 * $3))" "$6")" "$7" "$8" "$9" "$EMPTY" "${10}" "${10}" "${11}" >> "$RAW"
+  printf '%s,%s,%s,%s,%s,%s,%s,%.6f,%s,%s,,%s,%s,%s,%s%s,%s|%s|%s\n' "$SRV_COMMIT" "$SRV_DIRTY" "$1" "$2" "$3" "$4" "$5" "$6" \
+    "$(rate "$(($2 * $3))" "$6")" "$7" "$8" "$9" "${12:-}" "${13:-}" "$EMPTY" "${10}" "${10}" "${11}" >> "$RAW"
 }
 
 LOAD=$WORK/gocalbox-load
@@ -387,6 +444,7 @@ run_cell() {
       args=(-csv "$tmp" -reps 1 -size "$(value size 0)" -files "$(value files 1)" -users "$(value users 1)" -parallel "$(value parallel 4)")
       [ -z "$(value resume-at '')" ] || args+=(-resume-at "$(value resume-at '')")
       [ -z "$(value retry-for '')" ] || args+=(-retry-for "$(value retry-for '')")
+      [ -z "$(value fault '')" ] || args+=(-fault-at "$(value fault-at '')" -fault-cmd "$(fault_cmd "$(value fault '')" "$(value cut-for 10)")")
       bench_rm "$tmp"
       if [ "${CELL_TOOL[$id]}" = engine ]; then
         printf '%s\n' "$SRV_LOAD_PASSWORD" | "$LOAD" "${args[@]}" -url "https://$SERVER_HOST:$PORT" -ca "$WORK/server-ca.crt" \
@@ -405,7 +463,9 @@ run_cell() {
       else
         OUTCOME=failed
       fi
-      bench_rm "$tmp" ;;
+      bench_rm "$tmp"
+      # A crash gives the server a new PID, which tells whether it still runs.
+      if [ "$(value fault '')" = kill ]; then SERVER_PID=$(remote_cat "$SERVER_BENCH/server/ready" 2> /dev/null || true); fi ;;
     upload)
       size=$(value size 0); src=$(data "$size"); bytes=$(stat -c %s "$src"); name="u-$id.bin"
       curl_for "$transport"
@@ -447,6 +507,8 @@ run_cell() {
       elif [ -n "${MISPLACED[$size]:-}" ]; then code="$code wrong_file"; OUTCOME="the file placed for it isn't the source's bytes"; fi
       bench_rm "$sum"
       row "$id" "$bytes" 1 1 "$rep" "$secs" "" "$code" "$transport" "$t0" "$t1" ;;
+    seek)
+      seek_run "$id" "$rep" "$transport" ;;
     batch)
       local n conc codes=$WORK/codes-$STAMP names=()
       n=$(value files 100); conc=$(value conc 1); src=$(data 1M)
@@ -466,11 +528,79 @@ run_cell() {
   esac
 }
 
-# place_downloads uploads the files the server's download cells fetch.
+# fault_cmd KIND SECONDS prints the command the load client runs for a fault: a crash of the
+# server and its restart, or a cut of this machine's traffic to the server for SECONDS.
+fault_cmd() {
+  local cmd
+  case $1 in
+    kill)
+      cmd="cd $(q "$SERVER_REPO") && $(q env "BENCH_DIR=$SERVER_BENCH" bash bench/server.sh crash)"
+      if [ -n "$SERVER_SSH" ]; then echo "$(q "${SSH[@]}" "$SERVER_SSH" "$cmd")< /dev/null"; else echo "$cmd"; fi ;;
+    cut) q sudo -n "$NETCUT" "$SERVER_HOST" "$2" ;;
+  esac
+}
+
+# seek_run ID REP TRANSPORT runs one repetition of a seek cell, at offsets drawn from the seed, the
+# cell and the repetition.
+seek_run() {
+  local id=$1 rep=$2 transport=$3 size bytes chunk n name src t0 t1 i got=$WORK/seek-$STAMP
+  local code=206 secs p50 p99 c len pre first total
+  local -a offs=() cmd=() lines=()
+  size=$(value size 0); bytes=$(numfmt --from=iec "$size"); chunk=$(numfmt --from=iec "$(value chunk 1M)")
+  n=$(value seeks 100); name="d-$size.bin"; src=$(data "$size")
+  mapfile -t offs < <(random_offsets "seek-$id-$rep" "$n" $((bytes - chunk)))
+  curl_for "$transport"
+  bench_rm "$got"
+  [ "$rep" != 0 ] || mkdir -- "$got"
+  # --next ends a transfer's options, so each one repeats them; curl itself comes first only.
+  cmd=("${CURL[0]}")
+  for i in "${!offs[@]}"; do
+    [ "$i" = 0 ] || cmd+=(--next)
+    cmd+=("${CURL[@]:1}" -r "${offs[$i]}-$((offs[$i] + chunk - 1))" -w '%{http_code},%{size_download},%{time_pretransfer},%{time_starttransfer},%{time_total}\n')
+    if [ "$rep" = 0 ]; then cmd+=(-o "$got/$i"); else cmd+=(-o /dev/null); fi
+    cmd+=("$URL/files/$name")
+  done
+  [ "$DROP_CACHES" != 1 ] || remote "sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
+  t0=$EPOCHREALTIME
+  mapfile -t lines < <("${cmd[@]}" 2>> "$WORK/load.log" || true)
+  t1=$EPOCHREALTIME
+  OUTCOME=ok
+  [ "${#lines[@]}" = "$n" ] || { OUTCOME="got ${#lines[@]} of $n answers"; code=000; }
+  # A seek's times are from its request's start, which on the first one comes after the connection's set-up.
+  for i in "${!lines[@]}"; do
+    IFS=, read -r c len pre first total <<< "${lines[$i]}"
+    if [ "$OUTCOME" = ok ]; then
+      if [ "$c" != 206 ]; then OUTCOME="seek $((i + 1)) answered $c"; code=$c
+      elif [ "$len" != "$chunk" ]; then OUTCOME="seek $((i + 1)) got $len of $chunk bytes"; code="206 wrong_size"
+      elif [ "$rep" = 0 ] && ! cmp -s -- "$got/$i" <(tail -c +$((offs[$i] + 1)) -- "$src" | head -c "$chunk"); then
+        OUTCOME="seek $((i + 1)) got other bytes"; code="206 wrong_file"
+      fi
+    fi
+    awk -v s="$SEQ" -v id="$id" -v r="$rep" -v i=$((i + 1)) -v o="${offs[$i]}" -v l="$len" -v c="$c" -v p="$pre" -v f="$first" -v t="$total" \
+      'BEGIN {printf "%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f\n", s, id, r, i, o, l, c, (f - p) * 1000, (t - p) * 1000}' >> "$SEEKS"
+  done
+  if [ -n "${MISPLACED[$size]:-}" ] && [ "$OUTCOME" = ok ]; then OUTCOME="the file placed for it isn't the source's bytes"; code="206 wrong_file"; fi
+  bench_rm "$got"
+  # The percentiles are the load client's: the value at index p * n of the sorted times, from 0.
+  read -r secs p50 p99 < <(awk -F, -v s="$SEQ" '$1 == s {print $9}' "$SEEKS" | sort -g |
+    awk '{t[n++] = $1; sum += $1} function at(q,  k) {k = int(q * n); if (k > n - 1) k = n - 1; return t[k]}
+      END {if (n == 0) print "0 0 0"; else printf "%.6f %.3f %.3f\n", sum / 1000, at(0.5), at(0.99)}')
+  row "$id" "$chunk" "$n" 1 "$rep" "$secs" "" "$code" "$transport" "$t0" "$t1" "$p50" "$p99"
+}
+
+# random_offsets KEY N MAX prints N offsets from 0 to MAX, drawn from the seed and KEY.
+random_offsets() {
+  # openssl ends on the broken pipe once od has its bytes.
+  (openssl enc -aes-256-ctr -pass "pass:$SEED-$1" -nosalt -pbkdf2 -in /dev/zero 2> /dev/null || true) | od -An -tu8 -N $((8 * $2)) -w8 |
+    awk -v m="$3" '{print $1 % (m + 1)}'
+}
+
+# place_downloads uploads the files the server's download and seek cells fetch.
 place_downloads() {
   local srv=$1 id size src code sum ARGS
   for id in "${CELL_IDS[@]}"; do
-    [ "${CELL_SERVER[$id]}" = "$srv" ] && [ "${CELL_TOOL[$id]}" = download ] || continue
+    [ "${CELL_SERVER[$id]}" = "$srv" ] || continue
+    [ "${CELL_TOOL[$id]}" = download ] || [ "${CELL_TOOL[$id]}" = seek ] || continue
     ARGS=${CELL_ARGS[$id]}; size=$(value size 0); src=$(data "$size")
     [[ " ${PLACED[*]} " = *" $size "* ]] && continue
     curl_for https-h2
@@ -505,13 +635,13 @@ link_rates() {
 # --- The session --------------------------------------------------------------
 
 for s in $(for id in "${CELL_IDS[@]}"; do ARGS=${CELL_ARGS[$id]}
-  case ${CELL_TOOL[$id]} in upload | download) value size 0 ;; batch) echo 1M ;; esac; done | sort -u); do
+  case ${CELL_TOOL[$id]} in upload | download | seek) value size 0 ;; batch) echo 1M ;; esac; done | sort -u); do
   data "$s" > /dev/null
 done
 
 if [ "$DROP_CACHES" = 1 ]; then
   for id in "${CELL_IDS[@]}"; do
-    [ "${CELL_TOOL[$id]}" = download ] || continue
+    [ "${CELL_TOOL[$id]}" = download ] || [ "${CELL_TOOL[$id]}" = seek ] || continue
     remote "sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'" ||
       { echo "DROP_CACHES=1 needs passwordless sudo on the server to drop its page cache; or set DROP_CACHES=0" >&2; exit 1; }
     break
@@ -524,6 +654,7 @@ link_rates; UP0=$UP; DOWN0=$DOWN
   echo "server: ${SERVER_SSH:-this machine} at $SERVER_HOST:$PORT, repository $SERVER_REPO, benchmark folder $SERVER_BENCH"
   echo "reps: $REPS, $BIG_REPS from 5 GiB; warm-ups: $WARMUP; rounds: $ROUNDS; drop caches before downloads: $DROP_CACHES"
   echo "cells: ${CELLS:-all}"
+  [ "$CUTS" = 0 ] || echo "network cuts: $NETCUT, to $SERVER_HOST"
   echo "iperf3 at the start, Mbit/s: to the server $UP0, from the server $DOWN0"
   echo "--- this machine"
   bench_describe "$BENCH_DIR"
@@ -531,6 +662,10 @@ link_rates; UP0=$UP; DOWN0=$DOWN
   cat -- "$MATRIX"
 } > "$ENV"
 "$LOAD" -header > "$CSV"
+SEEKS=$RUN-seeks.csv
+for id in "${CELL_IDS[@]}"; do
+  if [ "${CELL_TOOL[$id]}" = seek ]; then echo "seq,cell,rep,seek,offset,bytes,http_code,first_byte_ms,ms" > "$SEEKS"; break; fi
+done
 
 # end_block stops the block's server, joins its CPU time to each row of
 # the block by the run's start and end, and appends the rows to the CSV.

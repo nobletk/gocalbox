@@ -54,6 +54,12 @@ type Config struct {
 	// RetryFor is how long a call is tried again while it gets no answer,
 	// or 503 unavailable from a server shutting down; 0 doesn't.
 	RetryFor time.Duration
+	// FaultAt, between 0 and 1, calls Fault once in the run, on a goroutine
+	// of its own, as soon as a file has that share of its parts accepted;
+	// the parts go on meanwhile. 0 calls nothing. It can't be used with
+	// ResumeAt.
+	FaultAt float64
+	Fault   func() error
 }
 
 type Result struct {
@@ -80,7 +86,9 @@ type Result struct {
 	// tries that couldn't connect.
 	Resent int64
 	// Resumes is the time from each file's stop to its end, for the files
-	// that stopped and were resumed with the session the server kept.
+	// that stopped and were resumed with the session the server kept; with
+	// FaultAt, the time from the fault to the end of each file uploaded
+	// that had begun before it.
 	Resumes []time.Duration
 	// Stalled is how long the calls of a user got no answer, at most over
 	// the users.
@@ -88,6 +96,10 @@ type Result struct {
 	// UserRates is each user's uploaded bytes over the time to its last
 	// file's end, in MiB/s.
 	UserRates []float64
+	// Faulted says whether Fault was called, and FaultErr is what it
+	// returned.
+	Faulted  bool
+	FaultErr error
 	// CPU is this process's CPU time over the run, or -1 where it can't be
 	// read. In process, it is the engine's and the users' together.
 	CPU time.Duration
@@ -104,11 +116,15 @@ func Run(ctx context.Context, cfg Config) Result {
 	var wg sync.WaitGroup
 	cpu := processCPU()
 	start := time.Now()
+	var f *fault
+	if cfg.FaultAt > 0 && cfg.Fault != nil {
+		f = &fault{call: cfg.Fault, done: make(chan struct{})}
+	}
 	for i, u := range cfg.Users {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r := runUser(ctx, u, cfg, i, start)
+			r := runUser(ctx, u, cfg, i, start, f)
 			mu.Lock()
 			defer mu.Unlock()
 			for k, v := range r.Codes {
@@ -127,6 +143,10 @@ func Run(ctx context.Context, cfg Config) Result {
 	}
 	wg.Wait()
 	res.Start, res.Duration = start, time.Since(start)
+	if f != nil && !f.when().IsZero() {
+		<-f.done
+		res.Faulted, res.FaultErr = true, f.err
+	}
 	res.CPU = -1
 	if end := processCPU(); cpu >= 0 && end >= 0 {
 		res.CPU = end - cpu
@@ -136,8 +156,37 @@ func Run(ctx context.Context, cfg Config) Result {
 	return res
 }
 
+// fault calls a run's fault once, and keeps when.
+type fault struct {
+	once sync.Once
+	call func() error
+	mu   sync.Mutex
+	at   time.Time
+	err  error
+	done chan struct{}
+}
+
+func (f *fault) fire() {
+	f.once.Do(func() {
+		f.mu.Lock()
+		f.at = time.Now()
+		f.mu.Unlock()
+		go func() {
+			defer close(f.done)
+			f.err = f.call()
+		}()
+	})
+}
+
+func (f *fault) when() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.at
+}
+
 type upload struct {
 	name    string
+	began   time.Time
 	key     string
 	seed    byte
 	c       transfer.Created
@@ -278,7 +327,7 @@ func (st *userState) answered(ok bool) {
 	}
 }
 
-func runUser(ctx context.Context, u User, cfg Config, user int, start time.Time) Result {
+func runUser(ctx context.Context, u User, cfg Config, user int, start time.Time, flt *fault) Result {
 	st := &userState{res: Result{Codes: map[string]int{}, Retried: map[string]int{}}}
 	q := newQueue()
 	r := retrier{cfg: cfg, st: st, pool: newPool(max(cfg.Parallel, 1))}
@@ -297,6 +346,11 @@ func runUser(ctx context.Context, u User, cfg Config, user int, start time.Time)
 			st.uploaded += cfg.Size
 			if !up.stopped.IsZero() && up.resumed {
 				st.res.Resumes = append(st.res.Resumes, time.Since(up.stopped))
+			}
+			if flt != nil {
+				if at := flt.when(); !at.IsZero() && up.began.Before(at) {
+					st.res.Resumes = append(st.res.Resumes, time.Since(at))
+				}
 			}
 		}
 		st.mu.Unlock()
@@ -348,6 +402,9 @@ func runUser(ctx context.Context, u User, cfg Config, user int, start time.Time)
 				default:
 					st.res.Parts = append(st.res.Parts, d)
 					j.up.done++
+					if flt != nil && j.up.done >= max(1, int(cfg.FaultAt*float64(j.up.c.PartCount))) {
+						flt.fire()
+					}
 					if j.up.stopAt > 0 && j.up.done >= j.up.stopAt && j.up.stopped.IsZero() {
 						// Under the lock, so that no part fails unnoticed between the
 						// stop and the cut, and no resumed session is cancelled.
@@ -376,7 +433,7 @@ func runUser(ctx context.Context, u User, cfg Config, user int, start time.Time)
 	}
 	for f := range cfg.Files {
 		name := fmt.Sprintf("load-%03d-%04d.bin", user, f)
-		up := &upload{name: name, seed: byte(user*31 + f), sends: map[int]int{}}
+		up := &upload{name: name, began: time.Now(), seed: byte(user*31 + f), sends: map[int]int{}}
 		up.key = clientKey(u.Dir, name, cfg.Size, up.seed)
 		q.opened()
 		c, err := r.create(ctx, u, cfg, up)

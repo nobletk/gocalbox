@@ -266,7 +266,12 @@ func TestTheSessionFilesAreValid(t *testing.T) {
 	}
 	for _, f := range files {
 		b, _ := os.ReadFile(f)
-		if runs := planOf(t, dir, string(b), "SEED=1", "PRE_M6=HEAD"); len(runs) < 10 {
+		env := []string{"SEED=1", "PRE_M6=HEAD"}
+		// Network cuts run only against a server over ssh, at its address.
+		if strings.Contains(string(b), "fault=cut") {
+			env = append(env, "SERVER_SSH=me@host", "SERVER_HOST=192.168.1.10", "SERVER_BENCH=/b", "SERVER_REPO=/r")
+		}
+		if runs := planOf(t, dir, string(b), env...); len(runs) < 10 {
 			t.Errorf("%s: %d runs", f, len(runs))
 		}
 	}
@@ -290,6 +295,35 @@ func TestTheSessionRefusesABadMatrix(t *testing.T) {
 		{"server a\ncell x a engine size=1M resume-at=1\n", nil, "resume-at must be a share"},
 		{"server a\ncell x a engine size=1M retry-for=2h\n", nil, "retry-for must be"},
 		{"server a\ncell x a inprocess size=1M audit-parts=yes\n", nil, "audit-parts must be 0 or 1"},
+		{"server a\ncell x a engine size=1M fault=reboot fault-at=0.5 retry-for=1m\n", nil, "fault must be kill or cut"},
+		{"server a\ncell x a engine size=1M fault=kill fault-at=1 retry-for=1m\n", nil, "fault-at must be a share"},
+		{"server a\ncell x a engine size=1M fault=kill fault-at=0.0 retry-for=1m\n", nil, "fault-at must be a share above 0"},
+		{"server a\ncell x a engine size=1M resume-at=.00\n", nil, "resume-at must be a share above 0"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=192.168.1.010", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=1:2:3:4:5:6:7", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=256.1.1.1", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=1.2.3.259", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=1:::2", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=1::2::3", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=12345::1", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=1:2:3:4:5:6:7:8::9", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=1:2:3:4:5:6::7:8:9", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=1:2:3:4:5:6:7::8", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a engine size=1M fault=kill retry-for=1m\n", nil, "a fault needs fault-at"},
+		{"server a\ncell x a engine size=1M fault=kill fault-at=0.5\n", nil, "a fault needs retry-for"},
+		{"server a\ncell x a engine size=1M fault=kill fault-at=0.5 retry-for=1m resume-at=0.5\n", nil, "can't be combined with resume-at"},
+		{"server a\ncell x a engine size=1M fault-at=0.5 retry-for=1m\n", nil, "fault-at needs a fault"},
+		{"server a\ncell x a engine size=1M fault=kill fault-at=0.5 retry-for=1m cut-for=5\n", nil, "cut-for needs fault=cut"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m cut-for=61\n", nil, "cut-for must be seconds from 1 to 60"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m cut-for=0\n", nil, "cut-for must be seconds from 1 to 60"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", nil, "runs only with SERVER_SSH"},
+		{"server a\ncell x a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=server.lan", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "SERVER_HOST must be the server's IP address"},
+		{"server a\ncell x a seek size=1M files=2\n", nil, "seek takes no files"},
+		{"server a\ncell x a seek size=1M chunk=2M\n", nil, "chunk must be at most the size"},
+		{"server a\ncell x a seek size=1M chunk=0\n", nil, "chunk must be bytes"},
+		{"server a\ncell x a seek size=1M seeks=0\n", nil, "seeks must be a number from 1"},
+		{"server a\ncell x a seek\n", nil, "seek needs a size"},
+		{"server a\ncell x a upload size=1M fault=kill\n", nil, "upload takes no fault"},
 		{"cell x a engine size=1M\n", nil, "no server named a"},
 		{"server a\ncell x a inprocess size=1M\n", nil, "give - as its server"},
 		{"server a\ncell x - inprocess size=1M\n", []string{"SERVER_SSH=me@host", "SERVER_HOST=h", "SERVER_BENCH=/b", "SERVER_REPO=/r"}, "runs only with the server here"},
@@ -312,6 +346,17 @@ func TestTheSessionRefusesABadMatrix(t *testing.T) {
 		if ok || !strings.Contains(out, c.want) {
 			t.Errorf("%q %v: %s; want %q", c.matrix, c.env, out, c.want)
 		}
+	}
+	for _, host := range []string{"192.168.1.10", "2001:db8::7", "1:2:3:4:5:6:7:8"} {
+		if runs := planOf(t, dir, "server a\ncell c a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", "SERVER_SSH=me@host", "SERVER_HOST="+host,
+			"SERVER_BENCH=/b", "SERVER_REPO=/r", "REPS=1", "WARMUP=0"); len(runs) != 1 {
+			t.Errorf("%s: runs %q", host, runs)
+		}
+	}
+	// A cut cell that doesn't run needs no ssh.
+	if runs := planOf(t, dir, "server a\ncell x a engine size=1M\ncell c a engine size=1M fault=cut fault-at=0.5 retry-for=1m\n", "CELLS=x", "SERVER_HOST=",
+		"REPS=1", "WARMUP=0"); len(runs) != 1 {
+		t.Errorf("runs %q", runs)
 	}
 	out, ok := script(t, "session.sh", "", "BENCH_DIR="+t.TempDir())
 	if ok || !strings.Contains(out, "usage") {
@@ -411,12 +456,19 @@ func checkSession(t *testing.T, out string, dirs ...string) {
 		b, _ := os.ReadFile(f)
 		name := strings.TrimSuffix(strings.TrimPrefix(f, base+"-server-"), "-env.txt")
 		var rounds []string
+		crashes := 0
 		for _, part := range strings.Split(string(b), "round: ")[1:] {
 			r, env, _ := strings.Cut(part, "\n")
 			if !strings.HasPrefix(env, "server: ") || !strings.Contains(env, "load users: ") {
 				t.Errorf("%s is incomplete in round %s:\n%s", f, r, b)
 			}
 			rounds = append(rounds, r)
+			var n int
+			if _, c, ok := strings.Cut(env, "\ncrashes: "); !ok {
+				t.Errorf("%s gives no crashes in round %s", f, r)
+			} else if fmt.Sscan(c, &n); n > 0 {
+				crashes += n
+			}
 		}
 		sb, _ := os.ReadFile(base + "-server-" + name + "-samples.csv")
 		var sampled []string
@@ -437,8 +489,8 @@ func checkSession(t *testing.T, out string, dirs ...string) {
 			t.Errorf("server %s: environments of rounds %q, samples of rounds %q, runs in rounds %q", name, rounds, sampled, served[name])
 		}
 		lb, _ := os.ReadFile(base + "-server-" + name + ".log")
-		if n := strings.Count(string(lb), "Starting server on "); n != len(rounds) {
-			t.Errorf("server %s's log holds %d starts, not %d", name, n, len(rounds))
+		if n := strings.Count(string(lb), "Starting server on "); n != len(rounds)+crashes {
+			t.Errorf("server %s's log holds %d starts, not %d and %d after crashes", name, n, len(rounds), crashes)
 		}
 		// A benchmark build's request log holds requests of each of its blocks.
 		if rb, err := os.ReadFile(base + "-server-" + name + "-requests.jsonl"); err == nil {
@@ -480,7 +532,7 @@ func checkSession(t *testing.T, out string, dirs ...string) {
 			t.Fatalf("%d columns: %s", len(row), line)
 		}
 		code, cpu, transport := col(row, "http_code"), col(row, "server_cpu_s"), col(row, "transport")
-		if code != "201" && code != "200" || col(row, "started_unix") == "" {
+		if code != "201" && code != "200" && code != "206" || col(row, "started_unix") == "" {
 			t.Errorf("row %s", line)
 		}
 		if (transport == "inprocess") != (cpu == "") {
@@ -490,7 +542,7 @@ func checkSession(t *testing.T, out string, dirs ...string) {
 			t.Errorf("the stopped file's row: %s", line)
 		}
 		// An engine run's own start and length place it among its server's samples.
-		if col(row, "part_p50_ms") != "" && transport != "inprocess" {
+		if col(row, "part_p50_ms") != "" && transport != "inprocess" && code != "206" {
 			var start, secs, got float64
 			fmt.Sscan(col(row, "started_unix"), &start)
 			fmt.Sscan(col(row, "seconds"), &secs)

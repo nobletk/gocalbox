@@ -2,7 +2,9 @@
 # Serves gocalbox for bench/client.sh or bench/session.sh. Run from the
 # repository root on the server. Stays in the foreground; Ctrl-C, or
 # bench/server.sh stop with the same BENCH_DIR, stops the server and writes
-# its environment file.
+# its environment file. bench/server.sh crash, with the same BENCH_DIR, kills
+# the server with SIGKILL and starts it again on the same folder and state,
+# as after a crash, and returns once it serves again.
 #
 # The server speaks HTTPS with a certificate from a local CA in
 # $BENCH_DIR/server/tls, which bench/client.sh fetches over ssh; plain HTTP is
@@ -55,6 +57,7 @@ TLS_DIR="$WORK/tls"
 SAMPLES="$WORK/samples.csv"
 PIDFILE="$WORK/server.pid"
 SERVERPID="$WORK/gocalbox.pid"
+KILLED_CPU="$WORK/killed-cpu"
 READY="$WORK/ready"
 REQUESTS="$WORK/requests.jsonl"
 
@@ -95,14 +98,30 @@ if [ "${1:-}" = stop ]; then
   elif pid=$(alive "$SERVERPID"); then
     kill -TERM "$pid"
     ended "$pid" 30 || kill -KILL "$pid"
-    bench_rm "$PIDFILE" "$SERVERPID" "$READY"
+    bench_rm "$PIDFILE" "$SERVERPID" "$READY" "$KILLED_CPU"
     echo "stopped the server that a bench/server.sh killed before it had left running"
   else
     echo "no bench/server.sh is running with $BENCH_DIR" >&2; exit 1
   fi
   exit 0
 fi
-[ "$#" = 0 ] || { echo "usage: bench/server.sh [stop]" >&2; exit 2; }
+if [ "${1:-}" = crash ]; then
+  pid=$(alive "$PIDFILE") || { echo "no bench/server.sh is running with $BENCH_DIR" >&2; exit 1; }
+  old=$(cat "$READY" 2> /dev/null) || { echo "the server with $BENCH_DIR isn't serving yet" >&2; exit 1; }
+  start=$EPOCHREALTIME
+  kill -USR1 "$pid"
+  for _ in $(seq 1200); do
+    new=$(cat "$READY" 2> /dev/null || true)
+    if [ -n "$new" ] && [ "$new" != "$old" ]; then
+      echo "killed the server and started it again; it served again after $(awk -v a="$start" -v b="$EPOCHREALTIME" 'BEGIN {printf "%.3f", b - a}')s"
+      exit 0
+    fi
+    kill -0 "$pid" 2> /dev/null || { echo "bench/server.sh ended instead of starting the server again" >&2; exit 1; }
+    sleep 0.1
+  done
+  echo "the server didn't serve again within 2 minutes" >&2; exit 1
+fi
+[ "$#" = 0 ] || { echo "usage: bench/server.sh [stop|crash]" >&2; exit 2; }
 [[ $LOAD_USERS =~ ^[0-9]{1,2}$ ]] || { echo "LOAD_USERS must be a number from 0 to 99" >&2; exit 1; }
 case " ${BUILD_TAGS//,/ } " in
   *" bench "*) BENCH_BUILD=1 ;;
@@ -117,7 +136,7 @@ mkdir -p "$WORK"
 if alive "$PIDFILE" > /dev/null || alive "$SERVERPID" > /dev/null; then
   echo "another bench/server.sh, or a server it left, is running with $BENCH_DIR; stop it with bench/server.sh stop" >&2; exit 1
 fi
-bench_rm "$PIDFILE" "$SERVERPID" "$READY"
+bench_rm "$PIDFILE" "$SERVERPID" "$READY" "$KILLED_CPU"
 record "$PIDFILE" "$$"
 trap 'bench_rm "$PIDFILE"' EXIT
 trap 'exit 1' INT TERM
@@ -239,10 +258,11 @@ finish() {
     echo "console event log: $CONSOLE_LOG"
     echo "scheme: $SCHEME"
     echo "load users: $LOAD_USERS"
+    echo "crashes: ${CRASHES:-0}"
     echo "server peak RSS (kB): $(tail -1 "$SAMPLES" 2>/dev/null | cut -d, -f3 || true)"
     echo "audit records: $(wc -l < "$AUDIT" 2>/dev/null || echo 0)"
   } > "$ENV"
-  bench_rm "$PIDFILE" "$SERVERPID" "$READY"
+  bench_rm "$PIDFILE" "$SERVERPID" "$READY" "$KILLED_CPU"
   echo "stopped; environment written to $ENV"
 }
 # Installed before the server starts, so a failure below cannot leave it running.
@@ -253,10 +273,24 @@ trap 'exit 0' INT TERM
 PID=$!
 record "$SERVERPID" "$PID"
 
-# Cumulative CPU seconds and peak RSS (kB) every 0.1 s, joined by the client to each operation's timestamps.
+# CPU seconds and peak RSS (kB) every 0.1 s, joined by the client to each operation's timestamps.
+# Both carry on across a crash and restart, so that a run's CPU is the difference of two samples.
 (
-  while kill -0 "$PID" 2>/dev/null; do
-    echo "$(date +%s.%N),$(awk -v t="$TICK" '{print ($14+$15)/t}' "/proc/$PID/stat" 2>/dev/null || echo 0),$(awk '/VmHWM/{print $2}' "/proc/$PID/status" 2>/dev/null || echo 0)" >> "$SAMPLES"
+  base=0; last=0; cur=; peak=0
+  while kill -0 $$ 2> /dev/null; do
+    p=
+    read -r p _ < "$SERVERPID" 2> /dev/null || true
+    if [ -n "$p" ] && cpu=$(awk -v t="$TICK" '{sub(/.*\) /, ""); print ($12+$13)/t}' "/proc/$p/stat" 2> /dev/null) && [ -n "$cpu" ]; then
+      if [ "$p" != "$cur" ]; then
+        # A killed server's last CPU time, read while it was stopped, counts what it used after its last sample.
+        if [ -n "$cur" ] && read -r kp kc < "$KILLED_CPU" 2> /dev/null && [ "$kp" = "$cur" ]; then last=$kc; fi
+        base=$(awk -v a="$base" -v b="$last" 'BEGIN {print a + b}'); cur=$p
+      fi
+      last=$cpu
+      rss=$(awk '/VmHWM/{print $2}' "/proc/$p/status" 2> /dev/null || echo 0)
+      [ "${rss:-0}" -le "$peak" ] || peak=$rss
+      echo "$(date +%s.%N),$(awk -v a="$base" -v b="$cpu" 'BEGIN {print a + b}'),$peak" >> "$SAMPLES"
+    fi
     sleep 0.1
   done
 ) &
@@ -264,18 +298,55 @@ SAMP_PID=$!
 
 LOCAL=127.0.0.1
 [ "$BIND" = 0.0.0.0 ] || [ "$BIND" = :: ] || LOCAL=$BIND
-UP=0
-for _ in $(seq 150); do
-  if "${CURL[@]}" -o /dev/null "$SCHEME://$LOCAL:$PORT/" 2>/dev/null; then UP=1; break; fi
-  kill -0 "$PID" 2>/dev/null || break
-  sleep 0.1
-done
-[ "$UP" = 1 ] || { echo "the server didn't start; its log:" >&2; tail -20 "$WORK/server.log" >&2; exit 1; }
+# serving waits until the server answers, and fails if it ends first.
+serving() {
+  for _ in $(seq 150); do
+    if "${CURL[@]}" -o /dev/null "$SCHEME://$LOCAL:$PORT/" 2>/dev/null; then return 0; fi
+    kill -0 "$PID" 2>/dev/null || return 1
+    sleep 0.1
+  done
+  return 1
+}
+serving || { echo "the server didn't start; its log:" >&2; tail -20 "$WORK/server.log" >&2; exit 1; }
 if [ "$BENCH_BUILD" = 1 ] && ! grep -q "BENCHMARK BUILD" "$WORK/server.log"; then
   echo "BUILD_TAGS=bench, but the server is no benchmark build (a commit from before it?)" >&2; exit 1
 fi
+CRASH=0
+CRASHES=0
+# crash stops the server, keeps its CPU time for the samples, and kills it. Killing it here, rather than
+# in the loop below, ends a wait that began after the loop looked at CRASH.
+crash() {
+  local cpu
+  CRASH=1
+  kill -STOP "$PID" 2> /dev/null || return 0
+  for _ in $(seq 100); do
+    [ "$(awk '{sub(/.*\) /, ""); print $1}' "/proc/$PID/stat" 2> /dev/null)" != T ] || break
+    sleep 0.01
+  done
+  cpu=$(awk -v t="$TICK" '{sub(/.*\) /, ""); print ($12+$13)/t}' "/proc/$PID/stat" 2> /dev/null || true)
+  [ -z "$cpu" ] || echo "$PID $cpu" > "$KILLED_CPU"
+  kill -KILL "$PID" 2> /dev/null || true
+}
+# Before the ready file, which bench/server.sh crash waits for: a USR1 without the trap would end this script.
+trap crash USR1
 echo "$PID" > "$READY"
 echo "serving $SCHEME on $BIND:$PORT (commit $COMMIT); press Ctrl-C to stop"
 [ "$SCHEME" = https ] && grep -m1 "HTTPS certificate" "$WORK/server.log" | sed 's/^[0-9/]* [0-9:]* //' || true
 
-wait "$PID" || true
+while :; do
+  # A USR1 that came before the wait has killed the server already.
+  [ "$CRASH" = 1 ] || wait "$PID" || true
+  [ "$CRASH" = 1 ] || break
+  CRASH=0
+  CRASHES=$((CRASHES + 1))
+  kill -KILL "$PID" 2> /dev/null || true
+  wait "$PID" 2> /dev/null || true
+  bench_rm "$READY"
+  echo "$(date '+%Y/%m/%d %H:%M:%S') bench/server.sh: killed the server with SIGKILL; starting it again" >> "$WORK/server.log"
+  "${SERVER_CMD[@]}" >> "$WORK/server.log" 2>&1 &
+  PID=$!
+  record "$SERVERPID" "$PID"
+  serving || { echo "the server didn't start again; its log:" >&2; tail -20 "$WORK/server.log" >&2; exit 1; }
+  echo "$PID" > "$READY"
+  echo "the server serves again after a crash"
+done

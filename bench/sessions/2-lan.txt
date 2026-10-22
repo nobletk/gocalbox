@@ -1,6 +1,7 @@
 # Session 2: wired LAN, Linux; the server on PC A, the client on PC B (X4, X5, X6, X7, X8).
-# X7's server kill and network cut, X8's seeks and the baselines come with M8a-2;
-# x7-stop is the client stopping and resuming, as a browser does after a reload.
+# The baselines come with M8a-2. x7-stop is the client stopping and resuming, as a browser
+# does after a reload; x7-kill and x7-cut, the server's crash and the network's cut, and
+# x8-seek came later, and run as a piece of their own: CELLS=x7-,x8-seek.
 # The same file runs session 3 (Wi-Fi) with PC B on Wi-Fi, without the x6 rows:
 # CELLS=x4-,x5-,x7-,x8-.
 #
@@ -58,6 +59,21 @@ cell x7-stop-10 default engine size=5G resume-at=0.1 retry-for=2m
 cell x7-stop-50 default engine size=5G resume-at=0.5 retry-for=2m
 cell x7-stop-90 default engine size=5G resume-at=0.9 retry-for=2m
 
+# X7, the server's part: at 10, 50 or 90% of the file the server is killed with SIGKILL and
+# started again, as after a crash or a power cut, while the parts go on; the client waits for it.
+cell x7-kill-10 default engine size=5G fault=kill fault-at=0.1 retry-for=2m
+cell x7-kill-50 default engine size=5G fault=kill fault-at=0.5 retry-for=2m
+cell x7-kill-90 default engine size=5G fault=kill fault-at=0.9 retry-for=2m
+
+# X7, the network's part: the client's traffic to the server is dropped for 10 s, as a cable
+# pulled and put back; the connections outlast that. 60 s is longer than the server's 30 s body
+# timeout and the client's HTTP/2 ping (45 s), which break them, and the client makes new ones.
+# Needs SERVER_HOST to be an IP address, and bench/lib/netcut.sh installed (bench/README.md).
+cell x7-cut-10     default engine size=5G fault=cut fault-at=0.1 retry-for=2m
+cell x7-cut-50     default engine size=5G fault=cut fault-at=0.5 retry-for=2m
+cell x7-cut-90     default engine size=5G fault=cut fault-at=0.9 retry-for=2m
+cell x7-cut-50-60s default engine size=5G fault=cut fault-at=0.5 retry-for=2m cut-for=60
+
 # X8: downloads.
 cell x8-down-h2-64M default download transport=https-h2 size=64M
 cell x8-down-h2-1G  default download transport=https-h2 size=1G
@@ -65,3 +81,7 @@ cell x8-down-h2-5G  default download transport=https-h2 size=5G
 cell x8-down-h1-64M default download transport=https-h1 size=64M
 cell x8-down-h1-1G  default download transport=https-h1 size=1G
 cell x8-down-h1-5G  default download transport=https-h1 size=5G
+
+# X8, streaming: 100 seeks, Range requests of 1 MiB at random offsets in a 1 GiB file, from disk.
+cell x8-seek-h2 default seek transport=https-h2 size=1G
+cell x8-seek-h1 default seek transport=https-h1 size=1G
