@@ -1,0 +1,14 @@
+# The X7/X8 follow-up: the same faults and seeks as 2-lan.txt's, on the benchmark build, whose
+# request log times every request, so that it shows where the time goes:
+# - over the cable, why some crash runs lose 2 s after the server answers again;
+# - over Wi-Fi, why the rest of an upload runs slower after a 10 s cut;
+# - over both, what the seeks' time to the first byte is made of.
+# Run it once with PC B on the cable and once on Wi-Fi, with ss and ping logging on PC B
+# (bench/README.md).
+
+server h2-bench BUILD_TAGS=bench
+
+cell d-kill-50 h2-bench engine size=5G fault=kill fault-at=0.5 retry-for=2m
+cell d-cut-50  h2-bench engine size=5G fault=cut fault-at=0.5 retry-for=2m
+cell d-seek-h2 h2-bench seek transport=https-h2 size=1G
+cell d-seek-h1 h2-bench seek transport=https-h1 size=1G
