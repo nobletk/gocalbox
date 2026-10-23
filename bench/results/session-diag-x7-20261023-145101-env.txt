@@ -1,0 +1,48 @@
+session: bench/sessions/diag-x7.txt   seed: 2905913873   started: 2026-10-23T14:51:24+02:00
+client commit: 5d19e5b (dirty=0)
+server: nobletk@192.168.1.137 at 192.168.1.137:18080, repository /home/nobletk/storage/personal/projects/gocalbox, benchmark folder /home/nobletk/storage/gocalbox-bench
+reps: 10, 5 from 5 GiB; warm-ups: 1; rounds: 5; drop caches before downloads: 1
+cells: all
+network cuts: /usr/local/sbin/gocalbox-netcut, to 192.168.1.137
+iperf3 at the start, Mbit/s: to the server 940, from the server 937
+--- this machine
+host: nobletkpc   date: 2026-10-23T14:51:24+02:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 7 9700X 8-Core Processor   cpus: 16
+memory: 30.5 GiB
+cpu governor: performance
+clock synchronised: yes
+folder: /home/nobletk/gocalbox-bench
+  file system: /dev/mapper/root[/@home] btrfs rw,relatime,compress=zstd:3,ssd,space_cache=v2,subvolid=257,subvol=/@home
+  free: 280181903360 bytes
+  disk: NAME="nvme1n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="1.8T" MODEL="Samsung SSD 980 PRO 2TB"
+network:
+  enp10s0: down, -1 Mb/s, 
+  wlp9s0: up, ? Mb/s, 192.168.1.12/24 2001:4c4e:248c:7300:3c5:59a2:abb9:d968/64 fe80::1e2a:5619:6e4c:efa0/64
+  wifi wlp9s0: SSID: Telekom-Noble; freq: 5220.0; signal: -31 dBm; rx bitrate: 2401.9 MBit/s 160MHz HE-MCS 11 HE-NSS 2 HE-GI 0 HE-DCM 0; tx bitrate: 2401.9 MBit/s 160MHz HE-MCS 11 HE-NSS 2 HE-GI 0 HE-DCM 0; 
+go: go version go1.27.3-X:nodwarf5 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+--- the matrix
+# The X7/X8 follow-up: the same faults and seeks as 2-lan.txt's, on the benchmark build, whose
+# request log times every request, so that it shows where the time goes:
+# - over the cable, why some crash runs lose 2 s after the server answers again;
+# - over Wi-Fi, why the rest of an upload runs slower after a 10 s cut;
+# - over both, what the seeks' time to the first byte is made of.
+# Run it once with PC B on the cable and once on Wi-Fi, with ss and ping logging on PC B
+# (bench/README.md).
+
+server h2-bench BUILD_TAGS=bench
+
+cell d-kill-50 h2-bench engine size=5G fault=kill fault-at=0.5 retry-for=2m
+cell d-cut-50  h2-bench engine size=5G fault=cut fault-at=0.5 retry-for=2m
+cell d-seek-h2 h2-bench seek transport=https-h2 size=1G
+cell d-seek-h1 h2-bench seek transport=https-h1 size=1G
+iperf3 at the end, Mbit/s: to the server 940, from the server 935
+finished: 2026-10-23T15:13:14+02:00   runs: 34   not ok: 0
+--- this machine's network at the end
+network:
+  enp10s0: down, -1 Mb/s, 
+  wlp9s0: up, ? Mb/s, 192.168.1.12/24 2001:4c4e:248c:7300:3c5:59a2:abb9:d968/64 fe80::1e2a:5619:6e4c:efa0/64
+  wifi wlp9s0: SSID: Telekom-Noble; freq: 5220.0; signal: -31 dBm; rx bitrate: 2161.3 MBit/s 160MHz HE-MCS 10 HE-NSS 2 HE-GI 0 HE-DCM 0; tx bitrate: 2401.9 MBit/s 160MHz HE-MCS 11 HE-NSS 2 HE-GI 0 HE-DCM 0; 
