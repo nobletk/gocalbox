@@ -1,0 +1,116 @@
+session: bench/sessions/1-loopback.txt   seed: 2806313262   started: 2026-10-26T13:18:49+01:00
+client commit: 195821c (dirty=0)
+server: this machine at localhost:18080, repository /home/nobletk/storage/personal/projects/gocalbox, benchmark folder /mnt/storage/gocalbox-bench
+reps: 10, 5 from 5 GiB; warm-ups: 1; rounds: 5; drop caches before downloads: 1
+cells: x6-
+iperf3 at the start, Mbit/s: to the server 49079, from the server 56917
+--- this machine
+host: nobletk-laptop   date: 2026-10-26T13:18:49+01:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench
+  file system: /dev/nvme0n1p9 ext4 rw,noatime
+  free: 1042537521152 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  wlp5s0: up, ? Mb/s, 192.168.1.16/24 fd42:4089:c37:0:703d:be35:33b6:cf4c/64 fd8c:d76:ba0a:5e00:8cf1:8bb4:a2bc:7b76/64 fd80::f755:c13e:ba38:613c/64 fe80::4ca9:493b:2d49:600b/64
+  wifi wlp5s0: SSID: Noble-Linksys 5.0; freq: 5320.0; signal: -50 dBm; rx bitrate: 200.0 MBit/s VHT-MCS 9 40MHz short GI VHT-NSS 1; tx bitrate: 135.0 MBit/s VHT-MCS 7 40MHz VHT-NSS 1; 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+--- the matrix
+# Session 1: loopback, Linux, on PC A (X1, X2, X3, X5, X6 of the benchmark plan).
+# Run on PC A without SERVER_SSH; the client and the server share the machine.
+# X1's and X5's baselines (tusd, SFTP, scp) come with M8a-2.
+#
+# PRE_M6 names the commit before M6 (bench/README.md says how to find it).
+
+server default
+server pre-m6 SERVER_REV=$PRE_M6
+server h2-bench BUILD_TAGS=bench
+server h2-128k BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=128K
+server h2-448k BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=448K
+server h2-1m BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=1M GOCALBOX_BENCH_H2_CONN_WINDOW=16M
+
+# X1: the server's capacity on our own paths, uploads and downloads, over both protocols.
+cell x1-engine-h2-1M   default engine   transport=https-h2 size=1M
+cell x1-engine-h2-64M  default engine   transport=https-h2 size=64M
+cell x1-engine-h2-1G   default engine   transport=https-h2 size=1G
+cell x1-engine-h2-5G   default engine   transport=https-h2 size=5G
+cell x1-engine-h1-1M   default engine   transport=https-h1 size=1M
+cell x1-engine-h1-64M  default engine   transport=https-h1 size=64M
+cell x1-engine-h1-1G   default engine   transport=https-h1 size=1G
+cell x1-engine-h1-5G   default engine   transport=https-h1 size=5G
+cell x1-single-h2-1M   default upload   transport=https-h2 size=1M
+cell x1-single-h2-64M  default upload   transport=https-h2 size=64M
+cell x1-single-h2-1G   default upload   transport=https-h2 size=1G
+cell x1-single-h2-5G   default upload   transport=https-h2 size=5G
+cell x1-single-h1-1M   default upload   transport=https-h1 size=1M
+cell x1-single-h1-64M  default upload   transport=https-h1 size=64M
+cell x1-single-h1-1G   default upload   transport=https-h1 size=1G
+cell x1-single-h1-5G   default upload   transport=https-h1 size=5G
+cell x1-down-h2-64M    default download transport=https-h2 size=64M
+cell x1-down-h2-1G     default download transport=https-h2 size=1G
+cell x1-down-h2-5G     default download transport=https-h2 size=5G
+cell x1-down-h1-64M    default download transport=https-h1 size=64M
+cell x1-down-h1-1G     default download transport=https-h1 size=1G
+cell x1-down-h1-5G     default download transport=https-h1 size=5G
+cell x1-batch-c1       default batch    transport=https-h2 conc=1
+cell x1-batch-c4       default batch    transport=https-h2 conc=4
+cell x1-batch-c16      default batch    transport=https-h2 conc=16
+
+# X2: what the guarantees cost. Auditing, in process: the default, every part recorded,
+# and changes answered before their records are on disk. Then M6's staging and flush:
+# the single-request upload before M6 against now.
+cell x2-audit-default-1G - inprocess size=1G
+cell x2-audit-parts-1G   - inprocess size=1G audit-parts=1
+cell x2-audit-nowait-1G  - inprocess size=1G audit-wait=0
+cell x2-audit-default-1M - inprocess size=1M files=200
+cell x2-audit-parts-1M   - inprocess size=1M files=200 audit-parts=1
+cell x2-audit-nowait-1M  - inprocess size=1M files=200 audit-wait=0
+cell x2-staged-now-64M   default upload transport=https-h2 size=64M
+cell x2-staged-now-1G    default upload transport=https-h2 size=1G
+cell x2-staged-pre-64M   pre-m6  upload transport=https-h2 size=64M
+cell x2-staged-pre-1G    pre-m6  upload transport=https-h2 size=1G
+cell x2-batch-now-c4     default batch  transport=https-h2 conc=4
+cell x2-batch-pre-c4     pre-m6  batch  transport=https-h2 conc=4
+
+# X3: the cost of finishing, in process on the NVMe; complete_p50_ms should stay flat.
+# The USB stick's rows run in session 4.
+cell x3-nvme-1M  - inprocess size=1M
+cell x3-nvme-64M - inprocess size=64M
+cell x3-nvme-1G  - inprocess size=1G
+cell x3-nvme-5G  - inprocess size=5G
+cell x3-nvme-20G - inprocess size=20G reps=3
+cell x3-nvme-50G - inprocess size=50G reps=3
+
+# X5 on loopback: HTTP/2's stream window, 256 KiB being today's, in the benchmark build.
+# The server's windows limit only what it receives, so only uploads are measured.
+cell x5-w128-engine  h2-128k  engine   transport=https-h2 size=1G
+cell x5-w256-engine  h2-bench engine   transport=https-h2 size=1G
+cell x5-w448-engine  h2-448k  engine   transport=https-h2 size=1G
+cell x5-w1m-engine   h2-1m    engine   transport=https-h2 size=1G
+cell x5-w128-single  h2-128k  upload   transport=https-h2 size=1G
+cell x5-w256-single  h2-bench upload   transport=https-h2 size=1G
+cell x5-w448-single  h2-448k  upload   transport=https-h2 size=1G
+cell x5-w1m-single   h2-1m    upload   transport=https-h2 size=1G
+
+# X6 on loopback: the server's capacity for many users, each with 3 files of 256 MiB.
+cell x6-users-1  default engine transport=https-h2 size=256M files=3 users=1
+cell x6-users-2  default engine transport=https-h2 size=256M files=3 users=2
+cell x6-users-4  default engine transport=https-h2 size=256M files=3 users=4
+cell x6-users-8  default engine transport=https-h2 size=256M files=3 users=8
+cell x6-users-16 default engine transport=https-h2 size=256M files=3 users=16
+# 24 users send 96 parts at once: more than the server's 32 in flight and 32 waiting.
+cell x6-users-24 default engine transport=https-h2 size=256M files=3 users=24
+iperf3 at the end, Mbit/s: to the server 55165, from the server 54735
+finished: 2026-10-26T13:30:03+01:00   runs: 66   not ok: 0
+--- this machine's network at the end
+network:
+  wlp5s0: up, ? Mb/s, 192.168.1.16/24 fd42:4089:c37:0:703d:be35:33b6:cf4c/64 fd8c:d76:ba0a:5e00:8cf1:8bb4:a2bc:7b76/64 fd80::f755:c13e:ba38:613c/64 fe80::4ca9:493b:2d49:600b/64
+  wifi wlp5s0: SSID: Noble-Linksys 5.0; freq: 5320.0; signal: -51 dBm; rx bitrate: 200.0 MBit/s VHT-MCS 9 40MHz short GI VHT-NSS 1; tx bitrate: 180.0 MBit/s VHT-MCS 9 40MHz VHT-NSS 1; 
