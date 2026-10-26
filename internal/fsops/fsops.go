@@ -60,6 +60,8 @@ type Entry struct {
 	// ActionMove and ActionDelete. For a folder it reflects the folder's own
 	// record only; the request itself also checks everything below.
 	Actions []string
+	// Link is set for a symbolic link, whose Size and IsDir are its target's.
+	Link bool
 }
 
 type Publisher interface {
@@ -218,7 +220,7 @@ func (s *Service) list(ctx context.Context, dir string) (sandbox.Path, []Entry, 
 		for _, f := range found {
 			key := path.Join(storedDir, f.name)
 			entries = append(entries, Entry{
-				Name: f.name, Size: f.shown.Size(), IsDir: f.shown.IsDir(),
+				Name: f.name, Size: f.shown.Size(), IsDir: f.shown.IsDir(), Link: f.info.Mode()&fs.ModeSymlink != 0,
 				Uploader: s.uploaderName(tx, key, f.info),
 				Actions:  s.actions(sub, tx, key, f.info),
 			})

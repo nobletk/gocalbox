@@ -9,7 +9,9 @@ import (
 	"time"
 )
 
-const uiCSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+// Scripts and styles come from files only, so markup injected into the UI
+// can't run as the user.
+const uiCSP = "default-src 'self'; script-src 'self'; style-src 'self'; " +
 	"img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 
 func isResourcePath(p string) bool {

@@ -69,7 +69,7 @@ func (a *app) logSetup(listenHost, port string) {
 	log.Printf("SETUP: One-time setup code: %s (valid until it is used or the server stops)", auth.FormatCode(code))
 	local, other := a.logLink("SETUP", "/#setup="+code, "code", listenHost, port)
 	if lines := setupCommand(runtime.GOOS, local, other, port, a.AllowedHosts, a.TLS, code, a.minPwLen); lines != nil {
-		log.Printf("SETUP: The web UI has no setup page yet; until it does, create the admin with")
+		log.Printf("SETUP: Or, without a browser, create the admin with")
 		for _, l := range lines {
 			log.Printf("SETUP: %s", l)
 		}
@@ -88,7 +88,7 @@ func (a *app) logRecovery(listenHost, port string) {
 	local, other := a.logLink("RECOVERY", "/#reset="+l.Token, "link", listenHost, port)
 	body := fmt.Sprintf(`{"token":"%s","password":"<at least %d characters>"}`, l.Token, a.minPwLen)
 	if lines := apiCommand(runtime.GOOS, local, other, port, a.AllowedHosts, a.TLS, "/api/reset/accept", body); lines != nil {
-		log.Printf("RECOVERY: The web UI has no reset page yet; until it does, set the new password with")
+		log.Printf("RECOVERY: Or, without a browser, set the new password with")
 		for _, l := range lines {
 			log.Printf("RECOVERY: %s", l)
 		}

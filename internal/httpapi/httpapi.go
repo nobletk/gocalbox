@@ -176,6 +176,7 @@ func (a *api) routes(webFS fs.FS, opts Options) []route {
 		{"/api/fs/rename", accessFiles, a.track(http.HandlerFunc(a.handleMove))},
 		{"/api/fs/move", accessFiles, a.track(http.HandlerFunc(a.handleMove))},
 		{"/api/fs/mkdir", accessFiles, a.track(http.HandlerFunc(a.handleCreateFolder))},
+		{"/api/fs/zip", accessFiles, a.track(http.HandlerFunc(a.handleZip))},
 		{"/api/", accessSession, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			writeErrorJSON(w, r, http.StatusNotFound, "not_found", "Unknown API endpoint")
 		})},

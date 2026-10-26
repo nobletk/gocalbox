@@ -166,6 +166,12 @@ type rawPart string
 // none with any part, every part and none, and the last another user's,
 // every part received; {sum} is the composite of a received upload.
 var denyAllCases = map[string][]denyCase{
+	"/api/fs/zip": {
+		{method: "GET", target: "/api/fs/zip"},
+		{method: "GET", target: "/api/fs/zip?path=dir"},
+		{method: "GET", target: "/api/fs/zip?path=dir/sub"},
+		{method: "GET", target: "/api/fs/zip?path=dir/secret.txt"},
+	},
 	"/files/": {
 		{method: "GET", target: "/files/dir/secret.txt"},
 		{method: "HEAD", target: "/files/dir/secret.txt"},
