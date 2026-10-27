@@ -1,0 +1,155 @@
+round: 1
+server: eb9c32e (dirty=0)   started: 20261027-172115
+kind: sshd   version: OpenSSH_10.6p1, OpenSSL 3.6.5 29 Sep 2026
+build tags: none
+benchmark settings: none
+host: nobletk-laptop   date: 2026-10-27T17:23:10+01:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench/server/root
+  file system: /dev/nvme0n1p9 ext4 rw,noatime
+  free: 1042395852800 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  wlp5s0: up, ? Mb/s, 192.168.1.16/24 fd42:4089:c37:0:703d:be35:33b6:cf4c/64 fd80::f755:c13e:ba38:613c/64 fd8c:d76:ba0a:5e00:8cf1:8bb4:a2bc:7b76/64 fe80::4ca9:493b:2d49:600b/64
+  wifi wlp5s0: SSID: Noble-Linksys 5.0; freq: 5320.0; signal: -50 dBm; rx bitrate: 200.0 MBit/s VHT-MCS 9 40MHz short GI VHT-NSS 1; tx bitrate: 180.0 MBit/s VHT-MCS 9 40MHz VHT-NSS 1; 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 1042395934720 bytes
+server command: '/mnt/storage/gocalbox-bench/server/subreaper' '/usr/bin/sshd' '-D' '-e' '-f' '/mnt/storage/gocalbox-bench/server/ssh/sshd_config'
+console event log: on
+scheme: ssh
+load users: 0
+crashes: 0
+server peak RSS (kB): 35228, the largest sum over sshd's processes
+audit records: 0
+round: 2
+server: eb9c32e (dirty=0)   started: 20261027-173405
+kind: sshd   version: OpenSSH_10.6p1, OpenSSL 3.6.5 29 Sep 2026
+build tags: none
+benchmark settings: none
+host: nobletk-laptop   date: 2026-10-27T17:35:14+01:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench/server/root
+  file system: /dev/nvme0n1p9 ext4 rw,noatime
+  free: 1042391744512 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  wlp5s0: up, ? Mb/s, 192.168.1.16/24 fd42:4089:c37:0:703d:be35:33b6:cf4c/64 fd80::f755:c13e:ba38:613c/64 fd8c:d76:ba0a:5e00:8cf1:8bb4:a2bc:7b76/64 fe80::4ca9:493b:2d49:600b/64
+  wifi wlp5s0: SSID: Noble-Linksys 5.0; freq: 5320.0; signal: -50 dBm; rx bitrate: 200.0 MBit/s VHT-MCS 9 40MHz short GI VHT-NSS 1; tx bitrate: 180.0 MBit/s VHT-MCS 9 40MHz VHT-NSS 1; 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 1042391801856 bytes
+server command: '/mnt/storage/gocalbox-bench/server/subreaper' '/usr/bin/sshd' '-D' '-e' '-f' '/mnt/storage/gocalbox-bench/server/ssh/sshd_config'
+console event log: on
+scheme: ssh
+load users: 0
+crashes: 0
+server peak RSS (kB): 35316, the largest sum over sshd's processes
+audit records: 0
+round: 3
+server: eb9c32e (dirty=0)   started: 20261027-173554
+kind: sshd   version: OpenSSH_10.6p1, OpenSSL 3.6.5 29 Sep 2026
+build tags: none
+benchmark settings: none
+host: nobletk-laptop   date: 2026-10-27T17:37:02+01:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench/server/root
+  file system: /dev/nvme0n1p9 ext4 rw,noatime
+  free: 1042390433792 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  wlp5s0: up, ? Mb/s, 192.168.1.16/24 fd42:4089:c37:0:703d:be35:33b6:cf4c/64 fd80::f755:c13e:ba38:613c/64 fd8c:d76:ba0a:5e00:8cf1:8bb4:a2bc:7b76/64 fe80::4ca9:493b:2d49:600b/64
+  wifi wlp5s0: SSID: Noble-Linksys 5.0; freq: 5320.0; signal: -49 dBm; rx bitrate: 200.0 MBit/s VHT-MCS 9 40MHz short GI VHT-NSS 1; tx bitrate: 180.0 MBit/s VHT-MCS 9 40MHz VHT-NSS 1; 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 1042389217280 bytes
+server command: '/mnt/storage/gocalbox-bench/server/subreaper' '/usr/bin/sshd' '-D' '-e' '-f' '/mnt/storage/gocalbox-bench/server/ssh/sshd_config'
+console event log: on
+scheme: ssh
+load users: 0
+crashes: 0
+server peak RSS (kB): 35424, the largest sum over sshd's processes
+audit records: 0
+round: 4
+server: eb9c32e (dirty=0)   started: 20261027-174029
+kind: sshd   version: OpenSSH_10.6p1, OpenSSL 3.6.5 29 Sep 2026
+build tags: none
+benchmark settings: none
+host: nobletk-laptop   date: 2026-10-27T17:41:35+01:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench/server/root
+  file system: /dev/nvme0n1p9 ext4 rw,noatime
+  free: 1042390302720 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  wlp5s0: up, ? Mb/s, 192.168.1.16/24 fd42:4089:c37:0:703d:be35:33b6:cf4c/64 fd80::f755:c13e:ba38:613c/64 fd8c:d76:ba0a:5e00:8cf1:8bb4:a2bc:7b76/64 fe80::4ca9:493b:2d49:600b/64
+  wifi wlp5s0: SSID: Noble-Linksys 5.0; freq: 5320.0; signal: -49 dBm; rx bitrate: 200.0 MBit/s VHT-MCS 9 40MHz short GI VHT-NSS 1; tx bitrate: 180.0 MBit/s VHT-MCS 9 40MHz VHT-NSS 1; 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 1042390347776 bytes
+server command: '/mnt/storage/gocalbox-bench/server/subreaper' '/usr/bin/sshd' '-D' '-e' '-f' '/mnt/storage/gocalbox-bench/server/ssh/sshd_config'
+console event log: on
+scheme: ssh
+load users: 0
+crashes: 0
+server peak RSS (kB): 34816, the largest sum over sshd's processes
+audit records: 0
+round: 5
+server: eb9c32e (dirty=0)   started: 20261027-174533
+kind: sshd   version: OpenSSH_10.6p1, OpenSSL 3.6.5 29 Sep 2026
+build tags: none
+benchmark settings: none
+host: nobletk-laptop   date: 2026-10-27T17:46:40+01:00
+kernel: Linux 7.2.8-9-omarchy #1 SMP PREEMPT_DYNAMIC Sat, 17 Oct 2026 22:09:33 +0000 x86_64
+os: Omarchy
+cpu: AMD Ryzen 9 6900HS with Radeon Graphics   cpus: 16
+memory: 38.4 GiB
+cpu governor: performance
+on mains: yes
+clock synchronised: yes
+folder: /mnt/storage/gocalbox-bench/server/root
+  file system: /dev/nvme0n1p9 ext4 rw,noatime
+  free: 1042388926464 bytes
+  disk: NAME="nvme0n1" TYPE="disk" TRAN="nvme" ROTA="0" SIZE="3.6T" MODEL="Samsung SSD 990 PRO 4TB"
+network:
+  wlp5s0: up, ? Mb/s, 192.168.1.16/24 fd42:4089:c37:0:703d:be35:33b6:cf4c/64 fd80::f755:c13e:ba38:613c/64 fd8c:d76:ba0a:5e00:8cf1:8bb4:a2bc:7b76/64 fe80::4ca9:493b:2d49:600b/64
+  wifi wlp5s0: SSID: Noble-Linksys 5.0; freq: 5320.0; signal: -50 dBm; rx bitrate: 200.0 MBit/s VHT-MCS 9 40MHz short GI VHT-NSS 1; tx bitrate: 180.0 MBit/s VHT-MCS 9 40MHz VHT-NSS 1; 
+go: go version go1.27.3 linux/amd64
+curl: curl 8.23.0 (x86_64-pc-linux-gnu) libcurl/8.23.0 OpenSSL/3.6.5 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.70.0 ngtcp2/1.25.0 nghttp3/1.18.0 mit-krb5/1.22.2
+iperf3: iperf 3.22 (cJSON 1.7.15)
+free space on served volume at start: 1042387705856 bytes
+server command: '/mnt/storage/gocalbox-bench/server/subreaper' '/usr/bin/sshd' '-D' '-e' '-f' '/mnt/storage/gocalbox-bench/server/ssh/sshd_config'
+console event log: on
+scheme: ssh
+load users: 0
+crashes: 0
+server peak RSS (kB): 35052, the largest sum over sshd's processes
+audit records: 0
