@@ -6,9 +6,10 @@
 #   bench/session.sh bench/sessions/1-loopback.txt
 #
 # A matrix file has two kinds of lines; # starts a comment:
-#   server NAME [VAR=VALUE ...]   a server: bench/server.sh's settings (BUILD_TAGS, SERVER_REV,
-#                                 SERVER_FLAGS, LOG_EVENTS and the GOCALBOX_BENCH_* variables);
-#                                 a VALUE of $NAME is taken from this script's environment
+#   server NAME [VAR=VALUE ...]   a server: bench/server.sh's settings (KIND, BUILD_TAGS, SERVER_REV,
+#                                 SERVER_FLAGS, LOG_EVENTS, ALLOWED_HOSTS, TUSD, SSHD and the GOCALBOX_BENCH_*
+#                                 variables); a VALUE of $NAME is taken from this script's environment.
+#                                 KIND=tusd serves tusd, and KIND=sshd a private sshd for SFTP and scp.
 #   cell ID SERVER TOOL [KEY=VALUE ...]
 #                                 a measurement, against the server SERVER, or - for none.
 #     engine     resumable uploads with the load client: transport=https-h2|https-h1, size,
@@ -29,6 +30,15 @@
 #     batch      files=100 single-request uploads of 1 MiB at once: transport, conc=1
 #     inprocess  the load client with the engine in this process (server -): size, files=1,
 #                users=1, parallel=4, audit-parts=0, audit-wait=1, resume-at, min-free-mb=1024
+#   against tusd:
+#     tus        one upload with the load client's tus mode: transport, size, chunk (by default
+#                the engine's part size; 0 sends the file in one PATCH), resume-at, retry-for
+#   against sshd, each with a connection of its own, as a user's command would have:
+#     sftp-put   files=1 uploads of size bytes, one after another in one sftp batch
+#     sftp-get   one download with sftp: size
+#     scp-put    one upload with scp: size
+#   A baseline's row holds 201 in http_code for a file stored with the source's bytes, and 200
+#   for a download; 000 if the command failed.
 #   Every cell also takes reps=N, its measured repetitions.
 #
 # The measured runs are spread over rounds, and in each round every server
@@ -82,7 +92,7 @@ IPERF_PORT=${IPERF_PORT:-5201}
 [ -z "${WORK:-}" ] || { echo "WORK is replaced by BENCH_DIR, a folder made with bench/init.sh" >&2; exit 1; }
 [ -z "$(compgen -e GOCALBOX_BENCH_ || true)" ] || { echo "unset the GOCALBOX_BENCH_* variables: the matrix sets them for each server" >&2; exit 1; }
 # The matrix sets these for each server; a server started here would take them from this shell.
-unset SERVER_FLAGS SERVER_REV BUILD_TAGS LOG_EVENTS LOAD_USERS ALLOWED_HOSTS BIND
+unset SERVER_FLAGS SERVER_REV BUILD_TAGS LOG_EVENTS LOAD_USERS ALLOWED_HOSTS BIND KIND AUTHORIZED_KEY
 . bench/lib/safe.sh
 . bench/lib/env.sh
 bench_use "${BENCH_DIR:-}" || exit 1
@@ -109,9 +119,9 @@ mkdir -p "$WORK" "$DATA" bench/results
 
 # --- The matrix -----------------------------------------------------------
 
-declare -A PROFILE_ENV=() PROFILE_USERS=() CELL_SERVER=() CELL_TOOL=() CELL_ARGS=()
+declare -A PROFILE_ENV=() PROFILE_USERS=() PROFILE_KIND=() CELL_SERVER=() CELL_TOOL=() CELL_ARGS=()
 CELL_IDS=()
-SERVER_VARS=" BUILD_TAGS SERVER_REV SERVER_FLAGS LOG_EVENTS GOCALBOX_BENCH_H2_CONN_WINDOW GOCALBOX_BENCH_H2_STREAM_WINDOW GOCALBOX_BENCH_PART_SIZE "
+SERVER_VARS=" KIND BUILD_TAGS SERVER_REV SERVER_FLAGS LOG_EVENTS ALLOWED_HOSTS TUSD SSHD GOCALBOX_BENCH_H2_CONN_WINDOW GOCALBOX_BENCH_H2_STREAM_WINDOW GOCALBOX_BENCH_PART_SIZE "
 declare -A TOOL_KEYS=(
   [engine]=" transport size files users parallel resume-at retry-for fault fault-at cut-for reps "
   [upload]=" transport size reps "
@@ -119,7 +129,15 @@ declare -A TOOL_KEYS=(
   [seek]=" transport size seeks chunk reps "
   [batch]=" transport conc files reps "
   [inprocess]=" size files users parallel audit-parts audit-wait resume-at min-free-mb reps "
+  [tus]=" transport size chunk resume-at retry-for reps "
+  [sftp-put]=" size files reps "
+  [sftp-get]=" size reps "
+  [scp-put]=" size reps "
 )
+# The kind of server each tool measures; inprocess has none.
+declare -A TOOL_KIND=([engine]=gocalbox [upload]=gocalbox [download]=gocalbox [seek]=gocalbox [batch]=gocalbox
+  [tus]=tusd [sftp-put]=sshd [sftp-get]=sshd [scp-put]=sshd)
+SSH_CELLS=0
 bad() { echo "$MATRIX:$LINE_NO: $*" >&2; exit 1; }
 # value KEY DEFAULT prints the cell's value of KEY.
 value() { local kv; for kv in $ARGS; do [ "${kv%%=*}" = "$1" ] && { echo "${kv#*=}"; return; }; done; echo "$2"; }
@@ -147,7 +165,9 @@ check_cell() {
       transport) [[ $v = https-h2 || $v = https-h1 ]] || bad "transport must be https-h2 or https-h1" ;;
       size) is_size "$v" || bad "size must be bytes, or a number with K, M or G" ;;
       files | users | parallel | conc | min-free-mb | seeks) is_count "$v" || bad "$k must be a number from 1" ;;
-      chunk) is_size "$v" && [ "$(numfmt --from=iec "$v")" -gt 0 ] || bad "chunk must be bytes, or a number with K, M or G, above 0" ;;
+      chunk)
+        if [ "$TOOL" = tus ]; then is_size "$v" || bad "chunk must be bytes, or a number with K, M or G; 0 sends the file in one PATCH"
+        else is_size "$v" && [ "$(numfmt --from=iec "$v")" -gt 0 ] || bad "chunk must be bytes, or a number with K, M or G, above 0"; fi ;;
       reps) [[ $v =~ ^[0-9]+$ ]] || bad "reps must be a number" ;;
       audit-parts | audit-wait) [[ $v = 0 || $v = 1 ]] || bad "$k must be 0 or 1" ;;
       resume-at | fault-at) [[ $v =~ ^0?\.[0-9]*[1-9][0-9]*$ ]] || bad "$k must be a share above 0 and below 1, such as 0.5" ;;
@@ -157,8 +177,11 @@ check_cell() {
     esac
   done
   case $TOOL in
-    engine | upload | download | seek | inprocess) is_size "$(value size x)" || bad "$TOOL needs a size" ;;
+    engine | upload | download | seek | inprocess | tus | sftp-put | sftp-get | scp-put) is_size "$(value size x)" || bad "$TOOL needs a size" ;;
   esac
+  if [ "$TOOL" = tus ] && [ -n "$(value resume-at '')" ] && [ -n "$(value chunk '')" ] && [ "$(numfmt --from=iec "$(value chunk '')")" = 0 ]; then
+    bad "resume-at needs chunks, as a stop comes between two"
+  fi
   if [ "$TOOL" = seek ]; then
     [ "$(numfmt --from=iec "$(value chunk 1M)")" -le "$(numfmt --from=iec "$(value size 0)")" ] || bad "chunk must be at most the size"
   fi
@@ -175,6 +198,8 @@ check_cell() {
     [ -z "$SERVER_SSH" ] || bad "an inprocess cell measures this machine, so it runs only with the server here, without SERVER_SSH"
   else
     [ -n "${PROFILE_ENV[$SERVER]+x}" ] || bad "no server named $SERVER above this line"
+    [ "${PROFILE_KIND[$SERVER]}" = "${TOOL_KIND[$TOOL]}" ] ||
+      bad "$TOOL measures a server of KIND=${TOOL_KIND[$TOOL]}, and server $SERVER is KIND=${PROFILE_KIND[$SERVER]}"
   fi
 }
 
@@ -188,6 +213,7 @@ while read -r -a WORDS || [ "${#WORDS[@]}" -gt 0 ]; do
       [[ $NAME =~ ^[A-Za-z0-9._-]+$ ]] || bad "a server needs a name of letters, digits, . _ and -"
       [ -z "${PROFILE_ENV[$NAME]+x}" ] || bad "server $NAME again"
       SETTINGS=
+      PROFILE_KIND[$NAME]=gocalbox
       for kv in "${WORDS[@]:2}"; do
         [[ $kv = *=* ]] || bad "not VAR=VALUE: $kv"
         k=${kv%%=*}; v=${kv#*=}
@@ -198,6 +224,10 @@ while read -r -a WORDS || [ "${#WORDS[@]}" -gt 0 ]; do
           v=${!ref}
         fi
         [[ $v =~ ^[A-Za-z0-9._,=+:/@^~-]*$ ]] || bad "unusual characters in $k"
+        if [ "$k" = KIND ]; then
+          [[ $v = gocalbox || $v = tusd || $v = sshd ]] || bad "KIND must be gocalbox, tusd or sshd"
+          PROFILE_KIND[$NAME]=$v
+        fi
         SETTINGS+="$k=$v "
       done
       PROFILE_ENV[$NAME]=$SETTINGS
@@ -207,7 +237,7 @@ while read -r -a WORDS || [ "${#WORDS[@]}" -gt 0 ]; do
       ID=${WORDS[1]}; SERVER=${WORDS[2]}; TOOL=${WORDS[3]}; ARGS="${WORDS[*]:4}"
       [[ $ID =~ ^[A-Za-z0-9._-]+$ ]] || bad "a cell needs an ID of letters, digits, . _ and -"
       [ -z "${CELL_TOOL[$ID]+x}" ] || bad "cell $ID again"
-      [ -n "${TOOL_KEYS[$TOOL]+x}" ] || bad "no tool $TOOL: engine, upload, download, seek, batch or inprocess"
+      [ -n "${TOOL_KEYS[$TOOL]+x}" ] || bad "no tool $TOOL: engine, upload, download, seek, batch, inprocess, tus, sftp-put, sftp-get or scp-put"
       check_cell
       if [ -n "$CELLS" ]; then
         keep=0
@@ -216,6 +246,7 @@ while read -r -a WORDS || [ "${#WORDS[@]}" -gt 0 ]; do
         [ "$keep" = 1 ] || continue
       fi
       CELL_IDS+=("$ID"); CELL_SERVER[$ID]=$SERVER; CELL_TOOL[$ID]=$TOOL; CELL_ARGS[$ID]=$ARGS
+      [ "${TOOL_KIND[$TOOL]:-}" != sshd ] || SSH_CELLS=1
       # Checked only for the cells that run, so that a matrix's other cells run without them.
       if [ "$(value fault '')" = cut ]; then
         [ -n "$SERVER_SSH" ] || bad "a cut drops this machine's traffic to the server, so it runs only with SERVER_SSH"
@@ -287,6 +318,10 @@ fi
 
 # --- The server -------------------------------------------------------------
 
+if [ "$SSH_CELLS" = 1 ]; then
+  for tool in ssh sftp scp ssh-keygen; do command -v "$tool" > /dev/null || { echo "missing: $tool, for the cells against sshd" >&2; exit 1; }; done
+fi
+
 if [ "$CUTS" = 1 ]; then
   { [ -f "$NETCUT" ] && [ "$(stat -c %u -- "$NETCUT")" = 0 ]; } ||
     { echo "cut cells need $NETCUT: bench/lib/netcut.sh installed as root (bench/README.md)" >&2; exit 1; }
@@ -319,6 +354,7 @@ STOPPING=0
 start_server() {
   local srv=$1 log=$SERVER_BENCH/server/console.log state settings pid
   read -r -a settings <<< "${PROFILE_ENV[$srv]}"
+  [ "${PROFILE_KIND[$srv]}" != sshd ] || settings+=("AUTHORIZED_KEY=$(cat "$SSH_KEY.pub")")
   remote "mkdir -p $(q "$SERVER_BENCH/server")"
   remote_rm "$SERVER_BENCH/server/run.env" "$SERVER_BENCH/server/ready"
   # A simple command in the background, so that nothing holds this session's output open.
@@ -343,9 +379,15 @@ start_server() {
   # Sets SRV_COMMIT, SRV_DIRTY, SRV_ROOT, SRV_SAMPLES, SRV_ENV, SRV_SCHEME, SRV_CA, SRV_USER,
   # SRV_PASSWORD, SRV_LOAD_PASSWORD, SRV_REQUESTS, SRV_LOG and the rest of the server's run.env.
   eval "$(remote_cat "$SERVER_BENCH/server/run.env")"
+  SRV_KIND=${SRV_KIND:-gocalbox}
+  [ "$SRV_KIND" = "${PROFILE_KIND[$srv]}" ] || { echo "server $srv is $SRV_KIND, not ${PROFILE_KIND[$srv]}: is the server's repository at this commit?" >&2; exit 1; }
+  bench_rm "$WORK/server-ca.crt" "$WORK/session-header"
+  case $SRV_KIND in
+    sshd) URL="sftp://$SRV_SSH_USER@$SERVER_HOST:$PORT"; ssh_client "$srv"; return 0 ;;
+    tusd) URL="https://$SERVER_HOST:$PORT/files/"; remote_cat "$SRV_CA" > "$WORK/server-ca.crt"; return 0 ;;
+  esac
   [ "$SRV_SCHEME" = https ] || { echo "server $srv speaks $SRV_SCHEME; the session measures HTTPS only" >&2; exit 1; }
   URL="https://$SERVER_HOST:$PORT"
-  bench_rm "$WORK/server-ca.crt" "$WORK/session-header"
   remote_cat "$SRV_CA" > "$WORK/server-ca.crt"
   token=$(printf '{"username":"%s","password":"%s"}' "$SRV_USER" "$SRV_PASSWORD" |
     curl -sS --cacert "$WORK/server-ca.crt" -o /dev/null -D - -H 'Content-Type: application/json' --data-binary @- "$URL/api/auth/login" |
@@ -357,6 +399,57 @@ start_server() {
   fi
   (umask 077; printf 'Cookie: __Host-gocalbox-session=%s\n' "$token" > "$WORK/session-header")
   [ "$SRV_DIRTY" = 0 ] || echo "warning: server $srv was built from a dirty tree; its rows are marked dirty=1" >&2
+}
+
+# The cells against sshd log in with a key of this machine's own, kept in its benchmark
+# folder, through a configuration of their own: ~/.ssh/config and the system's are not read,
+# so OpenSSH's defaults choose the cipher, as for a user without settings.
+SSH_DIR=$WORK/ssh
+SSH_KEY=$SSH_DIR/id_ed25519
+SSH_CONF=$SSH_DIR/config
+SSH_HOST=gocalbox-bench
+declare -A SSH_RECORDED=()
+if [ "$SSH_CELLS" = 1 ]; then
+  mkdir -p "$SSH_DIR"
+  [ -f "$SSH_KEY" ] || ssh-keygen -q -t ed25519 -N '' -C "gocalbox benchmark client" -f "$SSH_KEY" > /dev/null
+fi
+
+# ssh_config_quote prints a path as ssh_config reads it, refusing what it would read otherwise.
+ssh_config_quote() {
+  [[ $1 != *[\"\\%~]* && $1 != *$'\n'* ]] || { echo "ssh can't be given a path with \", \\, %, ~ or a new line: $1" >&2; exit 1; }
+  printf '"%s"' "$1"
+}
+
+# ssh_client writes the configuration for the block's sshd, trusting its host key, and records
+# the algorithms a connection agrees on, once per server.
+ssh_client() {
+  local srv=$1 out
+  bench_rm "$SSH_DIR/known_hosts" "$SSH_CONF"
+  echo "[$SERVER_HOST]:$PORT $(remote_cat "$SRV_HOSTKEY" | awk '{print $1, $2}')" > "$SSH_DIR/known_hosts"
+  {
+    echo "Host $SSH_HOST"
+    echo "  HostName $SERVER_HOST"
+    echo "  Port $PORT"
+    echo "  User $SRV_SSH_USER"
+    echo "  IdentityFile $(ssh_config_quote "$SSH_KEY")"
+    echo "  IdentitiesOnly yes"
+    echo "  IdentityAgent none"
+    echo "  UserKnownHostsFile $(ssh_config_quote "$SSH_DIR/known_hosts")"
+    echo "  StrictHostKeyChecking yes"
+    echo "  BatchMode yes"
+    echo "  ControlMaster no"
+    echo "  ControlPath none"
+    echo "  LogLevel ERROR"
+  } > "$SSH_CONF"
+  out=$(sftp -F "$SSH_CONF" -v -b /dev/null "$SSH_HOST" 2>&1) || {
+    echo "cannot log in to server $srv with sftp:" >&2; echo "$out" | grep -v '^debug' | tail -5 >&2; exit 1; }
+  if [ -z "${SSH_RECORDED[$srv]:-}" ]; then
+    SSH_RECORDED[$srv]=1
+    {
+      echo "server $srv: $SRV_VERSION; client: $(ssh -V 2>&1)"
+      echo "$out" | sed -n 's/^debug1: kex: \(algorithm\|host key algorithm\|server->client cipher\|client->server cipher\): /  \1: /p' | sort -u
+    } >> "$ENV"
+  fi
 }
 
 # server_alive succeeds while the block's server runs.
@@ -396,7 +489,7 @@ stop_server() {
   if [ -n "${SRV_REQUESTS:-}" ]; then cat -- "$BLOCK_REQUESTS" >> "$RUN-server-$srv-requests.jsonl" || true; fi
   bench_rm "$BLOCK_LOG" "$BLOCK_REQUESTS"
 }
-trap 'stop_server || true; close_ssh' EXIT
+trap 'stop_server || true; close_ssh; [ -z "${SSH_DIR:-}" ] || bench_rm "$SSH_DIR" || true' EXIT
 PLACED=()
 
 # --- The runs -----------------------------------------------------------------
@@ -509,6 +602,12 @@ run_cell() {
       row "$id" "$bytes" 1 1 "$rep" "$secs" "" "$code" "$transport" "$t0" "$t1" ;;
     seek)
       seek_run "$id" "$rep" "$transport" ;;
+    tus)
+      tus_run "$id" "$rep" "$transport" ;;
+    sftp-put | scp-put)
+      ssh_put "$id" "$rep" ;;
+    sftp-get)
+      sftp_get "$id" "$rep" ;;
     batch)
       local n conc codes=$WORK/codes-$STAMP names=()
       n=$(value files 100); conc=$(value conc 1); src=$(data 1M)
@@ -526,6 +625,121 @@ run_cell() {
       bench_rm "$codes"
       row "$id" 1048576 "$n" "$conc" "$rep" "$(awk -v a="$t0" -v b="$t1" 'BEGIN {printf "%.6f", b - a}')" "" "$code" "$transport" "$t0" "$t1" ;;
   esac
+}
+
+# stored_ok NAME... flushes the files the run stored in the served folder, and sets FLUSHED to the
+# seconds it took; then checks them against the source's size and SHA-256, $bytes and $src. If one
+# differs, it sets OUTCOME, and CODE to "$CODE wrong_file".
+stored_ok() {
+  local a got f paths=()
+  for f in "$@"; do paths+=("$SRV_ROOT/$f"); done
+  a=$EPOCHREALTIME
+  remote "$(q sync -- "${paths[@]}")" || true
+  FLUSHED=$(awk -v a="$a" -v b="$EPOCHREALTIME" 'BEGIN {printf "%.6f", b - a}')
+  for f in "${paths[@]}"; do
+    got=$(remote "$(q stat -c %s -- "$f") && $(q sha256sum -- "$f")" 2> /dev/null | awk '{printf "%s ", $1}' || true)
+    if [ "$got" != "$bytes $(cat "$src.sha256") " ]; then
+      CODE="$CODE wrong_file"; OUTCOME="stored size and SHA-256 ${got% } of ${f##*/} differ from the source's"
+      return 0
+    fi
+  done
+}
+
+# served_files prints the files in the served folder, one per line, relative to it.
+served_files() {
+  remote "cd $(q "$SRV_ROOT") && find . -type f -printf '%P\n'" 2> /dev/null || true
+}
+
+# tus_run ID REP TRANSPORT uploads the source to tusd with the load client. tusd names the
+# file it stores by the upload's ID, next to its .info: the one file the run leaves is checked.
+tus_run() {
+  local id=$1 rep=$2 transport=$3 size src bytes tmp=$WORK/load-$STAMP.csv args durable CODE secs files
+  size=$(value size 0); src=$(data "$size"); bytes=$(stat -c %s "$src")
+  args=(-tus "https://$SERVER_HOST:$PORT/files/" -ca "$WORK/server-ca.crt" -file "$src" -transport "$transport" -reps 1 -csv "$tmp")
+  [ -z "$(value chunk '')" ] || args+=(-chunk "$(value chunk '')")
+  [ -z "$(value resume-at '')" ] || args+=(-resume-at "$(value resume-at '')")
+  [ -z "$(value retry-for '')" ] || args+=(-retry-for "$(value retry-for '')")
+  bench_rm "$tmp"
+  remote sync
+  OUTCOME=ok
+  "$LOAD" "${args[@]}" < /dev/null 2>> "$WORK/load.log" || OUTCOME=failed
+  if [ "$OUTCOME" != ok ] || [ "$(wc -l < "$tmp" 2> /dev/null || echo 0)" != 2 ]; then
+    OUTCOME=failed
+    row "$id" "$bytes" 1 1 "$rep" 0 "" 000 "$transport" "$EPOCHREALTIME" "$EPOCHREALTIME"
+  else
+    CODE=$(tail -1 "$tmp" | cut -d, -f12)
+    durable=
+    mapfile -t files < <(served_files | grep -v -e '\.info$' -e '\.lock$' || true)
+    if [ "$CODE" = 201 ] && [ "${#files[@]}" = 1 ]; then
+      secs=$(tail -1 "$tmp" | cut -d, -f8)
+      stored_ok "${files[0]}"
+      durable=$(awk -v s="$secs" -v d="$FLUSHED" 'BEGIN {printf "%.6f", s + d}')
+    elif [ "$CODE" = 201 ]; then
+      CODE="201 wrong_file"; OUTCOME="tusd's folder holds ${#files[@]} files, not the one uploaded"
+    else
+      OUTCOME="answered $CODE"
+    fi
+    # As for the load client's other rows, with the time to flush the file, and what the check found.
+    tail -1 "$tmp" | awk -F, -v OFS=, -v id="$id" -v rep="$rep" -v c="$SRV_COMMIT" -v d="$SRV_DIRTY" -v code="$CODE" -v dur="$durable" '
+      { $1 = c; $2 = d; $3 = id; $7 = rep; $10 = dur; $12 = code; printf "%s|%.6f|%.6f\n", $0, $NF, $NF + $8 }' >> "$RAW"
+  fi
+  bench_rm "$tmp"
+  mapfile -t files < <(served_files)
+  [ "${#files[@]}" = 0 ] || remote_rm "${files[@]/#/$SRV_ROOT/}"
+}
+
+# ssh_put ID REP uploads files=1 copies of the source with one sftp batch, or one with scp, each
+# into the served folder, where sshd starts its sessions.
+ssh_put() {
+  local id=$1 rep=$2 size src bytes n i names=() batch=$WORK/batch-$STAMP t0 t1 secs durable CODE=201 ok=1
+  size=$(value size 0); src=$(data "$size"); bytes=$(stat -c %s "$src"); n=$(value files 1)
+  for i in $(seq "$n"); do names+=("u-$id-$i.bin"); done
+  OUTCOME=ok
+  remote sync
+  if [ "${CELL_TOOL[$id]}" = sftp-put ]; then
+    bench_rm "$batch"
+    for i in "${names[@]}"; do printf 'put %s %s\n' "$(ssh_config_quote "$src")" "$i"; done > "$batch"
+    t0=$EPOCHREALTIME
+    sftp -F "$SSH_CONF" -b "$batch" "$SSH_HOST" > /dev/null 2>> "$WORK/load.log" || ok=0
+    t1=$EPOCHREALTIME
+    bench_rm "$batch"
+  else
+    t0=$EPOCHREALTIME
+    scp -F "$SSH_CONF" -q "$src" "$SSH_HOST:${names[0]}" 2>> "$WORK/load.log" || ok=0
+    t1=$EPOCHREALTIME
+  fi
+  secs=$(awk -v a="$t0" -v b="$t1" 'BEGIN {printf "%.6f", b - a}')
+  durable=
+  if [ "$ok" = 1 ]; then
+    stored_ok "${names[@]}"
+    durable=$(awk -v s="$secs" -v d="$FLUSHED" 'BEGIN {printf "%.6f", s + d}')
+  else
+    CODE=000; OUTCOME="${CELL_TOOL[$id]%-put} failed"
+  fi
+  row "$id" "$bytes" "$n" 1 "$rep" "$secs" "$durable" "$CODE" ssh "$t0" "$t1"
+  mapfile -t names < <(served_files | grep -v '^d-' || true)
+  [ "${#names[@]}" = 0 ] || remote_rm "${names[@]/#/$SRV_ROOT/}"
+}
+
+# sftp_get ID REP downloads the file placed for the cell with sftp; a warm-up also checks its bytes.
+sftp_get() {
+  local id=$1 rep=$2 size bytes name t0 t1 got=$WORK/got-$STAMP CODE=200 dest=/dev/null ok=1
+  size=$(value size 0); bytes=$(numfmt --from=iec "$size"); name="d-$size.bin"
+  OUTCOME=ok
+  [ "$DROP_CACHES" != 1 ] || remote "sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
+  bench_rm "$got"
+  [ "$rep" != 0 ] || dest=$got
+  t0=$EPOCHREALTIME
+  printf 'get %s %s\n' "$name" "$(ssh_config_quote "$dest")" | sftp -F "$SSH_CONF" -b - "$SSH_HOST" > /dev/null 2>> "$WORK/load.log" || ok=0
+  t1=$EPOCHREALTIME
+  if [ "$ok" = 0 ]; then CODE=000; OUTCOME="sftp failed"
+  elif [ "$rep" = 0 ] && [ "$(stat -c %s "$got" 2> /dev/null || echo 0)" != "$bytes" ]; then
+    CODE="200 wrong_size"; OUTCOME="got $(stat -c %s "$got" 2> /dev/null || echo 0) of $bytes bytes"
+  elif [ "$rep" = 0 ] && [ "$(sha256sum < "$got" | cut -d' ' -f1)" != "$(cat "$(data "$size").sha256")" ]; then
+    CODE="200 wrong_file"; OUTCOME="got other bytes"
+  elif [ -n "${MISPLACED[$size]:-}" ]; then CODE="200 wrong_file"; OUTCOME="the file placed for it isn't the source's bytes"; fi
+  bench_rm "$got"
+  row "$id" "$bytes" 1 1 "$rep" "$(awk -v a="$t0" -v b="$t1" 'BEGIN {printf "%.6f", b - a}')" "" "$CODE" ssh "$t0" "$t1"
 }
 
 # fault_cmd KIND SECONDS prints the command the load client runs for a fault: a crash of the
@@ -600,12 +814,17 @@ place_downloads() {
   local srv=$1 id size src code sum ARGS
   for id in "${CELL_IDS[@]}"; do
     [ "${CELL_SERVER[$id]}" = "$srv" ] || continue
-    [ "${CELL_TOOL[$id]}" = download ] || [ "${CELL_TOOL[$id]}" = seek ] || continue
+    [ "${CELL_TOOL[$id]}" = download ] || [ "${CELL_TOOL[$id]}" = seek ] || [ "${CELL_TOOL[$id]}" = sftp-get ] || continue
     ARGS=${CELL_ARGS[$id]}; size=$(value size 0); src=$(data "$size")
     [[ " ${PLACED[*]} " = *" $size "* ]] && continue
-    curl_for https-h2
-    code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' -F "myFile=@$src;filename=d-$size.bin" "$URL/api/upload" || true)
-    [ "$code" = 201 ] || { echo "cannot place the $size file for downloads on server $srv: $code" >&2; exit 1; }
+    if [ "${CELL_TOOL[$id]}" = sftp-get ]; then
+      printf 'put %s %s\n' "$(ssh_config_quote "$src")" "d-$size.bin" | sftp -F "$SSH_CONF" -b - "$SSH_HOST" > /dev/null 2>> "$WORK/load.log" ||
+        { echo "cannot place the $size file for downloads on server $srv with sftp" >&2; exit 1; }
+    else
+      curl_for https-h2
+      code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' -F "myFile=@$src;filename=d-$size.bin" "$URL/api/upload" || true)
+      [ "$code" = 201 ] || { echo "cannot place the $size file for downloads on server $srv: $code" >&2; exit 1; }
+    fi
     PLACED+=("$size")
     # Later blocks have no warm-up to hash what their downloads get, so the placed file is checked.
     sum=$(remote "$(q sha256sum -- "$SRV_ROOT/d-$size.bin")" | cut -d' ' -f1 || true)
@@ -635,13 +854,13 @@ link_rates() {
 # --- The session --------------------------------------------------------------
 
 for s in $(for id in "${CELL_IDS[@]}"; do ARGS=${CELL_ARGS[$id]}
-  case ${CELL_TOOL[$id]} in upload | download | seek) value size 0 ;; batch) echo 1M ;; esac; done | sort -u); do
+  case ${CELL_TOOL[$id]} in upload | download | seek | tus | sftp-put | sftp-get | scp-put) value size 0 ;; batch) echo 1M ;; esac; done | sort -u); do
   data "$s" > /dev/null
 done
 
 if [ "$DROP_CACHES" = 1 ]; then
   for id in "${CELL_IDS[@]}"; do
-    [ "${CELL_TOOL[$id]}" = download ] || [ "${CELL_TOOL[$id]}" = seek ] || continue
+    [ "${CELL_TOOL[$id]}" = download ] || [ "${CELL_TOOL[$id]}" = seek ] || [ "${CELL_TOOL[$id]}" = sftp-get ] || continue
     remote "sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'" ||
       { echo "DROP_CACHES=1 needs passwordless sudo on the server to drop its page cache; or set DROP_CACHES=0" >&2; exit 1; }
     break
@@ -722,7 +941,7 @@ drop_envs() {
   local d; d=$(q "$SERVER_ENVS")
   if remote "[ -d $d ] && [ -z \"\$(ls -A $d)\" ]"; then remote_rm "$SERVER_ENVS"; fi
 }
-trap 'end_block || true; drop_envs || true; close_ssh; bench_rm "$PLAN" || true' EXIT
+trap 'end_block || true; drop_envs || true; close_ssh; bench_rm "$PLAN" "$SSH_DIR" || true' EXIT
 while read -r srv id rep round <&3; do
   if [ "$srv" != "$CURRENT" ] || [ "$round" != "$ROUND" ]; then
     end_block
@@ -760,7 +979,7 @@ while read -r srv id rep round <&3; do
   echo "[$SEQ/$TOTAL] $id rep $rep: $OUTCOME"
 done 3< "$PLAN"
 end_block
-bench_rm "$PLAN" "$LOAD" "$WORK/server-ca.crt" "$WORK/session-header"
+bench_rm "$PLAN" "$LOAD" "$WORK/server-ca.crt" "$WORK/session-header" "$SSH_DIR"
 drop_envs
 
 link_rates

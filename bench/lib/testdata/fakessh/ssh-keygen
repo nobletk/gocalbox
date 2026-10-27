@@ -1,0 +1,6 @@
+#!/bin/bash
+# A stand-in for ssh-keygen: an ed25519 key pair of random bytes.
+while [ $# -gt 0 ]; do case $1 in -f) f=$2; shift 2 ;; -C) c=$2; shift 2 ;; -t | -N) shift 2 ;; *) shift ;; esac; done
+[ ! -e "$f" ] || { echo "$f already exists" >&2; exit 1; }
+(umask 077; echo "fake private key" > "$f")
+echo "ssh-ed25519 $(head -c 32 /dev/urandom | base64 -w0 | tr -d '=') $c" > "$f.pub"

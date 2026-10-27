@@ -1,0 +1,26 @@
+#!/bin/bash
+# A stand-in for sftp: it logs in to fakesshd's folder only with the key and host key the
+# configuration names, and runs put and get of a batch there. FAKE_SSH_MODE=corrupt changes the
+# first byte of what it stores, and FAKE_SSH_MODE=fail fails the batch's commands.
+. "$(dirname "$0")/fakessh.sh"
+batch= verbose=0
+while [ $# -gt 1 ]; do
+  case $1 in
+    -F) conf=$2; shift 2 ;;
+    -b) batch=$2; shift 2 ;;
+    -v) verbose=1; shift ;;
+    -q) shift ;;
+    *) echo "fake sftp: unknown option $1" >&2; exit 2 ;;
+  esac
+done
+login "$1"
+[ "$verbose" = 0 ] || printf 'debug1: kex: algorithm: fake-kex\ndebug1: kex: host key algorithm: ssh-ed25519\ndebug1: kex: server->client cipher: fake-cipher MAC: <implicit> compression: none\ndebug1: kex: client->server cipher: fake-cipher MAC: <implicit> compression: none\n' >&2
+[ "$batch" = - ] && batch=/dev/stdin
+while IFS= read -r line; do
+  [ "${FAKE_SSH_MODE:-}" != fail ] || { echo "fake sftp: failing as asked" >&2; exit 1; }
+  if [[ $line =~ ^put\ \"([^\"]*)\"\ ([^\ ]+)$ ]]; then
+    cp -- "${BASH_REMATCH[1]}" "$ROOT/${BASH_REMATCH[2]}" || exit 1
+    [ "${FAKE_SSH_MODE:-}" != corrupt ] || printf x | dd of="$ROOT/${BASH_REMATCH[2]}" bs=1 count=1 conv=notrunc status=none
+  elif [[ $line =~ ^get\ ([^\ ]+)\ \"([^\"]*)\"$ ]]; then cat -- "$ROOT/${BASH_REMATCH[1]}" > "${BASH_REMATCH[2]}" || exit 1
+  else echo "fake sftp: unknown command: $line" >&2; exit 1; fi
+done < "$batch"

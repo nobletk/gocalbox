@@ -227,7 +227,7 @@ func TestASessionWithCrashesAndSeeks(t *testing.T) {
 	repo, _ := filepath.Abs(filepath.Join("..", ".."))
 	matrix := filepath.Join(t.TempDir(), "m.txt")
 	write(t, matrix, `server s
-cell kill  s engine size=17M fault=kill fault-at=0.5 retry-for=1m
+cell kill  s engine size=129M fault=kill fault-at=0.5 retry-for=1m
 cell seek  s seek size=1M seeks=5 chunk=64K transport=https-h1
 cell seek2 s seek size=256K seeks=5 chunk=200K
 `)
@@ -380,7 +380,7 @@ func TestASessionCutsTheNetworkThroughNetcut(t *testing.T) {
 	os.Chmod(netcut, 0o755)
 	repo, _ := filepath.Abs(filepath.Join("..", ".."))
 	matrix := filepath.Join(t.TempDir(), "m.txt")
-	write(t, matrix, "server s\ncell cut s engine size=17M fault=cut fault-at=0.5 retry-for=1m cut-for=7\n")
+	write(t, matrix, "server s\ncell cut s engine size=129M fault=cut fault-at=0.5 retry-for=1m cut-for=7\n")
 	env := []string{"BENCH_DIR=" + client, "SERVER_SSH=bench@server", "SERVER_HOST=127.0.0.1", "SERVER_BENCH=" + server, "SERVER_REPO=" + repo,
 		"PORT=18474", "REPS=1", "WARMUP=1", "DROP_CACHES=0", "IPERF=0", "CELLS=", "NETCUT=" + netcut}
 	out, ok := scriptArgs(t, []string{"session.sh", matrix}, bin, env...)

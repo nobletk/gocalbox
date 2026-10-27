@@ -1,6 +1,7 @@
 # Session 1: loopback, Linux, on PC A (X1, X2, X3, X5, X6 of the benchmark plan).
 # Run on PC A without SERVER_SSH; the client and the server share the machine.
-# X1's and X5's baselines (tusd, SFTP, scp) come with M8a-2.
+# X1's baselines (tusd, SFTP and scp) need tusd and OpenSSH (bench/README.md); run them with
+# the rest of X1, CELLS=x1-, so that the engine and the baselines share the session.
 #
 # PRE_M6 names the commit before M6 (bench/README.md says how to find it).
 
@@ -10,6 +11,8 @@ server h2-bench BUILD_TAGS=bench
 server h2-128k BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=128K
 server h2-448k BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=448K
 server h2-1m BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=1M GOCALBOX_BENCH_H2_CONN_WINDOW=16M
+server tusd KIND=tusd
+server sshd KIND=sshd
 
 # X1: the server's capacity on our own paths, uploads and downloads, over both protocols.
 cell x1-engine-h2-1M   default engine   transport=https-h2 size=1M
@@ -37,6 +40,41 @@ cell x1-down-h1-5G     default download transport=https-h1 size=5G
 cell x1-batch-c1       default batch    transport=https-h2 conc=1
 cell x1-batch-c4       default batch    transport=https-h2 conc=4
 cell x1-batch-c16      default batch    transport=https-h2 conc=16
+
+# X1's baselines. The tus core protocol sends one request at a time, so the engine is
+# measured with one part in flight as well as its 4; tus sends PATCHes of the engine's part
+# size, or the whole file in one, as tus-js-client does by default. sftp and scp use OpenSSH's
+# default cipher; the batch is 100 files in one sftp session.
+cell x1-engine-p1-h2-1M   default engine   transport=https-h2 size=1M parallel=1
+cell x1-engine-p1-h2-64M  default engine   transport=https-h2 size=64M parallel=1
+cell x1-engine-p1-h2-1G   default engine   transport=https-h2 size=1G parallel=1
+cell x1-engine-p1-h2-5G   default engine   transport=https-h2 size=5G parallel=1
+cell x1-engine-p1-h1-1M   default engine   transport=https-h1 size=1M parallel=1
+cell x1-engine-p1-h1-64M  default engine   transport=https-h1 size=64M parallel=1
+cell x1-engine-p1-h1-1G   default engine   transport=https-h1 size=1G parallel=1
+cell x1-engine-p1-h1-5G   default engine   transport=https-h1 size=5G parallel=1
+cell x1-tus-h2-1M         tusd    tus      transport=https-h2 size=1M
+cell x1-tus-h2-64M        tusd    tus      transport=https-h2 size=64M
+cell x1-tus-h2-1G         tusd    tus      transport=https-h2 size=1G
+cell x1-tus-h2-5G         tusd    tus      transport=https-h2 size=5G
+cell x1-tus-h1-1M         tusd    tus      transport=https-h1 size=1M
+cell x1-tus-h1-64M        tusd    tus      transport=https-h1 size=64M
+cell x1-tus-h1-1G         tusd    tus      transport=https-h1 size=1G
+cell x1-tus-h1-5G         tusd    tus      transport=https-h1 size=5G
+cell x1-tus-whole-h2-1G   tusd    tus      transport=https-h2 size=1G chunk=0
+cell x1-tus-whole-h2-5G   tusd    tus      transport=https-h2 size=5G chunk=0
+cell x1-sftp-1M           sshd    sftp-put size=1M
+cell x1-sftp-64M          sshd    sftp-put size=64M
+cell x1-sftp-1G           sshd    sftp-put size=1G
+cell x1-sftp-5G           sshd    sftp-put size=5G
+cell x1-scp-1M            sshd    scp-put  size=1M
+cell x1-scp-64M           sshd    scp-put  size=64M
+cell x1-scp-1G            sshd    scp-put  size=1G
+cell x1-scp-5G            sshd    scp-put  size=5G
+cell x1-sftp-down-64M     sshd    sftp-get size=64M
+cell x1-sftp-down-1G      sshd    sftp-get size=1G
+cell x1-sftp-down-5G      sshd    sftp-get size=5G
+cell x1-sftp-batch        sshd    sftp-put size=1M files=100
 
 # X2: what the guarantees cost. Auditing, in process: the default, every part recorded,
 # and changes answered before their records are on disk. Then M6's staging and flush:

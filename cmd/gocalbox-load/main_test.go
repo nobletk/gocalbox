@@ -165,27 +165,34 @@ func TestParseSize(t *testing.T) {
 
 func TestEachModeTakesOnlyItsFlags(t *testing.T) {
 	for _, c := range []struct {
-		set       []string
-		remote    bool
-		transport string
-		want      string
+		set         []string
+		remote, tus bool
+		transport   string
+		want        string
 	}{
-		{nil, false, "https-h2", ""},
-		{[]string{"bench-dir", "audit-wait", "audit-parts", "min-free-mb", "users", "csv", "resume-at", "retry-for"}, false, "https-h2", ""},
-		{[]string{"url", "ca", "transport", "user-prefix", "users", "csv", "resume-at", "retry-for"}, true, "https-h1", ""},
-		{[]string{"ca"}, false, "https-h2", "-ca: only for -url"},
-		{[]string{"transport", "user-prefix"}, false, "https-h1", "-transport, -user-prefix: only for -url"},
-		{[]string{"bench-dir"}, true, "https-h2", "-bench-dir: only for the in-process mode; set them on the server"},
-		{[]string{"audit-wait", "audit-parts", "min-free-mb"}, true, "https-h2", "-audit-wait, -audit-parts, -min-free-mb: only for the in-process mode; set them on the server"},
-		{[]string{"transport"}, true, "h2", `-transport must be https-h2 or https-h1, not "h2"`},
+		{nil, false, false, "https-h2", ""},
+		{[]string{"bench-dir", "audit-wait", "audit-parts", "min-free-mb", "users", "files", "size", "parallel", "csv", "resume-at", "retry-for", "reps"}, false, false, "https-h2", ""},
+		{[]string{"url", "ca", "transport", "user-prefix", "users", "files", "size", "parallel", "fault-at", "fault-cmd", "csv", "resume-at", "retry-for"}, true, false, "https-h1", ""},
+		{[]string{"tus", "ca", "transport", "file", "chunk", "csv", "resume-at", "retry-for", "reps"}, false, true, "https-h1", ""},
+		{[]string{"ca"}, false, false, "https-h2", "-ca: only for -url and -tus"},
+		{[]string{"transport", "user-prefix"}, false, false, "https-h1", "-transport: only for -url and -tus; -user-prefix: only for -url"},
+		{[]string{"bench-dir"}, true, false, "https-h2", "-bench-dir: only for the in-process mode; set them on the server"},
+		{[]string{"audit-wait", "audit-parts", "min-free-mb"}, true, false, "https-h2", "-audit-wait, -audit-parts, -min-free-mb: only for the in-process mode; set them on the server"},
+		{[]string{"file", "chunk"}, true, false, "https-h2", "-file, -chunk: only for -tus"},
+		{[]string{"chunk"}, false, false, "https-h2", "-chunk: only for -tus"},
+		{[]string{"bench-dir", "users", "size", "user-prefix", "fault-at"}, false, true, "https-h2",
+			"-bench-dir: only for the in-process mode; -users, -size: only for the in-process mode and -url; -user-prefix, -fault-at: only for -url"},
+		{nil, true, true, "https-h2", "-url and -tus: choose one server"},
+		{[]string{"transport"}, true, false, "h2", `-transport must be https-h2 or https-h1, not "h2"`},
+		{[]string{"transport"}, false, true, "h1", `-transport must be https-h2 or https-h1, not "h1"`},
 	} {
 		set := map[string]bool{}
 		for _, f := range c.set {
 			set[f] = true
 		}
-		err := checkModes(set, c.remote, c.transport)
+		err := checkModes(set, c.remote, c.tus, c.transport)
 		if got := fmt.Sprint(err); c.want == "" && err != nil || c.want != "" && got != c.want {
-			t.Errorf("%v, remote %v, %s: %v, want %q", c.set, c.remote, c.transport, err, c.want)
+			t.Errorf("%v, remote %v, tus %v, %s: %v, want %q", c.set, c.remote, c.tus, c.transport, err, c.want)
 		}
 	}
 }
@@ -517,7 +524,7 @@ func TestTheCommandRefuses(t *testing.T) {
 		{[]string{"-url", f.srv.URL, "-ca", filepath.Join(dir, "missing.crt")}, "pw\n", "missing.crt"},
 		{[]string{"-size", "1T"}, "", "invalid flags"},
 		{[]string{"-users", "0"}, "", "invalid flags"},
-		{[]string{"-ca", f.caFile}, "", "-ca: only for -url"},
+		{[]string{"-ca", f.caFile}, "", "-ca: only for -url and -tus"},
 		{append(remote, "-fault-at", "1", "-fault-cmd", "true"), "pw\n", "-fault-at must be at least 0 and below 1"},
 		{append(remote, "-fault-at", "NaN", "-fault-cmd", "true"), "pw\n", "-fault-at must be"},
 		{append(remote, "-fault-at", "0.5"), "pw\n", "given with -fault-cmd"},
@@ -560,5 +567,131 @@ func TestTheLogLineSaysWhatTheEngineDid(t *testing.T) {
 	want := "the engine: 1 parts, 2 duplicates, refused busy 3 (4 waits ran out, 5 found the queue full), too_many_requests 6, too_many_uploads 7; 8 parts waited for a slot, 9ms in all"
 	if got != want {
 		t.Errorf("%s\nwant %s", got, want)
+	}
+}
+
+// tusServer is a tus server that takes uploads whole, and records the
+// length of each PATCH and its protocol.
+type tusServer struct {
+	srv     *httptest.Server
+	caFile  string
+	mu      sync.Mutex
+	held    map[string]int64
+	patches []string
+}
+
+func newTusServer(t *testing.T) *tusServer {
+	f := &tusServer{held: map[string]int64{}}
+	n := 0
+	f.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		switch r.Method {
+		case http.MethodPost:
+			n++
+			id := fmt.Sprintf("/files/u%d", n)
+			f.held[id] = 0
+			w.Header().Set("Location", id)
+			w.WriteHeader(http.StatusCreated)
+		case http.MethodHead:
+			w.Header().Set("Upload-Offset", fmt.Sprint(f.held[r.URL.Path]))
+		case http.MethodPatch:
+			got, _ := io.Copy(io.Discard, r.Body)
+			f.held[r.URL.Path] += got
+			f.patches = append(f.patches, fmt.Sprintf("%s %d", r.Proto, got))
+			w.Header().Set("Upload-Offset", fmt.Sprint(f.held[r.URL.Path]))
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	f.srv.EnableHTTP2 = true
+	f.srv.StartTLS()
+	t.Cleanup(f.srv.Close)
+	f.caFile = filepath.Join(t.TempDir(), "ca.crt")
+	os.WriteFile(f.caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: f.srv.Certificate().Raw}), 0o644)
+	return f
+}
+
+// With -tus the file goes to the tus server in PATCHes of the engine's part
+// size, or of -chunk, once per repetition, each with its row.
+func TestTheTusMode(t *testing.T) {
+	f := newTusServer(t)
+	src := filepath.Join(t.TempDir(), "src.bin")
+	size := transfer.PartSize(9<<20) + 1<<20
+	if err := os.WriteFile(src, make([]byte, size), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	csv := filepath.Join(t.TempDir(), "out.csv")
+	base := []string{"-tus", f.srv.URL + "/files/", "-ca", f.caFile, "-file", src, "-csv", csv}
+	if err := run(append(base, "-reps", "2"), strings.NewReader(""), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	part := transfer.PartSize(size)
+	want := []string{fmt.Sprintf("HTTP/2.0 %d", part), fmt.Sprintf("HTTP/2.0 %d", size-part)}
+	want = append(want, want...)
+	if fmt.Sprint(f.patches) != fmt.Sprint(want) {
+		t.Errorf("PATCHes %q, want %q", f.patches, want)
+	}
+	f.patches = nil
+	if err := run(append(base, "-reps", "1", "-chunk", "0", "-transport", "https-h1", "-retry-for", "1s"), strings.NewReader(""), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{fmt.Sprintf("HTTP/1.1 %d", size)}; fmt.Sprint(f.patches) != fmt.Sprint(want) {
+		t.Errorf("PATCHes %q, want %q", f.patches, want)
+	}
+	f.patches = nil
+	if err := run(append(base, "-reps", "1", "-chunk", "4M", "-resume-at", "0.5"), strings.NewReader(""), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(csv)
+	rows := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if rows[0] != load.Header || len(rows) != 5 {
+		t.Fatalf("rows %q", rows)
+	}
+	header := strings.Split(load.Header, ",")
+	for i, want := range []struct{ scenario, rep, transport, resumed string }{
+		{"tus_upload", "1", "https-h2", "0"}, {"tus_upload", "2", "https-h2", "0"}, {"tus_upload", "1", "https-h1", "0"},
+		{"tus_upload_resume50", "1", "https-h2", "1"},
+	} {
+		row := strings.Split(rows[i+1], ",")
+		col := func(name string) string { return row[slices.Index(header, name)] }
+		if col("scenario") != want.scenario || col("rep") != want.rep || col("transport") != want.transport || col("resumed") != want.resumed ||
+			col("size_bytes") != fmt.Sprint(size) || col("files") != "1" || col("concurrency") != "1" || col("http_code") != "201" {
+			t.Errorf("row %d: %s", i+1, rows[i+1])
+		}
+	}
+	if n := len(f.patches); n != 3 {
+		t.Errorf("%d PATCHes of 4 MiB, want 3", n)
+	}
+}
+
+func TestTheTusModeRefuses(t *testing.T) {
+	f := newTusServer(t)
+	src := filepath.Join(t.TempDir(), "src.bin")
+	os.WriteFile(src, []byte("data"), 0o644)
+	csv := filepath.Join(t.TempDir(), "out.csv")
+	base := []string{"-tus", f.srv.URL + "/files/", "-ca", f.caFile, "-csv", csv}
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{base, "-tus needs -file"},
+		{append(base, "-file", src+".missing"), "no such file"},
+		{append(base, "-file", src, "-chunk", "x"), "-chunk \"x\""},
+		{append(base, "-file", src, "-chunk", "0", "-resume-at", "0.5"), "-resume-at needs chunks"},
+		{append(base, "-file", src, "-users", "2"), "-users: only for the in-process mode and -url"},
+		{append(base, "-file", src, "-url", f.srv.URL), "choose one server"},
+		{append(base, "-file", src, "-transport", "h2"), "-transport must be"},
+		{[]string{"-file", src}, "-file: only for -tus"},
+		{append(base, "-file", src, "-tus", "http://x/files/"), "https://host:port/path"},
+	} {
+		if err := run(c.args, strings.NewReader(""), io.Discard); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q: %v, want %q", c.args, err, c.want)
+		}
+	}
+	if len(f.patches) != 0 {
+		t.Errorf("a refused run sent %q", f.patches)
+	}
+	if b, _ := os.ReadFile(csv); strings.Count(string(b), "\n") > 1 {
+		t.Errorf("a refused run wrote rows: %q", b)
 	}
 }

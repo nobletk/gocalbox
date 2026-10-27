@@ -1,0 +1,14 @@
+#!/bin/bash
+# A stand-in for scp, as fake sftp: it copies one local file to the server, with FAKE_SSH_MODE.
+. "$(dirname "$0")/fakessh.sh"
+while [ $# -gt 2 ]; do
+  case $1 in
+    -F) conf=$2; shift 2 ;;
+    -q) shift ;;
+    *) echo "fake scp: unknown option $1" >&2; exit 2 ;;
+  esac
+done
+login "${2%%:*}"
+[ "${FAKE_SSH_MODE:-}" != fail ] || { echo "fake scp: failing as asked" >&2; exit 1; }
+cp -- "$1" "$ROOT/${2#*:}"
+[ "${FAKE_SSH_MODE:-}" != corrupt ] || printf x | dd of="$ROOT/${2#*:}" bs=1 count=1 conv=notrunc status=none

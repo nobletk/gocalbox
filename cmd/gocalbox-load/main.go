@@ -11,6 +11,10 @@
 // command reads from standard input. What they uploaded is deleted after
 // each repetition. The CSV names the commit of this tree, which should
 // then be the server's. Run it from the repository root.
+//
+// With -tus, it uploads the file -file to a tus server, such as tusd, with
+// the core protocol: one PATCH at a time, of -chunk bytes, with no login.
+// What it uploaded stays on the server.
 package main
 
 import (
@@ -71,6 +75,9 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	retryFor := fl.Duration("retry-for", 0, "Try calls that get no answer, or find the server shutting down, again for up to this long, such as 2m; 0 ends the file at once")
 	faultAt := fl.Float64("fault-at", 0, "With -url: run -fault-cmd once in each repetition, as soon as a file has this share of its parts in, such as 0.5, while the parts go on")
 	faultCmd := fl.String("fault-cmd", "", "With -fault-at: the command to run, with bash -c, such as one that kills the server and starts it again")
+	tusURL := fl.String("tus", "", "Upload -file to the tus server whose uploads are created at this address, such as https://localhost:18080/files/, rather than to gocalbox")
+	file := fl.String("file", "", "With -tus: the file to upload")
+	chunk := fl.String("chunk", "", "With -tus: the bytes of each PATCH, with K, M or G, or 0 for the whole file in one; by default the part size the engine uses for the file")
 	header := fl.Bool("header", false, "Print the CSV file's first line and exit")
 	if err := fl.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -98,11 +105,15 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	}
 	set := map[string]bool{}
 	fl.Visit(func(f *flag.Flag) { set[f.Name] = true })
-	if err := checkModes(set, *url != "", *transport); err != nil {
+	if err := checkModes(set, *url != "", *tusURL != "", *transport); err != nil {
 		return err
 	}
 	if err := benchmode.Init(); err != nil {
 		return err
+	}
+	if *tusURL != "" {
+		return runTus(tusOptions{endpoint: *tusURL, ca: *ca, transport: *transport, file: *file, chunk: *chunk,
+			resumeAt: *resumeAt, retryFor: *retryFor, reps: *reps, csv: *csvPath})
 	}
 	var bench *lib.Folder
 	if *url == "" {
@@ -214,21 +225,53 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	return nil
 }
 
-// checkModes refuses the flags of the mode not chosen, which would go
+// modeFlags lists the flags that only some modes take, in the order their
+// errors name them, with those modes: i is the in-process mode, u -url and
+// t -tus.
+var modeFlags = []struct{ name, modes string }{
+	{"bench-dir", "i"}, {"audit-wait", "i"}, {"audit-parts", "i"}, {"min-free-mb", "i"},
+	{"users", "iu"}, {"files", "iu"}, {"size", "iu"}, {"parallel", "iu"},
+	{"ca", "ut"}, {"transport", "ut"}, {"user-prefix", "u"}, {"fault-at", "u"}, {"fault-cmd", "u"},
+	{"file", "t"}, {"chunk", "t"},
+}
+
+var modeNames = map[string]string{
+	"i": "the in-process mode", "iu": "the in-process mode and -url", "ut": "-url and -tus", "u": "-url", "t": "-tus",
+}
+
+// checkModes refuses the flags of the modes not chosen, which would go
 // unused without a word.
-func checkModes(set map[string]bool, remote bool, transport string) error {
-	other, mode := []string{"bench-dir", "audit-wait", "audit-parts", "min-free-mb"}, "the in-process mode; set them on the server"
-	if !remote {
-		other, mode = []string{"ca", "transport", "user-prefix", "fault-at", "fault-cmd"}, "-url"
+func checkModes(set map[string]bool, remote, tus bool, transport string) error {
+	if remote && tus {
+		return errors.New("-url and -tus: choose one server")
 	}
-	var named []string
-	for _, f := range other {
-		if set[f] {
-			named = append(named, "-"+f)
+	mode := "i"
+	switch {
+	case remote:
+		mode = "u"
+	case tus:
+		mode = "t"
+	}
+	var groups []string
+	named := map[string][]string{}
+	for _, f := range modeFlags {
+		if set[f.name] && !strings.Contains(f.modes, mode) {
+			if named[f.modes] == nil {
+				groups = append(groups, f.modes)
+			}
+			named[f.modes] = append(named[f.modes], "-"+f.name)
 		}
 	}
-	if len(named) > 0 {
-		return fmt.Errorf("%s: only for %s", strings.Join(named, ", "), mode)
+	var errs []string
+	for _, g := range groups {
+		e := fmt.Sprintf("%s: only for %s", strings.Join(named[g], ", "), modeNames[g])
+		if g == "i" && remote {
+			e += "; set them on the server"
+		}
+		errs = append(errs, e)
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
 	}
 	if transport != "https-h2" && transport != "https-h1" {
 		return fmt.Errorf("-transport must be https-h2 or https-h1, not %q", transport)
@@ -345,4 +388,72 @@ func runFault(cmd string) func() error {
 		log.Printf("the fault took %v", time.Since(start).Round(time.Millisecond))
 		return err
 	}
+}
+
+type tusOptions struct {
+	endpoint, ca, transport, file, chunk, csv string
+	resumeAt                                  float64
+	retryFor                                  time.Duration
+	reps                                      int
+}
+
+// runTus uploads the file to a tus server, once per repetition, and adds a
+// row for each to the CSV file.
+func runTus(o tusOptions) error {
+	if o.file == "" {
+		return errors.New("-tus needs -file, the file to upload")
+	}
+	fi, err := os.Stat(o.file)
+	if err != nil {
+		return err
+	}
+	chunk := transfer.PartSize(fi.Size())
+	if o.chunk != "" {
+		if chunk, err = parseSize(o.chunk); err != nil {
+			return fmt.Errorf("invalid flags: -chunk %q: %v", o.chunk, err)
+		}
+	}
+	if o.resumeAt > 0 && chunk == 0 {
+		return errors.New("invalid flags: -resume-at needs chunks; give -chunk above 0")
+	}
+	cfg := load.TusConfig{Server: load.Tus{Endpoint: o.endpoint, HTTP1: o.transport == "https-h1"}, File: o.file, Chunk: chunk,
+		ResumeAt: o.resumeAt, RetryFor: o.retryFor}
+	if o.ca != "" {
+		if cfg.Server.CA, err = os.ReadFile(o.ca); err != nil {
+			return err
+		}
+	}
+	commit, dirty := gitState()
+	if o.csv == "" {
+		o.csv = filepath.Join("bench", "results", fmt.Sprintf("%s-%s-load.csv", commit, time.Now().Format("20060102-150405")))
+	}
+	if err := os.MkdirAll(filepath.Dir(o.csv), 0o755); err != nil {
+		return err
+	}
+	out, err := openCSV(o.csv)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	chunkName := fmt.Sprintf("up to %d bytes", chunk)
+	if chunk == 0 {
+		chunkName = "the whole file"
+	}
+	scenario := "tus_upload"
+	if o.resumeAt > 0 {
+		scenario += fmt.Sprintf("_resume%g", o.resumeAt*100)
+	}
+	for rep := 1; rep <= o.reps; rep++ {
+		res, err := load.TusRun(context.Background(), cfg)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(out, res.Row(commit, dirty, scenario, res.Bytes, 1, rep, o.transport))
+		log.Printf("rep %d: %s in %.2fs, %.1f MiB/s, %d PATCHes answered, of %s, p50 %v p99 %v, tried again %s, resent %d bytes, CPU %v",
+			rep, res.CodeColumn(), res.Duration.Seconds(), float64(res.Bytes)/(1<<20)/res.Duration.Seconds(), len(res.Parts), chunkName,
+			res.Percentile(0.5).Round(time.Microsecond), res.Percentile(0.99).Round(time.Microsecond),
+			cmp.Or(load.Counts(res.Retried), "none"), res.Resent, res.CPU.Round(time.Millisecond))
+	}
+	log.Printf("results: %s", o.csv)
+	return nil
 }

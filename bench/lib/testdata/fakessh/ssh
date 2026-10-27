@@ -1,0 +1,4 @@
+#!/bin/bash
+# A stand-in for ssh: it prints its version.
+[ "$1" = -V ] && { echo "OpenSSH_fake client" >&2; exit 0; }
+echo "fake ssh: only -V" >&2; exit 2

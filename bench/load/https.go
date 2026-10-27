@@ -64,12 +64,9 @@ func LogIn(ctx context.Context, r Remote, names []string, password string) ([]Us
 		base.User != nil || base.RawQuery != "" || base.ForceQuery || base.Fragment != "" {
 		return nil, fmt.Errorf("the server's URL must be https://host:port, not %q", r.URL)
 	}
-	var roots *x509.CertPool
-	if r.CA != nil {
-		roots = x509.NewCertPool()
-		if !roots.AppendCertsFromPEM(r.CA) {
-			return nil, errors.New("no certificate in the CA file")
-		}
+	roots, err := rootsOf(r.CA)
+	if err != nil {
+		return nil, err
 	}
 	var users []User
 	for _, typed := range names {
@@ -77,24 +74,8 @@ func LogIn(ctx context.Context, r Remote, names []string, password string) ([]Us
 		if err != nil {
 			return nil, fmt.Errorf("user %q: %w", typed, err)
 		}
-		tr := &http.Transport{
-			TLSClientConfig:     &tls.Config{RootCAs: roots},
-			Protocols:           new(http.Protocols),
-			TLSHandshakeTimeout: 10 * time.Second,
-			// Long enough for a completion that waits for the audit log.
-			ResponseHeaderTimeout: 5 * time.Minute,
-			// Go keeps 2 idle connections per host by default: over HTTP/1.1,
-			// more parts in flight would open a new connection for most parts.
-			MaxIdleConnsPerHost: 64,
-			HTTP2:               &http.HTTP2Config{SendPingTimeout: 30 * time.Second, PingTimeout: 15 * time.Second},
-		}
-		if r.HTTP1 {
-			tr.Protocols.SetHTTP1(true)
-		} else {
-			tr.Protocols.SetHTTP2(true)
-		}
 		jar, _ := cookiejar.New(nil)
-		a := &remote{url: "https://" + base.Host, client: &http.Client{Transport: tr, Jar: jar}, open: map[string]bool{}}
+		a := &remote{url: "https://" + base.Host, client: &http.Client{Transport: newTransport(roots, r.HTTP1), Jar: jar}, open: map[string]bool{}}
 		body, _ := json.Marshal(map[string]string{"username": name, "password": password})
 		if err := a.post(ctx, "/api/auth/login", body, nil); err != nil {
 			return nil, fmt.Errorf("log in as %s: %w", name, err)
@@ -102,6 +83,41 @@ func LogIn(ctx context.Context, r Remote, names []string, password string) ([]Us
 		users = append(users, User{API: a, Dir: auth.HomeOf(name)})
 	}
 	return users, nil
+}
+
+// rootsOf parses the PEM certificates of a server's CA, or returns nil, to
+// trust the system's, for none.
+func rootsOf(ca []byte) (*x509.CertPool, error) {
+	if ca == nil {
+		return nil, nil
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(ca) {
+		return nil, errors.New("no certificate in the CA file")
+	}
+	return roots, nil
+}
+
+// newTransport is one user's way to the server, over HTTP/2, or HTTP/1.1
+// with http1.
+func newTransport(roots *x509.CertPool, http1 bool) *http.Transport {
+	tr := &http.Transport{
+		TLSClientConfig:     &tls.Config{RootCAs: roots},
+		Protocols:           new(http.Protocols),
+		TLSHandshakeTimeout: 10 * time.Second,
+		// Long enough for a completion that waits for the audit log.
+		ResponseHeaderTimeout: 5 * time.Minute,
+		// Go keeps 2 idle connections per host by default: over HTTP/1.1,
+		// more parts in flight would open a new connection for most parts.
+		MaxIdleConnsPerHost: 64,
+		HTTP2:               &http.HTTP2Config{SendPingTimeout: 30 * time.Second, PingTimeout: 15 * time.Second},
+	}
+	if http1 {
+		tr.Protocols.SetHTTP1(true)
+	} else {
+		tr.Protocols.SetHTTP2(true)
+	}
+	return tr
 }
 
 // Clean deletes the files the users uploaded over HTTPS, those whose
