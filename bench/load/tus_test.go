@@ -458,7 +458,7 @@ func TestTusRefusesAConfigurationThatCantRun(t *testing.T) {
 		{func(c *TusConfig) { c.RetryFor = -time.Second }, "negative"},
 		{func(c *TusConfig) { c.Server.CA = []byte("no pem") }, "no certificate"},
 		{func(c *TusConfig) { c.File = filepath.Dir(p) }, "no regular file"},
-		{func(c *TusConfig) { c.File += ".missing" }, "no such file"},
+		{func(c *TusConfig) { c.File += ".missing" }, "source.bin.missing"},
 	} {
 		cfg := f.config(p, 5, false)
 		c.change(&cfg)
@@ -519,10 +519,14 @@ func TestTusTriesAHeadAgain(t *testing.T) {
 	if err != nil || !bytes.Equal(got, want) || res.CodeColumn() != "201" || res.Retried["000"] != 2 || res.Stalled <= 0 {
 		t.Errorf("%v, %d bytes, result %+v", err, len(got), res)
 	}
+	// A creation whose answer is cut off is no answer, so it is tried again within RetryFor.
 	f = newFakeTus(t)
 	f.breakNext[http.MethodPost] = true
-	res, err = TusRun(context.Background(), f.config(p, 300, true))
-	if err != nil || res.CodeColumn() != "000x1" || res.Stalled <= 0 {
+	cfg = f.config(p, 300, true)
+	cfg.RetryFor = 10 * time.Second
+	res, err = TusRun(context.Background(), cfg)
+	got, _ = f.only()
+	if err != nil || !bytes.Equal(got, want) || res.CodeColumn() != "201" || res.Retried["000"] != 1 {
 		t.Errorf("a creation's answer cut off: %v, %+v", err, res)
 	}
 }

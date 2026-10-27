@@ -675,7 +675,7 @@ func TestTheTusModeRefuses(t *testing.T) {
 		want string
 	}{
 		{base, "-tus needs -file"},
-		{append(base, "-file", src+".missing"), "no such file"},
+		{append(base, "-file", src+".missing"), "src.bin.missing"},
 		{append(base, "-file", src, "-chunk", "x"), "-chunk \"x\""},
 		{append(base, "-file", src, "-chunk", "0", "-resume-at", "0.5"), "-resume-at needs chunks"},
 		{append(base, "-file", src, "-users", "2"), "-users: only for the in-process mode and -url"},
