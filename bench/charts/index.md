@@ -91,3 +91,15 @@ Sources: `session-2-lan-20261021-134011`, `session-2-lan-20261022-003044`.
 HTTP/2's two windows over Wi-Fi (session 3b), one changed at a time, for 1 GiB: the engine with 4 parts in flight and with 1, and the single-request upload, against the engine over HTTP/1.1 (dotted). Medians with interquartile whiskers. Session 3b measured one part in flight at 256K / 4M and 1M / 16M only, and the single request at 1M only; session 3 has the single request at 256K / 4M, 10.0 MiB/s (fig07).
 
 Sources: `session-3b-windows-20261022-180157`.
+
+## fig16-x1-baselines
+
+X1's uploads on loopback against the baselines, all in one session. (a) Throughput as each answers, by file size: the engine over HTTP/2 with 4 parts in flight and with 1, as tus sends one request at a time; tusd over HTTP/2 with PATCHes of the engine's 8 MiB part size, and with the whole file in one (1 and 5 GiB only); sftp and scp. The engine answers once the file and its audit record are on disk; tusd, sftp and scp flush nothing. sftp's and scp's times include starting the command and SSH's key exchange and login, about 0.13 s, which is about 40% of their time at 64 MiB, and nearly all of it in (b). (b) Time until a file of 1 MiB is on disk: the engine's own time, the others' with an fsync after them; tusd's one PATCH has no 1 MiB cell. Bars are medians of 10 runs (5 for 5 GiB); whiskers the interquartile range.
+
+Sources: `session-1-loopback-20261027-172052`.
+
+## fig17-x1-baselines-cost
+
+X1's downloads and costs on loopback against the baselines, in the session of the previous figure. (a) Downloads by file size, with the page cache dropped before each: gocalbox over HTTP/2 and HTTP/1.1, and sftp, whose times include starting the command and SSH's login, about half of its time at 64 MiB. (b) Server CPU time per GiB uploaded: the engine with 4 parts and tusd with 8 MiB PATCHes, both over HTTP/2, and sftp; sshd's includes its sessions' processes. Bars are medians of 10 runs (5 for 5 GiB); whiskers the interquartile range.
+
+Sources: `session-1-loopback-20261027-172052`.

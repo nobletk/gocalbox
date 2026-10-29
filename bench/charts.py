@@ -87,6 +87,7 @@ SESSIONS = {
     "x6loop": ("session-1-loopback-20261026-131827", "loopback after M9"),
     "x7lan": ("session-2-lan-20261023-113117", "LAN (X7/X8)"),
     "x7wifi": ("session-2-lan-20261023-124658", "Wi-Fi (X7/X8)"),
+    "x1b": ("session-1-loopback-20261027-172052", "loopback, X1 with its baselines"),
 }
 
 # Runs the session reports set apart, by their place in the session's order.
@@ -203,10 +204,12 @@ class NoData(Exception):
     """A panel would be drawn empty: its session lacks the cells."""
 
 
-def bars(ax, groups, series, data, ylabel, first_colour=0):
+def bars(ax, groups, series, data, ylabel, first_colour=0, colours=None):
     """Grouped bars of medians with interquartile whiskers. data maps
     (group, series) to the run values; a missing pair leaves a gap, and a
-    panel with no values at all is refused."""
+    panel with no values at all is refused. colours, when given, picks each
+    series' colour and hatch: an index in COLOURS, or a (colour, hatch)
+    pair."""
     width = 0.8 / max(1, len(series))
     x = np.arange(len(groups))
     used = []
@@ -223,10 +226,10 @@ def bars(ax, groups, series, data, ylabel, first_colour=0):
             hi.append(q3 - m)
         if not xs:
             continue
-        c = (first_colour + i) % len(COLOURS)
+        c = colours[i] if colours is not None else (first_colour + i) % len(COLOURS)
+        colour, hatch = c if isinstance(c, tuple) else (COLOURS[c], HATCHES[c % len(HATCHES)])
         ax.bar(xs, meds, width * 0.92, yerr=[lo, hi], capsize=2, label=s,
-               color=COLOURS[c], hatch=HATCHES[c % len(HATCHES)],
-               edgecolor="white" if HATCHES[c % len(HATCHES)] == "" else "#333333", linewidth=0.5,
+               color=colour, hatch=hatch, edgecolor="white" if hatch == "" else "#333333", linewidth=0.5,
                error_kw={"elinewidth": 0.8})
         used.append(s)
     if not used:
@@ -304,13 +307,9 @@ def fig_x1_downloads(S):
     return fig, [s]
 
 
-@figure("fig03-x1-cpu", ["s1"],
-        "Server CPU time per GiB uploaded on loopback, by path, for files of 1 and 5 GiB. Medians with "
-        "interquartile whiskers.")
-def fig_x1_cpu(S):
-    s = S["s1"]
-    paths = [("engine-h2", "engine, HTTP/2"), ("engine-h1", "engine, HTTP/1.1"),
-             ("single-h2", "single, HTTP/2"), ("single-h1", "single, HTTP/1.1")]
+def cpu_per_gib(s, paths):
+    """Each X1 run's server CPU seconds per GiB uploaded, for files of 1 and 5 GiB, by (size, label) of the
+    (cell key, label) paths."""
     data = {}
     for sz in ("1G", "5G"):
         for key, label in paths:
@@ -320,6 +319,17 @@ def fig_x1_cpu(S):
                 if cpu is not None and size:
                     vals.append(cpu / (size * files / GiB))
             data[(size_label("x-" + sz), label)] = vals
+    return data
+
+
+@figure("fig03-x1-cpu", ["s1"],
+        "Server CPU time per GiB uploaded on loopback, by path, for files of 1 and 5 GiB. Medians with "
+        "interquartile whiskers.")
+def fig_x1_cpu(S):
+    s = S["s1"]
+    paths = [("engine-h2", "engine, HTTP/2"), ("engine-h1", "engine, HTTP/1.1"),
+             ("single-h2", "single, HTTP/2"), ("single-h1", "single, HTTP/1.1")]
+    data = cpu_per_gib(s, paths)
     fig, ax = plt.subplots(figsize=(5.0, 2.8))
     bars(ax, ["1 GiB", "5 GiB"], [p[1] for p in paths], data, "server CPU s per GiB")
     ax.set_xlabel("file size")
@@ -714,6 +724,78 @@ def fig_3b(S):
 
 
 # --- running -----------------------------------------------------------------
+
+# X1's paths against the baselines, over HTTP/2 where they speak HTTP: the cell's key, its label, and its colour,
+# which it keeps in both of their figures.
+BASELINE_UPLOADS = [("engine-h2", "gocalbox engine, 4 parts", 0), ("engine-p1-h2", "gocalbox engine, 1 part", 1),
+                    ("tus-h2", "tusd, 8 MiB PATCHes", 2), ("tus-whole-h2", "tusd, one PATCH", 3),
+                    ("sftp", "sftp", 4), ("scp", "scp", 5)]
+# The downloads take hatches no upload series has, and no black, which would hide the whiskers; gocalbox's download over
+# HTTP/2 shares the engine's blue.
+BASELINE_DOWNLOADS = [("down-h2", "gocalbox download, HTTP/2", (COLOURS[0], "--")),
+                      ("down-h1", "gocalbox download, HTTP/1.1", (COLOURS[7], "++")), ("sftp-down", "sftp", 4)]
+STARTUP = ("sftp's and scp's times include starting the command and SSH's key exchange and login, about 0.13 s, "
+           "which is about 40% of their time at 64 MiB")
+
+
+def durable_ms(rows):
+    """Each run's time until its file is on disk, in ms: the engine's own, as it answers only then; the others' with an
+    fsync after them."""
+    out = []
+    for r in rows:
+        t = num(r.get("durable_upper_seconds"))
+        if t is not None:
+            out.append(t * 1000)
+    return out
+
+
+@figure("fig16-x1-baselines", ["x1b"],
+        "X1's uploads on loopback against the baselines, all in one session. (a) Throughput as each answers, by "
+        "file size: the engine over HTTP/2 with 4 parts in flight and with 1, as tus sends one request at a "
+        "time; tusd over HTTP/2 with PATCHes of the engine's 8 MiB part size, and with the whole file in one (1 and "
+        "5 GiB only); sftp and scp. The engine answers once the file and its audit record are on disk; tusd, sftp "
+        "and scp flush nothing. " + STARTUP + ", and nearly all of it in (b). (b) Time until a file of 1 MiB is on disk: the engine's own time, "
+        "the others' with an fsync after them; tusd's one PATCH has no 1 MiB cell. Bars are medians of 10 runs (5 "
+        "for 5 GiB); whiskers the interquartile range.")
+def fig_x1_baselines(S):
+    s = S["x1b"]
+    fig, (a, b) = plt.subplots(1, 2, figsize=(6.3, 3.2), gridspec_kw={"width_ratios": [3, 1.4]})
+    labels, colours = [p[1] for p in BASELINE_UPLOADS], [p[2] for p in BASELINE_UPLOADS]
+    sizes = ["64M", "1G", "5G"]
+    data = {(size_label("x-" + z), label): s.values(f"x1-{key}-{z}", "mib_per_s") for z in sizes for key, label, _ in BASELINE_UPLOADS}
+    bars(a, [size_label("x-" + z) for z in sizes], labels, data, "MiB/s", colours=colours)
+    a.set_title("(a) uploads", loc="left")
+    a.set_xlabel("file size")
+    data = {("1 MiB", label): durable_ms(s.cell(f"x1-{key}-1M")) for key, label, _ in BASELINE_UPLOADS}
+    bars(b, ["1 MiB"], labels, data, "ms until on disk", colours=colours)
+    b.set_title("(b) one file of 1 MiB", loc="left")
+    legend_below(fig, [a], ncol=3)
+    return fig, [s]
+
+
+@figure("fig17-x1-baselines-cost", ["x1b"],
+        "X1's downloads and costs on loopback against the baselines, in the session of the previous figure. (a) "
+        "Downloads by file size, with the page cache dropped before each: gocalbox over HTTP/2 and HTTP/1.1, and "
+        "sftp, whose times include starting the command and SSH's login, about half of its time at 64 MiB. (b) "
+        "Server CPU time per GiB uploaded: the engine with 4 parts and tusd with 8 MiB PATCHes, both over HTTP/2, "
+        "and sftp; sshd's includes its sessions' processes. Bars are medians of 10 runs (5 for 5 GiB); whiskers "
+        "the interquartile range.")
+def fig_x1_baselines_cost(S):
+    s = S["x1b"]
+    fig, (a, b) = plt.subplots(1, 2, figsize=(6.3, 3.0), gridspec_kw={"width_ratios": [3, 2]})
+    sizes = ["64M", "1G", "5G"]
+    data = {(size_label("x-" + z), label): s.values(f"x1-{key}-{z}", "mib_per_s") for z in sizes for key, label, _ in BASELINE_DOWNLOADS}
+    bars(a, [size_label("x-" + z) for z in sizes], [p[1] for p in BASELINE_DOWNLOADS], data, "MiB/s",
+         colours=[p[2] for p in BASELINE_DOWNLOADS])
+    a.set_title("(a) downloads", loc="left")
+    a.set_xlabel("file size")
+    paths = [p for p in BASELINE_UPLOADS if p[0] in ("engine-h2", "tus-h2", "sftp")]
+    data = cpu_per_gib(s, [p[:2] for p in paths])
+    bars(b, ["1 GiB", "5 GiB"], [p[1] for p in paths], data, "server CPU s per GiB", colours=[p[2] for p in paths])
+    b.set_title("(b) server CPU, uploads", loc="left")
+    b.set_xlabel("file size")
+    legend_below(fig, [a, b], ncol=3)
+    return fig, [s]
 
 
 def save(fig, out, name, formats):

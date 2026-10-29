@@ -435,6 +435,8 @@ S1, S2, S3 = "session-1-loopback-20261021-113623", "session-2-lan-20261021-13401
 S3B, X13 = "session-3b-windows-20261022-180157", "session-13-swap-20261022-152333"
 X6LAN, X6LOOP = "session-2-lan-20261022-160558", "session-1-loopback-20261026-131827"
 X7LAN, X7WIFI = "session-2-lan-20261023-113117", "session-2-lan-20261023-124658"
+X1B = "session-1-loopback-20261027-172052"
+HAVE_X1B = os.path.exists(os.path.join(RESULTS, X1B + ".csv"))
 
 
 @unittest.skipUnless(os.path.exists(os.path.join(RESULTS, X6LOOP + ".csv")), "the repository's results aren't here")
@@ -504,7 +506,9 @@ class TheRealResults(unittest.TestCase):
     def test_a_figures_bar_series_differ_in_colour(self):
         from matplotlib.colors import to_hex
         from matplotlib.container import BarContainer
-        for name, _, _, _ in charts.FIGURES:
+        for name, needs, _, _ in charts.FIGURES:
+            if any(self.S.get(k) is None for k in needs):
+                continue
             with self.subTest(name):
                 fig = self.draw(name)
                 looks = {}
@@ -664,8 +668,185 @@ class TheRealResults(unittest.TestCase):
         out = tempfile.mkdtemp()
         code, text, _ = run("--results", RESULTS, "--out", out, "--formats", "png")
         self.assertEqual(code, 0)
-        self.assertIn(f"{len(charts.FIGURES)} figures in", text)
-        self.assertNotIn("skipped", text)
+        here = [n for n, needs, _, _ in charts.FIGURES if all(self.S.get(k) is not None for k in needs)]
+        self.assertIn(f"{len(here)} figures in", text)
+        self.assertEqual(text.count(": skipped,"), len(charts.FIGURES) - len(here))
+        if HAVE_X1B:
+            with open(os.path.join(out, "index.md")) as f:
+                index = f.read()
+            for name in ("fig16-x1-baselines", "fig17-x1-baselines-cost"):
+                section = index[index.index(f"## {name}"):]
+                section = section[:section.index("\n## ")] if "\n## " in section else section
+                self.assertIn(X1B, section)
+
+    @unittest.skipUnless(HAVE_X1B, "the session of X1's baselines isn't here")
+    def test_fig16(self):
+        fig = self.draw("fig16-x1-baselines")
+        a, b = fig.axes
+        upload = [("engine-h2", "gocalbox engine, 4 parts"), ("engine-p1-h2", "gocalbox engine, 1 part"),
+                  ("tus-h2", "tusd, 8 MiB PATCHes"), ("sftp", "sftp"), ("scp", "scp")]
+        for key, label in upload:
+            # The three sizes of (a), then the 1 MiB file of (b), in ms until it is on disk.
+            want = [med(X1B, f"x1-{key}-{z}") for z in ("64M", "1G", "5G")]
+            want.append(med(X1B, f"x1-{key}-1M", transform=lambda r: float(r["durable_upper_seconds"]) * 1000))
+            self.assertSeries(bar_heights(fig, label), want)
+        self.assertSeries(bar_heights(fig, "tusd, one PATCH"), [med(X1B, f"x1-tus-whole-h2-{z}") for z in ("1G", "5G")])
+        for g, w in zip(whiskers(fig, "sftp")[:3], [quartiles(X1B, f"x1-sftp-{z}") for z in ("64M", "1G", "5G")]):
+            self.assertAlmostEqual(g[0], w[0], places=6)
+            self.assertAlmostEqual(g[1], w[1], places=6)
+        self.assertEqual([t.get_text() for t in a.get_xticklabels()], ["64 MiB", "1 GiB", "5 GiB"])
+        self.assertEqual(b.get_ylabel(), "ms until on disk")
+        self.assertEqual((a.get_ylabel(), a.get_xlabel(), a.get_title(loc="left"), b.get_title(loc="left")),
+                         ("MiB/s", "file size", "(a) uploads", "(b) one file of 1 MiB"))
+        self.assertEqual([t.get_text() for t in fig.legends[0].get_texts()],
+                         ["gocalbox engine, 4 parts", "gocalbox engine, 1 part", "tusd, 8 MiB PATCHes", "tusd, one PATCH", "sftp", "scp"])
+
+    @unittest.skipUnless(HAVE_X1B, "the session of X1's baselines isn't here")
+    def test_fig17(self):
+        fig = self.draw("fig17-x1-baselines-cost")
+        a, b = fig.axes
+        for key, label in [("down-h2", "gocalbox download, HTTP/2"), ("down-h1", "gocalbox download, HTTP/1.1")]:
+            self.assertSeries(bar_heights(fig, label), [med(X1B, f"x1-{key}-{z}") for z in ("64M", "1G", "5G")])
+        per_gib = lambda r: float(r["server_cpu_s"]) / (int(r["size_bytes"]) * int(r["files"]) / (1 << 30))
+        # sftp's downloads in (a), then its server CPU per GiB in (b).
+        self.assertSeries(bar_heights(fig, "sftp"), [med(X1B, f"x1-sftp-down-{z}") for z in ("64M", "1G", "5G")]
+                          + [med(X1B, f"x1-sftp-{z}", transform=per_gib) for z in ("1G", "5G")])
+        for key, label in [("engine-h2", "gocalbox engine, 4 parts"), ("tus-h2", "tusd, 8 MiB PATCHes")]:
+            self.assertSeries(bar_heights(fig, label), [med(X1B, f"x1-{key}-{z}", transform=per_gib) for z in ("1G", "5G")])
+        self.assertEqual([t.get_text() for t in b.get_xticklabels()], ["1 GiB", "5 GiB"])
+        self.assertEqual((a.get_ylabel(), a.get_xlabel(), a.get_title(loc="left"), b.get_ylabel(), b.get_title(loc="left")),
+                         ("MiB/s", "file size", "(a) downloads", "server CPU s per GiB", "(b) server CPU, uploads"))
+        self.assertEqual([t.get_text() for t in fig.legends[0].get_texts()],
+                         ["gocalbox download, HTTP/2", "gocalbox download, HTTP/1.1", "sftp", "gocalbox engine, 4 parts",
+                          "tusd, 8 MiB PATCHes"])
+
+    @unittest.skipUnless(HAVE_X1B, "the session of X1's baselines isn't here")
+    def test_the_baselines_figures_give_a_path_one_look(self):
+        from matplotlib.colors import to_hex
+        from matplotlib.container import BarContainer
+        looks = {}
+        for name in ("fig16-x1-baselines", "fig17-x1-baselines-cost"):
+            for ax in self.draw(name).axes:
+                for c in ax.containers:
+                    if isinstance(c, BarContainer) and c.patches:
+                        looks.setdefault(c.get_label(), set()).add((to_hex(c.patches[0].get_facecolor()), c.patches[0].get_hatch()))
+        for lab, l in looks.items():
+            self.assertEqual(len(l), 1, lab)
+        seen = [next(iter(l)) for l in looks.values()]
+        self.assertEqual(len(seen), len(set(seen)), sorted(looks))
+        # Hatches tell series apart in greyscale print; whiskers are black, so no bar is.
+        for name in ("fig16-x1-baselines", "fig17-x1-baselines-cost"):
+            hatches, faces = {}, set()
+            for ax in self.draw(name).axes:
+                for c in ax.containers:
+                    if isinstance(c, BarContainer) and c.patches:
+                        hatches[c.get_label()] = c.patches[0].get_hatch()
+                        faces.add(to_hex(c.patches[0].get_facecolor()))
+            self.assertEqual(len(set(hatches.values())), len(hatches), (name, hatches))
+            self.assertNotIn("#000000", faces, name)
+
+    @unittest.skipUnless(HAVE_X1B, "the session of X1's baselines isn't here")
+    def test_the_baselines_reports_numbers(self):
+        self.assertEqual(round(med(X1B, "x1-tus-h2-1G")), 1107)
+        self.assertEqual(round(med(X1B, "x1-engine-p1-h2-1G")), 212)
+        self.assertEqual(round(med(X1B, "x1-engine-h2-1G")), 551)
+        self.assertEqual(round(med(X1B, "x1-sftp-1G")), 588)
+        self.assertEqual(round(med(X1B, "x1-engine-h1-5G")), 633)
+        self.assertEqual(round(med(X1B, "x1-engine-h2-1M", "durable_upper_seconds") * 1000), 66)
+        self.assertEqual(len(self.S["x1b"].rows), 480)
+        # A 1 MiB sftp upload is nearly all start-up, which the captions give as a share of the 64 MiB time.
+        for tool in ("sftp", "scp"):
+            start = med(X1B, f"x1-{tool}-1M", "seconds")
+            self.assertAlmostEqual(start, 0.13, delta=0.01)
+            self.assertAlmostEqual(start / med(X1B, f"x1-{tool}-64M", "seconds"), 0.40, delta=0.03)
+        self.assertIn("about 0.13 s, which is about 40% of their time at 64 MiB", charts.STARTUP)
+
+
+
+class TheBaselinesFigures(unittest.TestCase):
+    """fig16 and fig17 from a small session of their own, without the real results."""
+
+    CELLS = ([f"x1-{p}-{z}" for p in ("engine-h2", "engine-p1-h2", "tus-h2", "sftp", "scp") for z in ("1M", "64M", "1G", "5G")]
+             + [f"x1-tus-whole-h2-{z}" for z in ("1G", "5G")]
+             + [f"x1-{p}-{z}" for p in ("down-h2", "down-h1", "sftp-down") for z in ("64M", "1G", "5G")])
+
+    def setUp(self):
+        self.results = tempfile.mkdtemp()
+        self.out = tempfile.mkdtemp()
+        charts.style()
+
+    def write(self, cells):
+        rows = []
+        for i, c in enumerate(cells):
+            for rep in (0, 1, 2, 3):
+                rows.append(row(c, rep, 10 * (i + 1) + rep, durable_upper_seconds=0.01 * (i + 1) + 0.001 * rep,
+                                server_cpu_s=0.5 * (i + 1) + 0.1 * rep))
+        write_session(self.results, charts.SESSIONS["x1b"][0], rows)
+
+    def test_they_draw_the_session_they_name(self):
+        self.write(self.CELLS)
+        code, text, _ = run("--results", self.results, "--out", self.out, "--formats", "png")
+        self.assertEqual(code, 0)
+        self.assertNotIn("fig16-x1-baselines: skipped", text)
+        self.assertNotIn("fig17-x1-baselines-cost: skipped", text)
+        S = {"x1b": charts.load(self.results, charts.SESSIONS["x1b"][0], "x1b", "l")}
+        fn = next(f for n, _, _, f in charts.FIGURES if n == "fig16-x1-baselines")
+        fig, sources = fn(S)
+        self.addCleanup(lambda: charts.plt.close(fig))
+        self.assertEqual([x.name for x in sources], [charts.SESSIONS["x1b"][0]])
+        i = self.CELLS.index("x1-sftp-1M")
+        self.assertAlmostEqual(bar_heights(fig, "sftp")[-1], (0.01 * (i + 1) + 0.002) * 1000, places=6)
+        fig.canvas.draw()
+        rows = {round(t.get_window_extent().y0) for t in fig.legends[0].get_texts()}
+        self.assertEqual(len(rows), 2)
+        with open(os.path.join(self.out, "index.md")) as f:
+            index = f.read()
+        self.assertIn(charts.SESSIONS["x1b"][0], index)
+        # sftp's and scp's 1 MiB times are nearly all start-up, which the reader of (b) must be told.
+        self.assertIn("nearly all of it in (b)", index)
+
+    def test_a_series_given_a_colour_and_hatch_draws_with_them(self):
+        from matplotlib.colors import to_hex
+        from matplotlib.container import BarContainer
+        self.write(self.CELLS)
+        S = {"x1b": charts.load(self.results, charts.SESSIONS["x1b"][0], "x1b", "l")}
+        fn = next(f for n, _, _, f in charts.FIGURES if n == "fig17-x1-baselines-cost")
+        fig, _ = fn(S)
+        self.addCleanup(lambda: charts.plt.close(fig))
+        looks = {}
+        for c in fig.axes[0].containers:
+            if isinstance(c, BarContainer) and c.patches:
+                looks[c.get_label()] = (to_hex(c.patches[0].get_facecolor()), c.patches[0].get_hatch())
+        self.assertEqual(looks, {"gocalbox download, HTTP/2": (charts.COLOURS[0].lower(), "--"),
+                                 "gocalbox download, HTTP/1.1": (charts.COLOURS[7].lower(), "++"),
+                                 "sftp": (charts.COLOURS[4].lower(), charts.HATCHES[4])})
+        self.assertEqual([ax.get_xlabel() for ax in fig.axes], ["file size", "file size"])
+        # A hatch is drawn in the edge colour, so a hatched bar's edge is dark and a plain bar's white.
+        edges = {}
+        for ax in fig.axes:
+            for c in ax.containers:
+                if isinstance(c, BarContainer) and c.patches:
+                    edges[c.get_label()] = to_hex(c.patches[0].get_edgecolor())
+        self.assertEqual(edges["gocalbox download, HTTP/2"], "#333333")
+        self.assertEqual(edges["gocalbox engine, 4 parts"], "#ffffff")
+
+    def test_a_run_without_its_server_cpu_is_left_out(self):
+        class Session:
+            def cell(self, key):
+                return [{"server_cpu_s": "2", "size_bytes": str(1 << 30), "files": "1"},
+                        {"server_cpu_s": "", "size_bytes": str(1 << 30), "files": "1"}] if key == "x1-p-1G" else []
+        self.assertEqual(charts.cpu_per_gib(Session(), [("p", "path")]), {("1 GiB", "path"): [2.0], ("5 GiB", "path"): []})
+
+    def test_a_run_without_a_durable_time_is_left_out(self):
+        self.assertEqual(charts.durable_ms([{"durable_upper_seconds": "0.002"}, {"durable_upper_seconds": ""}, {}]), [2.0])
+
+    def test_they_are_skipped_without_their_cells(self):
+        self.write(["x2-unrelated-1G"])
+        code, text, _ = run("--results", self.results, "--out", self.out, "--formats", "png")
+        self.assertEqual(code, 0)
+        self.assertIn("fig16-x1-baselines: skipped", text)
+        self.assertIn("fig17-x1-baselines-cost: skipped", text)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "fig16-x1-baselines.png")))
 
 
 if __name__ == "__main__":
