@@ -204,7 +204,7 @@ type received struct {
 }
 
 // receive writes exactly expected bytes of body at off and makes them
-// durable.
+// durable, unless a benchmark build turned that off.
 func (e *Engine) receive(data *os.File, off, expected int64, body io.Reader) received {
 	buf := copyBufs.Get().(*[]byte)
 	defer copyBufs.Put(buf)
@@ -224,8 +224,10 @@ func (e *Engine) receive(data *os.File, off, expected int64, body io.Reader) rec
 	} else if !errors.Is(err, io.EOF) {
 		return received{body: fmt.Errorf("%w: %v", ErrPartAborted, err)}
 	}
-	if err := e.syncFile(data); err != nil {
-		return received{sync: err}
+	if e.syncPartData {
+		if err := e.syncFile(data); err != nil {
+			return received{sync: err}
+		}
 	}
 	return received{sum: hexSum(h)}
 }
@@ -284,7 +286,7 @@ func (e *Engine) finishPart(ctx context.Context, s *session, req PartRequest, ex
 		return PartResult{}, e.refusePart(ctx, s, req.N, refusal)
 	}
 	e.at("written")
-	if err := e.appendLine(s, line{Op: opPart, N: req.N, SHA256: got.sum, IP: clientAddr(ctx)}, true); errors.Is(err, space.ErrInsufficient) {
+	if err := e.appendLine(s, line{Op: opPart, N: req.N, SHA256: got.sum, IP: clientAddr(ctx)}, e.syncPartLog); errors.Is(err, space.ErrInsufficient) {
 		s.mu.Unlock()
 		return PartResult{}, e.refusePart(ctx, s, req.N, err)
 	} else if err != nil {

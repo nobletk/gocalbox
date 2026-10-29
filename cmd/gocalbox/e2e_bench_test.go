@@ -134,6 +134,7 @@ func TestE2EABenchmarkBinaryRefusesABadSetting(t *testing.T) {
 		benchmode.EnvConnWindow:   "1K",
 		benchmode.EnvStreamWindow: "0",
 		benchmode.EnvRequestLog:   filepath.Join(t.TempDir(), "missing", "log"),
+		benchmode.EnvSync:         "all",
 	} {
 		dir := t.TempDir()
 		cmd := exec.Command(bin, "-host=127.0.0.1", fmt.Sprintf("-port=%d", freePort(t)), "-root="+dir,
@@ -157,5 +158,27 @@ func TestE2EABenchmarkBinaryRefusesABadSetting(t *testing.T) {
 		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 			t.Errorf("%s=%s: the served folder holds %d entries", name, value, len(entries))
 		}
+	}
+}
+
+// A benchmark binary that flushes nothing per part says so, and still stores
+// the whole file.
+func TestE2EABenchmarkBinaryWithoutPartFlushesStoresTheFile(t *testing.T) {
+	t.Setenv(benchmode.EnvSync, "none")
+	s := newLiveServer(t)
+	s.bin = benchBinary(t)
+	tokens := addUsers(t, s, "alice:contributor")
+	s.start()
+	f := source{dir: "public", name: "unflushed.bin", data: randomData(t, 20<<20+7), modified: time.Now()}
+	res, err := s.uploader(tokens["alice"]).upload(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(s.root, filepath.FromSlash(res.Path)))
+	if err != nil || !bytes.Equal(b, f.data) {
+		t.Fatalf("the stored file: %d bytes, %v", len(b), err)
+	}
+	if want := "flushes nothing before its answer (" + benchmode.EnvSync + ")"; !strings.Contains(s.out.String(), want) {
+		t.Errorf("output lacks %q:\n%s", want, s.out)
 	}
 }

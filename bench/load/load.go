@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"slices"
 	"sort"
@@ -60,6 +61,10 @@ type Config struct {
 	// ResumeAt.
 	FaultAt float64
 	Fault   func() error
+	// Source, when set, holds the bytes every file is made of: at least Size
+	// bytes, as a part it can't give ends its file. Without it, the bytes are
+	// made up from each file's seed.
+	Source io.ReaderAt
 }
 
 type Result struct {
@@ -71,7 +76,8 @@ type Result struct {
 	Duration time.Duration
 	// Codes counts the files by the HTTP status their upload ended with:
 	// 201 for a file uploaded, otherwise the status of the refusal that
-	// stopped it, or 000 for a request that got no answer.
+	// stopped it, 000 for a request that got no answer, or "source" for a
+	// part this client couldn't read from Config.Source.
 	Codes map[string]int
 	// Retried counts the calls that were tried again, by the status that
 	// refused them: 503 busy or unavailable, 429 too_many_requests, 409
@@ -597,7 +603,13 @@ func (r retrier) sendPart(ctx context.Context, api API, size int64, j job, buf [
 	c := j.up.c
 	off := int64(j.n-1) * c.PartSize
 	b := buf[:min(c.PartSize, size-off)]
-	fill(b, off, j.up.seed)
+	if r.cfg.Source != nil {
+		if n, err := r.cfg.Source.ReadAt(b, off); n < len(b) {
+			return 0, fmt.Errorf("%w: part %d: %v", ErrSource, j.n, err)
+		}
+	} else {
+		fill(b, off, j.up.seed)
+	}
 	h := sha256.Sum256(b)
 	r.st.mu.Lock()
 	j.up.hashes[j.n-1] = h
@@ -732,11 +744,17 @@ var statuses = []struct {
 	{fs.ErrPermission, "403"},
 }
 
+// ErrSource is a part this client couldn't read from Config.Source; no
+// server saw it.
+var ErrSource = errors.New("cannot read the source")
+
 // status is the HTTP status the server answers err with.
 func status(err error) string {
 	var te *transfer.Error
 	var rf *Refused
 	switch {
+	case errors.Is(err, ErrSource):
+		return "source"
 	case errors.As(err, &rf):
 		return strconv.Itoa(rf.Status)
 	case errors.Is(err, ErrNoAnswer):

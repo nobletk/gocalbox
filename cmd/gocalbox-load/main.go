@@ -12,6 +12,9 @@
 // each repetition. The CSV names the commit of this tree, which should
 // then be the server's. Run it from the repository root.
 //
+// Each file's bytes are made up from its own seed, unless -file names a file
+// to read them from, as a browser reads the file it sends.
+//
 // With -tus, it uploads the file -file to a tus server, such as tusd, with
 // the core protocol: one PATCH at a time, of -chunk bytes, with no login.
 // What it uploaded stays on the server.
@@ -76,7 +79,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	faultAt := fl.Float64("fault-at", 0, "With -url: run -fault-cmd once in each repetition, as soon as a file has this share of its parts in, such as 0.5, while the parts go on")
 	faultCmd := fl.String("fault-cmd", "", "With -fault-at: the command to run, with bash -c, such as one that kills the server and starts it again")
 	tusURL := fl.String("tus", "", "Upload -file to the tus server whose uploads are created at this address, such as https://localhost:18080/files/, rather than to gocalbox")
-	file := fl.String("file", "", "With -tus: the file to upload")
+	file := fl.String("file", "", "With -tus: the file to upload. Otherwise every file uploaded is the first -size bytes of this one, read for each part, rather than bytes made up")
 	chunk := fl.String("chunk", "", "With -tus: the bytes of each PATCH, with K, M or G, or 0 for the whole file in one; by default the part size the engine uses for the file")
 	header := fl.Bool("header", false, "Print the CSV file's first line and exit")
 	if err := fl.Parse(args); err != nil {
@@ -114,6 +117,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	if *tusURL != "" {
 		return runTus(tusOptions{endpoint: *tusURL, ca: *ca, transport: *transport, file: *file, chunk: *chunk,
 			resumeAt: *resumeAt, retryFor: *retryFor, reps: *reps, csv: *csvPath})
+	}
+	var source *os.File
+	if *file != "" {
+		if source, err = openSource(*file, bytes); err != nil {
+			return err
+		}
+		defer source.Close()
 	}
 	var bench *lib.Folder
 	if *url == "" {
@@ -164,6 +174,11 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		scenario += fmt.Sprintf("_fault%g", *faultAt*100)
 	}
 	cfg := load.Config{Users: remote, Files: *files, Size: bytes, Parallel: *parallel, ResumeAt: *resumeAt, RetryFor: *retryFor}
+	if source != nil {
+		cfg.Source = source
+		scenario += "_from_file"
+		log.Printf("every file uploaded is read from %s", *file)
+	}
 	if *faultAt > 0 {
 		cfg.FaultAt, cfg.Fault = *faultAt, runFault(*faultCmd)
 	}
@@ -192,6 +207,9 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 			server = "; " + engineSummary(stack.Engine.Stats())
 			if err := stack.Close(); err != nil {
 				log.Printf("closing the stack: %v", err)
+			}
+			if afterInProcess != nil {
+				afterInProcess(stack.Root)
 			}
 		}
 		var faultErr error
@@ -225,6 +243,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	return nil
 }
 
+// afterInProcess, when set, is given the served folder of each in-process
+// repetition before the next one empties it.
+var afterInProcess func(root string)
+
 // modeFlags lists the flags that only some modes take, in the order their
 // errors name them, with those modes: i is the in-process mode, u -url and
 // t -tus.
@@ -232,7 +254,7 @@ var modeFlags = []struct{ name, modes string }{
 	{"bench-dir", "i"}, {"audit-wait", "i"}, {"audit-parts", "i"}, {"min-free-mb", "i"},
 	{"users", "iu"}, {"files", "iu"}, {"size", "iu"}, {"parallel", "iu"},
 	{"ca", "ut"}, {"transport", "ut"}, {"user-prefix", "u"}, {"fault-at", "u"}, {"fault-cmd", "u"},
-	{"file", "t"}, {"chunk", "t"},
+	{"chunk", "t"},
 }
 
 var modeNames = map[string]string{
@@ -277,6 +299,28 @@ func checkModes(set map[string]bool, remote, tus bool, transport string) error {
 		return fmt.Errorf("-transport must be https-h2 or https-h1, not %q", transport)
 	}
 	return nil
+}
+
+// openSource opens the file uploads are read from, which must be a regular
+// file of at least size bytes.
+func openSource(path string, size int64) (*os.File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	switch {
+	case err != nil:
+	case !fi.Mode().IsRegular():
+		err = fmt.Errorf("-file %s is no regular file", path)
+	case fi.Size() < size:
+		err = fmt.Errorf("-file %s holds %d bytes, fewer than -size, %d", path, fi.Size(), size)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // readPassword reads the users' password from the first line of r.

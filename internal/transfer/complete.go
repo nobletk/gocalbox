@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 
 	"github.com/nobletk/gocalbox/internal/events"
@@ -66,7 +67,30 @@ func (e *Engine) Complete(ctx context.Context, id, composite string) (Result, er
 		s.data = nil
 	}
 	s.mu.Unlock()
+	if !e.syncPartData {
+		if err := e.flushStaged(s.rec.ID); err != nil {
+			s.mu.Lock()
+			ev, ferr := e.fail(ctx, s, fmt.Sprintf("cannot flush the staged data: %v", err))
+			s.mu.Unlock()
+			e.failed(s, ev)
+			return Result{}, ferr
+		}
+	}
 	return e.finish(ctx, s, composite)
+}
+
+// flushStaged makes the staged data of upload id durable, for an engine
+// whose parts don't, and closes it again before it is placed.
+func (e *Engine) flushStaged(id string) error {
+	f, err := e.root.OpenFile(native(uploadsDir, id, dataName), os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := e.syncFile(f); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // stateErr is the refusal of a session that isn't receiving. The caller

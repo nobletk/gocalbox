@@ -16,6 +16,7 @@ func TestANormalBuildReadsNoSetting(t *testing.T) {
 	t.Setenv(EnvStreamWindow, "64K")
 	t.Setenv(EnvPartSize, "16M")
 	t.Setenv(EnvRequestLog, logPath)
+	t.Setenv(EnvSync, "none")
 	if Enabled {
 		t.Fatal("Enabled")
 	}
@@ -27,6 +28,9 @@ func TestANormalBuildReadsNoSetting(t *testing.T) {
 	}
 	if p := PartSize(); p != 0 {
 		t.Errorf("PartSize = %d", p)
+	}
+	if d, l := PartSyncs(); !d || !l {
+		t.Errorf("PartSyncs = %v, %v", d, l)
 	}
 	if w := RequestLog(); w != nil {
 		t.Errorf("RequestLog = %v", w)

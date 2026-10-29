@@ -45,11 +45,47 @@ func TestSettingsAreReadAndChecked(t *testing.T) {
 		EnvStreamWindow: {"0", "2147483648", "2G", "-5"},
 		EnvPartSize:     {"4M", "128M", "24M", "8388609", "16m", "x"},
 		EnvRequestLog:   {filepath.Join(t.TempDir(), "missing", "log.jsonl")},
+		EnvSync:         {"Part", "all", "data,log", " none", "0"},
 	} {
 		for _, v := range values {
 			if _, err := load(env(map[string]string{name: v})); err == nil || !strings.Contains(err.Error(), name) {
 				t.Errorf("%s=%s: %v", name, v, err)
 			}
+		}
+	}
+}
+
+// The part flushes are both by default, and the setting names what is kept.
+func TestThePartFlushesAreRead(t *testing.T) {
+	t.Cleanup(func() { current = settings{} })
+	for v, want := range map[string][2]bool{"": {true, true}, "part": {true, true}, "data": {true, false}, "log": {false, true}, "none": {false, false}} {
+		s, err := load(env(map[string]string{EnvSync: v}))
+		if err != nil {
+			t.Fatalf("%q: %v", v, err)
+		}
+		current = s
+		if d, l := PartSyncs(); [2]bool{d, l} != want {
+			t.Errorf("%q: data %v, log %v, want %v", v, d, l, want)
+		}
+	}
+}
+
+// A setting that drops a flush says so in the log, and what it drops; the
+// default says nothing.
+func TestInitSaysWhichFlushesAreDropped(t *testing.T) {
+	t.Cleanup(func() { current = settings{} })
+	var out bytes.Buffer
+	log.SetOutput(&out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	for v, want := range map[string]string{"data": "flushes only its data", "log": "flushes only its log line", "none": "flushes nothing", "part": "", "": ""} {
+		out.Reset()
+		t.Setenv(EnvSync, v)
+		if err := Init(); err != nil {
+			t.Fatal(err)
+		}
+		got := out.String()
+		if want == "" && strings.Contains(got, EnvSync) || want != "" && (!strings.Contains(got, want) || !strings.Contains(got, "may not be on disk")) {
+			t.Errorf("%q: log %q", v, got)
 		}
 	}
 }

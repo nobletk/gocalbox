@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nobletk/gocalbox/internal/benchmode"
 	"github.com/nobletk/gocalbox/internal/events"
 	"github.com/nobletk/gocalbox/internal/sandbox"
 	"github.com/nobletk/gocalbox/internal/space"
@@ -243,6 +244,12 @@ type Engine struct {
 	writeLog func(f *os.File, b []byte, off int64) (int, error)
 	writeAt  func(f *os.File, off int64) io.Writer
 	partSize func(size int64) int64
+
+	// syncPartData and syncPartLog are whether an accepted part's data and its
+	// log line are flushed before it is answered; only a benchmark build
+	// turns either off, and Complete then flushes the data itself.
+	syncPartData, syncPartLog bool
+
 	// admitted, when set, runs once a part has its slots, before the
 	// session is checked again.
 	admitted func(PartRequest)
@@ -284,6 +291,7 @@ func New(cfg Config) (*Engine, error) {
 		partSize:    PartSize,
 		served:      cfg.Root,
 	}
+	e.syncPartData, e.syncPartLog = benchmode.PartSyncs()
 	if cfg.prepare != nil {
 		cfg.prepare(e)
 	}

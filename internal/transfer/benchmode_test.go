@@ -63,3 +63,22 @@ func TestASessionWithABenchmarkPartSizeIsRecovered(t *testing.T) {
 		t.Errorf("after a restart: %s", next.state(created.UploadID))
 	}
 }
+
+// A benchmark build's engine takes which of a part's flushes to make from
+// the environment.
+func TestABenchmarkBuildTakesThePartFlushes(t *testing.T) {
+	t.Cleanup(func() {
+		os.Unsetenv(benchmode.EnvSync)
+		benchmode.Init()
+	})
+	for v, want := range map[string][2]bool{"part": {true, true}, "data": {true, false}, "log": {false, true}, "none": {false, false}} {
+		t.Setenv(benchmode.EnvSync, v)
+		if err := benchmode.Init(); err != nil {
+			t.Fatal(err)
+		}
+		en := newEnv(t)
+		if got := [2]bool{en.e.syncPartData, en.e.syncPartLog}; got != want {
+			t.Errorf("%s: data, log = %v, want %v", v, got, want)
+		}
+	}
+}

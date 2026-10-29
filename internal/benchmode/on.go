@@ -19,7 +19,9 @@ const Enabled = true
 type settings struct {
 	conn, stream int
 	partSize     int64
-	log          *lineWriter
+	// sync is EnvSync's value; "" is SyncPart.
+	sync string
+	log  *lineWriter
 }
 
 var current settings
@@ -42,6 +44,9 @@ func Init() error {
 	}
 	if s.partSize > 0 {
 		log.Printf("BENCHMARK BUILD: part size %d bytes for every resumable upload (%s)", s.partSize, EnvPartSize)
+	}
+	if s.sync != "" && s.sync != SyncPart {
+		log.Printf("BENCHMARK BUILD: an accepted part flushes %s before its answer (%s); answered parts may not be on disk", flushes(s.sync), EnvSync)
 	}
 	if s.log != nil {
 		log.Printf("BENCHMARK BUILD: logging every request to %s (%s)", s.log.f.Name(), EnvRequestLog)
@@ -67,6 +72,12 @@ func load(getenv func(string) string) (settings, error) {
 		return s, fmt.Errorf("%s=%s: the part size must be a power of two", EnvPartSize, getenv(EnvPartSize))
 	}
 	s.partSize = int64(part)
+	switch v := getenv(EnvSync); v {
+	case "", SyncPart, SyncData, SyncLog, SyncNone:
+		s.sync = v
+	default:
+		return s, fmt.Errorf("%s=%s: give %s, %s, %s or %s", EnvSync, v, SyncPart, SyncData, SyncLog, SyncNone)
+	}
 	if p := getenv(EnvRequestLog); p != "" {
 		if s.log, err = openLineWriter(p); err != nil {
 			return s, fmt.Errorf("%s: %w", EnvRequestLog, err)
@@ -124,6 +135,30 @@ func H2Windows(conn, stream int) (int, int) {
 // PartSize returns the part size every resumable upload uses, or 0 for the
 // schedule's.
 func PartSize() int64 { return current.partSize }
+
+// PartSyncs reports whether an accepted part's data and its log line are
+// flushed before it is answered.
+func PartSyncs() (data, log bool) {
+	switch current.sync {
+	case SyncData:
+		return true, false
+	case SyncLog:
+		return false, true
+	case SyncNone:
+		return false, false
+	}
+	return true, true
+}
+
+func flushes(v string) string {
+	switch v {
+	case SyncData:
+		return "only its data"
+	case SyncLog:
+		return "only its log line"
+	}
+	return "nothing"
+}
 
 // RequestLog returns where to log every request, or nil if the environment
 // named no log. Each Write to it is written whole, and others wait for it.

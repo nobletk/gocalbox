@@ -278,3 +278,62 @@ func TestAFailedUploadSendsNoMoreParts(t *testing.T) {
 		t.Errorf("codes %s, %d parts sent", res.CodeColumn(), srv.calls)
 	}
 }
+
+// With a source, every file is its first Size bytes, read part by part.
+func TestFilesAreReadFromTheSource(t *testing.T) {
+	work := t.TempDir()
+	s, err := NewStack(StackOptions{Work: work, Users: 1, AuditWait: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := make([]byte, 20<<20+3)
+	for i := range src {
+		src[i] = byte(i*7 + i>>11)
+	}
+	const size = 16<<20 + 1
+	res := Run(context.Background(), Config{Users: s.Users, Files: 2, Size: size, Parallel: 2, Source: bytes.NewReader(src)})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if res.CodeColumn() != "201" || len(res.Parts) != 6 {
+		t.Fatalf("codes %s, %d parts", res.CodeColumn(), len(res.Parts))
+	}
+	for _, name := range []string{"load-000-0000.bin", "load-000-0001.bin"} {
+		got, err := os.ReadFile(filepath.Join(work, "root", "users", "load00", name))
+		if err != nil || !bytes.Equal(got, src[:size]) {
+			t.Errorf("%s holds other bytes than the source's: %d bytes, %v", name, len(got), err)
+		}
+	}
+}
+
+// A source shorter than the files ends them without sending what it lacks.
+func TestAShortSourceEndsTheFile(t *testing.T) {
+	srv := &fakeServer{partSize: 4, parts: map[int][]byte{}}
+	res := Run(context.Background(), Config{Users: []User{{API: srv, Dir: "x"}}, Files: 1, Size: 10, Parallel: 1,
+		Source: bytes.NewReader([]byte("0123456"))})
+	if res.CodeColumn() != "sourcex1" || len(srv.parts) != 1 || string(srv.parts[1]) != "0123" {
+		t.Errorf("codes %s, parts %v", res.CodeColumn(), srv.parts)
+	}
+}
+
+// eofReader gives every read whole, with io.EOF when it reaches the end, as
+// io.ReaderAt allows.
+type eofReader []byte
+
+func (r eofReader) ReadAt(p []byte, off int64) (int, error) {
+	n := copy(p, r[off:])
+	if off+int64(n) == int64(len(r)) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// A read that ends the source and says so is still a whole part.
+func TestASourceThatReportsItsEndIsReadWhole(t *testing.T) {
+	srv := &fakeServer{partSize: 4, parts: map[int][]byte{}}
+	res := Run(context.Background(), Config{Users: []User{{API: srv, Dir: "x"}}, Files: 1, Size: 10, Parallel: 1,
+		Source: eofReader("0123456789")})
+	if res.CodeColumn() != "201" || string(srv.parts[3]) != "89" {
+		t.Errorf("codes %s, parts %v", res.CodeColumn(), srv.parts)
+	}
+}

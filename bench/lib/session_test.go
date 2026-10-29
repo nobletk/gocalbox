@@ -295,6 +295,9 @@ func TestTheSessionRefusesABadMatrix(t *testing.T) {
 		{"server a\ncell x a engine size=1M resume-at=1\n", nil, "resume-at must be a share"},
 		{"server a\ncell x a engine size=1M retry-for=2h\n", nil, "retry-for must be"},
 		{"server a\ncell x a inprocess size=1M audit-parts=yes\n", nil, "audit-parts must be 0 or 1"},
+		{"server a\ncell x a engine size=1M from-file=yes\n", nil, "from-file must be 0 or 1"},
+		{"server a\ncell x a upload size=1M from-file=1\n", nil, "upload takes no from-file"},
+		{"server a\ncell x - inprocess size=1M from-file=1\n", nil, "inprocess takes no from-file"},
 		{"server a\ncell x a engine size=1M fault=reboot fault-at=0.5 retry-for=1m\n", nil, "fault must be kill or cut"},
 		{"server a\ncell x a engine size=1M fault=kill fault-at=1 retry-for=1m\n", nil, "fault-at must be a share"},
 		{"server a\ncell x a engine size=1M fault=kill fault-at=0.0 retry-for=1m\n", nil, "fault-at must be a share above 0"},
@@ -379,8 +382,9 @@ func sessionTools(t *testing.T) {
 }
 
 const runMatrix = `server plain
-server bench BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=128K
+server bench BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=128K GOCALBOX_BENCH_SYNC=none
 cell e-h2  plain engine transport=https-h2 size=64M files=2 users=2
+cell e-src bench engine size=9M from-file=1
 cell e-h1  bench engine transport=https-h1 size=64K
 cell stop  bench engine size=17M resume-at=0.5 retry-for=30s
 cell up    plain upload transport=https-h1 size=64K
@@ -643,6 +647,57 @@ func TestASessionWithTheServerHere(t *testing.T) {
 	if !exists(filepath.Join(dir, "data", "fixed-64K.bin")) || !exists(filepath.Join(dir, ".gocalbox-bench")) {
 		t.Error("the data or the marker is gone")
 	}
+	checkPartFlushes(t, out, dir)
+}
+
+// checkPartFlushes checks that the session's benchmark server ran without
+// its part flushes, as its matrix line says, and that the cell from a file,
+// and no other, read the session's data file of its size.
+func checkPartFlushes(t *testing.T, out, client string) {
+	t.Helper()
+	_, rest, _ := strings.Cut(out, "results: ")
+	csv, _, _ := strings.Cut(rest, "\n")
+	base := filepath.Join("..", "..", strings.TrimSuffix(csv, ".csv"))
+	if b, _ := os.ReadFile(base + "-server-bench.log"); !strings.Contains(string(b), "flushes nothing before its answer (GOCALBOX_BENCH_SYNC)") {
+		t.Errorf("the benchmark server's log doesn't say it flushes nothing: %.400s", b)
+	}
+	if b, _ := os.ReadFile(base + "-server-bench-env.txt"); !strings.Contains(string(b), "GOCALBOX_BENCH_SYNC=none") {
+		t.Errorf("the benchmark server's environment file lacks its setting: %.400s", b)
+	}
+	if b, _ := os.ReadFile(base + "-server-plain.log"); strings.Contains(string(b), "flushes") {
+		t.Errorf("the plain server's log: %.400s", b)
+	}
+	data := filepath.Join(client, "data", "fixed-9M.bin")
+	fi, err := os.Stat(data)
+	if err != nil {
+		t.Fatal("no data file for the cell from a file")
+	}
+	// Made before the first run, so that writing it out doesn't fall in a measured one.
+	first := math.Inf(1)
+	for _, line := range strings.Split(strings.TrimSpace(output(t, out, "order")), "\n")[1:] {
+		var t0 float64
+		fmt.Sscan(strings.Split(line, ",")[5], &t0)
+		first = min(first, t0)
+	}
+	if made := float64(fi.ModTime().UnixNano()) / 1e9; made > first {
+		t.Errorf("the data file was made at %.3f, after the first run began at %.3f", made, first)
+	}
+	header := strings.Split(load.Header, ",")
+	rows := 0
+	for _, line := range strings.Split(strings.TrimSpace(output(t, out, "results")), "\n")[1:] {
+		row := strings.Split(line, ",")
+		if row[slices.Index(header, "scenario")] != "e-src" {
+			continue
+		}
+		rows++
+		if size := row[slices.Index(header, "size_bytes")]; size != "9437184" {
+			t.Errorf("the cell from a file uploaded %s bytes", size)
+		}
+	}
+	b, _ := os.ReadFile(filepath.Join(client, "session", "load.log"))
+	if n := strings.Count(string(b), "every file uploaded is read from "+data+"\n"); rows == 0 || n != rows || strings.Count(string(b), "is read from") != n {
+		t.Errorf("%d runs read from %s, for %d rows of the cell from a file:\n%s", n, data, rows, b)
+	}
 }
 
 // fakeIperf is an iperf3 whose rate from the server falls from 930 to 700
@@ -711,6 +766,7 @@ func TestASessionOverSSH(t *testing.T) {
 	if exists(filepath.Join(client, "server")) {
 		t.Error("the server ran in the client's folder")
 	}
+	checkPartFlushes(t, out, client)
 }
 
 // A transfer that moved other bytes than the source's is marked, in its row

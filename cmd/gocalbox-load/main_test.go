@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -178,7 +180,9 @@ func TestEachModeTakesOnlyItsFlags(t *testing.T) {
 		{[]string{"transport", "user-prefix"}, false, false, "https-h1", "-transport: only for -url and -tus; -user-prefix: only for -url"},
 		{[]string{"bench-dir"}, true, false, "https-h2", "-bench-dir: only for the in-process mode; set them on the server"},
 		{[]string{"audit-wait", "audit-parts", "min-free-mb"}, true, false, "https-h2", "-audit-wait, -audit-parts, -min-free-mb: only for the in-process mode; set them on the server"},
-		{[]string{"file", "chunk"}, true, false, "https-h2", "-file, -chunk: only for -tus"},
+		{[]string{"file", "chunk"}, true, false, "https-h2", "-chunk: only for -tus"},
+		{[]string{"file"}, true, false, "https-h2", ""},
+		{[]string{"file"}, false, false, "https-h2", ""},
 		{[]string{"chunk"}, false, false, "https-h2", "-chunk: only for -tus"},
 		{[]string{"bench-dir", "users", "size", "user-prefix", "fault-at"}, false, true, "https-h2",
 			"-bench-dir: only for the in-process mode; -users, -size: only for the in-process mode and -url; -user-prefix, -fault-at: only for -url"},
@@ -241,6 +245,8 @@ type fakeServer struct {
 	calls  []string
 	done   map[string]string // completed uploads and their paths
 
+	parts map[string][]byte // what each upload's parts carried, in order of arrival
+
 	refuseDeletes bool
 	unavailable   int      // creates answered 503 unavailable, as by a server shutting down
 	users         []string // who logged in
@@ -259,13 +265,20 @@ func newFakeServer(t *testing.T) *fakeServer {
 
 func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request) {
 	var body map[string]any
+	var raw []byte
 	if r.Header.Get("Content-Type") == "application/json" {
 		json.NewDecoder(r.Body).Decode(&body)
 	} else {
-		io.Copy(io.Discard, r.Body)
+		raw, _ = io.ReadAll(r.Body)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if r.URL.Path == "/api/upload/part" {
+		if f.parts == nil {
+			f.parts = map[string][]byte{}
+		}
+		f.parts[r.URL.Query().Get("id")] = append(f.parts[r.URL.Query().Get("id")], raw...)
+	}
 	f.protos[r.Proto]++
 	f.calls = append(f.calls, r.URL.Path)
 	switch r.URL.Path {
@@ -681,7 +694,6 @@ func TestTheTusModeRefuses(t *testing.T) {
 		{append(base, "-file", src, "-users", "2"), "-users: only for the in-process mode and -url"},
 		{append(base, "-file", src, "-url", f.srv.URL), "choose one server"},
 		{append(base, "-file", src, "-transport", "h2"), "-transport must be"},
-		{[]string{"-file", src}, "-file: only for -tus"},
 		{append(base, "-file", src, "-tus", "http://x/files/"), "https://host:port/path"},
 	} {
 		if err := run(c.args, strings.NewReader(""), io.Discard); err == nil || !strings.Contains(err.Error(), c.want) {
@@ -693,5 +705,92 @@ func TestTheTusModeRefuses(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(csv); strings.Count(string(b), "\n") > 1 {
 		t.Errorf("a refused run wrote rows: %q", b)
+	}
+}
+
+// With -file, the engine's uploads are read from it, and the row says so; a
+// file too short for -size, missing or not a file is refused before any
+// upload.
+func TestTheEngineModesReadFromAFile(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src.bin")
+	os.WriteFile(src, []byte("0123456789abcdef"), 0o644)
+	f := newFakeServer(t)
+	csv := filepath.Join(t.TempDir(), "out.csv")
+	base := []string{"-url", f.srv.URL, "-ca", f.caFile, "-reps", "1", "-csv", csv}
+	for _, size := range []string{"10", "16"} {
+		if err := run(append(base, "-size", size, "-file", src, "-parallel", "1"), strings.NewReader("pw\n"), io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		f.mu.Lock()
+		var got string
+		for _, b := range f.parts {
+			got += string(b)
+		}
+		if len(f.parts) != 1 {
+			t.Errorf("-size %s: parts of %d uploads", size, len(f.parts))
+		}
+		f.parts = nil
+		f.mu.Unlock()
+		if n, _ := strconv.Atoi(size); got != "0123456789abcdef"[:n] {
+			t.Errorf("-size %s: the server got %q", size, got)
+		}
+	}
+	rows := readCSV(t, csv)
+	if len(rows) != 2 || rows[0][2] != "engine_upload_1u_from_file" || rows[0][11] != "201" || rows[1][11] != "201" {
+		t.Errorf("rows %q", rows)
+	}
+	for _, c := range []struct{ file, size, want string }{
+		{src, "17", "holds 16 bytes, fewer than -size, 17"},
+		{src + ".missing", "10", "src.bin.missing"},
+		{filepath.Dir(src), "10", "is no regular file"},
+	} {
+		f.mu.Lock()
+		f.calls = nil
+		f.mu.Unlock()
+		err := run(append(base, "-size", c.size, "-file", c.file), strings.NewReader("pw\n"), io.Discard)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("-file %s -size %s: %v, want %q", c.file, c.size, err, c.want)
+		}
+		f.mu.Lock()
+		if len(f.calls) != 0 {
+			t.Errorf("-file %s -size %s: a refused run called %q", c.file, c.size, f.calls)
+		}
+		f.mu.Unlock()
+	}
+	if rows := readCSV(t, csv); len(rows) != 2 {
+		t.Errorf("refused runs wrote rows: %q", rows)
+	}
+}
+
+// In process too, the files stored are the file's bytes.
+func TestTheInProcessModeReadsFromAFile(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src.bin")
+	data := make([]byte, 9<<20)
+	for i := range data {
+		data[i] = byte(i * 13)
+	}
+	os.WriteFile(src, data, 0o644)
+	var stored [][]byte
+	afterInProcess = func(root string) {
+		for _, name := range []string{"load-000-0000.bin", "load-000-0001.bin"} {
+			b, _ := os.ReadFile(filepath.Join(root, "users", "load00", name))
+			stored = append(stored, b)
+		}
+	}
+	t.Cleanup(func() { afterInProcess = nil })
+	csv := filepath.Join(t.TempDir(), "out.csv")
+	if err := run([]string{"-bench-dir", benchDir(t), "-csv", csv, "-size", "9M", "-files", "2", "-reps", "1", "-min-free-mb", "0", "-file", src}, strings.NewReader(""), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for i, b := range stored {
+		if !bytes.Equal(b, data) {
+			t.Errorf("file %d: stored %d bytes other than the file's", i, len(b))
+		}
+	}
+	if len(stored) != 2 {
+		t.Errorf("%d files looked at", len(stored))
+	}
+	if rows := readCSV(t, csv); len(rows) != 1 || rows[0][2] != "engine_upload_1u_from_file" {
+		t.Errorf("rows %q", rows)
 	}
 }
