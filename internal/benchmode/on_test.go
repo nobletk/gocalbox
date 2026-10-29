@@ -4,6 +4,7 @@ package benchmode
 
 import (
 	"bytes"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -22,6 +23,9 @@ func TestSettingsAreReadAndChecked(t *testing.T) {
 	}))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if s.log != nil {
+		t.Cleanup(func() { s.log.close() })
 	}
 	if s.conn != 16<<20 || s.stream != 1<<20 || s.partSize != 16<<20 || s.log == nil {
 		t.Errorf("settings %+v", s)
@@ -90,6 +94,64 @@ func TestInitSaysWhichFlushesAreDropped(t *testing.T) {
 	}
 }
 
+// Settings taken again close the request log they replace, and the folder
+// that held it can be deleted, on Windows too.
+func TestInitClosesTheRequestLogItReplaces(t *testing.T) {
+	t.Cleanup(func() { current = settings{} })
+	dir := t.TempDir()
+	t.Cleanup(func() {
+		if current.log != nil {
+			current.log.close()
+		}
+	})
+	t.Setenv(EnvRequestLog, filepath.Join(dir, "first.jsonl"))
+	if err := Init(); err != nil {
+		t.Fatal(err)
+	}
+	first := RequestLog()
+	t.Setenv(EnvRequestLog, filepath.Join(dir, "second.jsonl"))
+	if err := Init(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Write([]byte("x\n")); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("the replaced log took a write: %v", err)
+	}
+	second := RequestLog()
+	if _, err := second.Write([]byte("y\n")); err != nil {
+		t.Errorf("the new log: %v", err)
+	}
+	os.Unsetenv(EnvRequestLog)
+	if err := Init(); err != nil {
+		t.Fatal(err)
+	}
+	if RequestLog() != nil {
+		t.Error("a request log without the setting")
+	}
+	if _, err := second.Write([]byte("z\n")); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("a log replaced by none took a write: %v", err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Errorf("the logs' folder: %v", err)
+	}
+}
+
+// A refused setting leaves the request log open.
+func TestARefusedSettingKeepsTheRequestLog(t *testing.T) {
+	t.Cleanup(func() { current = settings{} })
+	t.Setenv(EnvRequestLog, filepath.Join(t.TempDir(), "log.jsonl"))
+	if err := Init(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { current.log.close() })
+	t.Setenv(EnvPartSize, "3")
+	if err := Init(); err == nil {
+		t.Fatal("an invalid setting was taken")
+	}
+	if _, err := RequestLog().Write([]byte("x\n")); err != nil {
+		t.Errorf("the log after a refused setting: %v", err)
+	}
+}
+
 // Init takes what the environment sets, says so in the log, and changes
 // only what is set.
 func TestInitTakesTheEnvironment(t *testing.T) {
@@ -130,6 +192,7 @@ func TestTheRequestLogWritesWholeLines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { w.close() })
 	done := make(chan bool)
 	for i := range 8 {
 		go func() {

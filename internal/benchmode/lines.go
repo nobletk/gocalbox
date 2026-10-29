@@ -21,6 +21,12 @@ func openLineWriter(path string) (*lineWriter, error) {
 	return &lineWriter{f: f}, nil
 }
 
+func (w *lineWriter) close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.f.Close()
+}
+
 func (w *lineWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

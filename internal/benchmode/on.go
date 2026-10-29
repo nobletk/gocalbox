@@ -28,11 +28,16 @@ var current settings
 
 // Init reads the benchmark settings from the environment and logs each one
 // it takes. A value out of range is an error: HTTP/2 would quietly use its
-// default instead, and the run would measure something else.
+// default instead, and the run would measure something else. Settings taken
+// again close the request log they replace: Windows can't delete an open
+// file.
 func Init() error {
 	s, err := load(os.Getenv)
 	if err != nil {
 		return err
+	}
+	if current.log != nil {
+		current.log.close()
 	}
 	current = s
 	log.Printf("BENCHMARK BUILD: not for serving users")
