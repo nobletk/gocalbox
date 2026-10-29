@@ -1,0 +1,70 @@
+2026/10/29 16:53:10 BENCHMARK BUILD: not for serving users
+2026/10/29 16:53:10 BENCHMARK BUILD: an accepted part flushes only its data before its answer (GOCALBOX_BENCH_SYNC); answered parts may not be on disk
+2026/10/29 16:53:10 BENCHMARK BUILD: logging every request to /mnt/storage/gocalbox-bench/server/requests.jsonl (GOCALBOX_BENCH_REQUEST_LOG)
+2026/10/29 16:53:10 Starting server on https://127.0.0.1:18080
+2026/10/29 16:53:10 Sandboxing directory: /mnt/storage/gocalbox-bench/server/root
+2026/10/29 16:53:10 Accepted host names: localhost, 127.0.0.1, ::1
+2026/10/29 16:53:10 Audit log: /mnt/storage/gocalbox-bench/server/audit.jsonl (6 existing records)
+2026/10/29 16:53:10 State file: /mnt/storage/gocalbox-bench/server/state.db
+2026/10/29 16:53:10 Free space: 970.8 GiB on the served volume; uploads leave at least 1024 MiB free
+2026/10/29 16:53:10 HTTPS certificate from the local CA, renewed automatically, for: localhost, 127.0.0.1, ::1
+2026/10/29 16:53:10 Local CA: /mnt/storage/gocalbox-bench/server/tls/ca.crt (valid until 2036-10-18)
+2026/10/29 16:53:10 Local CA SHA-256 fingerprint: 2D:B8:41:F3:98:CF:D9:B9:C9:9B:0E:89:06:83:32:6E:30:F9:15:DE:29:42:DD:AF:4B:58:9E:C4:53:5B:C2:4E
+2026/10/29 16:53:10 Install the local CA once on each device: open https://localhost:18080/ca.crt, accept the warning this one time, and check that the fingerprint the installer shows matches the one above
+2026/10/29 16:54:33 Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...
+2026/10/29 16:54:34 BENCHMARK BUILD: not for serving users
+2026/10/29 16:54:34 BENCHMARK BUILD: an accepted part flushes only its data before its answer (GOCALBOX_BENCH_SYNC); answered parts may not be on disk
+2026/10/29 16:54:34 BENCHMARK BUILD: logging every request to /mnt/storage/gocalbox-bench/server/requests.jsonl (GOCALBOX_BENCH_REQUEST_LOG)
+2026/10/29 16:54:34 Starting server on https://127.0.0.1:18080
+2026/10/29 16:54:34 Sandboxing directory: /mnt/storage/gocalbox-bench/server/root
+2026/10/29 16:54:34 Accepted host names: localhost, 127.0.0.1, ::1
+2026/10/29 16:54:34 Audit log: /mnt/storage/gocalbox-bench/server/audit.jsonl (6 existing records)
+2026/10/29 16:54:34 State file: /mnt/storage/gocalbox-bench/server/state.db
+2026/10/29 16:54:34 Free space: 970.8 GiB on the served volume; uploads leave at least 1024 MiB free
+2026/10/29 16:54:34 HTTPS certificate from the local CA, renewed automatically, for: localhost, 127.0.0.1, ::1
+2026/10/29 16:54:34 Local CA: /mnt/storage/gocalbox-bench/server/tls/ca.crt (valid until 2036-10-18)
+2026/10/29 16:54:34 Local CA SHA-256 fingerprint: 2D:B8:41:F3:98:CF:D9:B9:C9:9B:0E:89:06:83:32:6E:30:F9:15:DE:29:42:DD:AF:4B:58:9E:C4:53:5B:C2:4E
+2026/10/29 16:54:34 Install the local CA once on each device: open https://localhost:18080/ca.crt, accept the warning this one time, and check that the fingerprint the installer shows matches the one above
+2026/10/29 16:55:20 Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...
+2026/10/29 17:00:35 BENCHMARK BUILD: not for serving users
+2026/10/29 17:00:35 BENCHMARK BUILD: an accepted part flushes only its data before its answer (GOCALBOX_BENCH_SYNC); answered parts may not be on disk
+2026/10/29 17:00:35 BENCHMARK BUILD: logging every request to /mnt/storage/gocalbox-bench/server/requests.jsonl (GOCALBOX_BENCH_REQUEST_LOG)
+2026/10/29 17:00:35 Starting server on https://127.0.0.1:18080
+2026/10/29 17:00:35 Sandboxing directory: /mnt/storage/gocalbox-bench/server/root
+2026/10/29 17:00:35 Accepted host names: localhost, 127.0.0.1, ::1
+2026/10/29 17:00:35 Audit log: /mnt/storage/gocalbox-bench/server/audit.jsonl (6 existing records)
+2026/10/29 17:00:35 State file: /mnt/storage/gocalbox-bench/server/state.db
+2026/10/29 17:00:35 Free space: 970.8 GiB on the served volume; uploads leave at least 1024 MiB free
+2026/10/29 17:00:35 HTTPS certificate from the local CA, renewed automatically, for: localhost, 127.0.0.1, ::1
+2026/10/29 17:00:35 Local CA: /mnt/storage/gocalbox-bench/server/tls/ca.crt (valid until 2036-10-18)
+2026/10/29 17:00:35 Local CA SHA-256 fingerprint: 2D:B8:41:F3:98:CF:D9:B9:C9:9B:0E:89:06:83:32:6E:30:F9:15:DE:29:42:DD:AF:4B:58:9E:C4:53:5B:C2:4E
+2026/10/29 17:00:35 Install the local CA once on each device: open https://localhost:18080/ca.crt, accept the warning this one time, and check that the fingerprint the installer shows matches the one above
+2026/10/29 17:01:22 Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...
+2026/10/29 17:04:23 BENCHMARK BUILD: not for serving users
+2026/10/29 17:04:23 BENCHMARK BUILD: an accepted part flushes only its data before its answer (GOCALBOX_BENCH_SYNC); answered parts may not be on disk
+2026/10/29 17:04:23 BENCHMARK BUILD: logging every request to /mnt/storage/gocalbox-bench/server/requests.jsonl (GOCALBOX_BENCH_REQUEST_LOG)
+2026/10/29 17:04:23 Starting server on https://127.0.0.1:18080
+2026/10/29 17:04:23 Sandboxing directory: /mnt/storage/gocalbox-bench/server/root
+2026/10/29 17:04:23 Accepted host names: localhost, 127.0.0.1, ::1
+2026/10/29 17:04:23 Audit log: /mnt/storage/gocalbox-bench/server/audit.jsonl (6 existing records)
+2026/10/29 17:04:23 State file: /mnt/storage/gocalbox-bench/server/state.db
+2026/10/29 17:04:23 Free space: 970.8 GiB on the served volume; uploads leave at least 1024 MiB free
+2026/10/29 17:04:23 HTTPS certificate from the local CA, renewed automatically, for: localhost, 127.0.0.1, ::1
+2026/10/29 17:04:23 Local CA: /mnt/storage/gocalbox-bench/server/tls/ca.crt (valid until 2036-10-18)
+2026/10/29 17:04:23 Local CA SHA-256 fingerprint: 2D:B8:41:F3:98:CF:D9:B9:C9:9B:0E:89:06:83:32:6E:30:F9:15:DE:29:42:DD:AF:4B:58:9E:C4:53:5B:C2:4E
+2026/10/29 17:04:23 Install the local CA once on each device: open https://localhost:18080/ca.crt, accept the warning this one time, and check that the fingerprint the installer shows matches the one above
+2026/10/29 17:05:08 Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...
+2026/10/29 17:08:56 BENCHMARK BUILD: not for serving users
+2026/10/29 17:08:56 BENCHMARK BUILD: an accepted part flushes only its data before its answer (GOCALBOX_BENCH_SYNC); answered parts may not be on disk
+2026/10/29 17:08:56 BENCHMARK BUILD: logging every request to /mnt/storage/gocalbox-bench/server/requests.jsonl (GOCALBOX_BENCH_REQUEST_LOG)
+2026/10/29 17:08:56 Starting server on https://127.0.0.1:18080
+2026/10/29 17:08:56 Sandboxing directory: /mnt/storage/gocalbox-bench/server/root
+2026/10/29 17:08:56 Accepted host names: localhost, 127.0.0.1, ::1
+2026/10/29 17:08:56 Audit log: /mnt/storage/gocalbox-bench/server/audit.jsonl (6 existing records)
+2026/10/29 17:08:56 State file: /mnt/storage/gocalbox-bench/server/state.db
+2026/10/29 17:08:56 Free space: 970.8 GiB on the served volume; uploads leave at least 1024 MiB free
+2026/10/29 17:08:56 HTTPS certificate from the local CA, renewed automatically, for: localhost, 127.0.0.1, ::1
+2026/10/29 17:08:56 Local CA: /mnt/storage/gocalbox-bench/server/tls/ca.crt (valid until 2036-10-18)
+2026/10/29 17:08:56 Local CA SHA-256 fingerprint: 2D:B8:41:F3:98:CF:D9:B9:C9:9B:0E:89:06:83:32:6E:30:F9:15:DE:29:42:DD:AF:4B:58:9E:C4:53:5B:C2:4E
+2026/10/29 17:08:56 Install the local CA once on each device: open https://localhost:18080/ca.crt, accept the warning this one time, and check that the fingerprint the installer shows matches the one above
+2026/10/29 17:09:40 Shutting down; waiting for transfers and file operations to finish (signal again to exit immediately)...

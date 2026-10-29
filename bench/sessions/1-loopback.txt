@@ -3,6 +3,8 @@
 # X1's baselines (tusd, SFTP and scp) need tusd and OpenSSH (bench/README.md); run them with
 # the rest of X1, CELLS=x1-, so that the engine and the baselines share the session.
 #
+# X14, what each part's flushes cost, runs on its own with CELLS=x14-.
+#
 # PRE_M6 names the commit before M6 (bench/README.md says how to find it).
 
 server default
@@ -13,6 +15,10 @@ server h2-448k BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=448K
 server h2-1m BUILD_TAGS=bench GOCALBOX_BENCH_H2_STREAM_WINDOW=1M GOCALBOX_BENCH_H2_CONN_WINDOW=16M
 server tusd KIND=tusd
 server sshd KIND=sshd
+server sync-part BUILD_TAGS=bench GOCALBOX_BENCH_SYNC=part
+server sync-data BUILD_TAGS=bench GOCALBOX_BENCH_SYNC=data
+server sync-log  BUILD_TAGS=bench GOCALBOX_BENCH_SYNC=log
+server sync-none BUILD_TAGS=bench GOCALBOX_BENCH_SYNC=none
 
 # X1: the server's capacity on our own paths, uploads and downloads, over both protocols.
 cell x1-engine-h2-1M   default engine   transport=https-h2 size=1M
@@ -120,3 +126,38 @@ cell x6-users-8  default engine transport=https-h2 size=256M files=3 users=8
 cell x6-users-16 default engine transport=https-h2 size=256M files=3 users=16
 # 24 users send 96 parts at once: more than the server's 32 in flight and 32 waiting.
 cell x6-users-24 default engine transport=https-h2 size=256M files=3 users=24
+
+# X14: what an accepted part's two flushes cost, its data's and its log line's, in the benchmark
+# build, which can leave either out: part (both, as every build does), data, log, or none. Only
+# part keeps the promise that an answered part is on disk; log and none flush the data once, at
+# the completion. The engine with 1 part in flight and with its 4, over HTTP/2. from-file=1
+# reads the parts from a file, as a browser does, instead of making them up, so that the load
+# client's own cost can be told from SHA-256's.
+cell x14-part-p1-64M      sync-part engine transport=https-h2 size=64M parallel=1
+cell x14-part-p1-1G       sync-part engine transport=https-h2 size=1G parallel=1
+cell x14-part-p1-5G       sync-part engine transport=https-h2 size=5G parallel=1
+cell x14-part-p4-64M      sync-part engine transport=https-h2 size=64M parallel=4
+cell x14-part-p4-1G       sync-part engine transport=https-h2 size=1G parallel=4
+cell x14-part-p4-5G       sync-part engine transport=https-h2 size=5G parallel=4
+cell x14-data-p1-64M      sync-data engine transport=https-h2 size=64M parallel=1
+cell x14-data-p1-1G       sync-data engine transport=https-h2 size=1G parallel=1
+cell x14-data-p1-5G       sync-data engine transport=https-h2 size=5G parallel=1
+cell x14-data-p4-64M      sync-data engine transport=https-h2 size=64M parallel=4
+cell x14-data-p4-1G       sync-data engine transport=https-h2 size=1G parallel=4
+cell x14-data-p4-5G       sync-data engine transport=https-h2 size=5G parallel=4
+cell x14-log-p1-64M       sync-log  engine transport=https-h2 size=64M parallel=1
+cell x14-log-p1-1G        sync-log  engine transport=https-h2 size=1G parallel=1
+cell x14-log-p1-5G        sync-log  engine transport=https-h2 size=5G parallel=1
+cell x14-log-p4-64M       sync-log  engine transport=https-h2 size=64M parallel=4
+cell x14-log-p4-1G        sync-log  engine transport=https-h2 size=1G parallel=4
+cell x14-log-p4-5G        sync-log  engine transport=https-h2 size=5G parallel=4
+cell x14-none-p1-64M      sync-none engine transport=https-h2 size=64M parallel=1
+cell x14-none-p1-1G       sync-none engine transport=https-h2 size=1G parallel=1
+cell x14-none-p1-5G       sync-none engine transport=https-h2 size=5G parallel=1
+cell x14-none-p4-64M      sync-none engine transport=https-h2 size=64M parallel=4
+cell x14-none-p4-1G       sync-none engine transport=https-h2 size=1G parallel=4
+cell x14-none-p4-5G       sync-none engine transport=https-h2 size=5G parallel=4
+cell x14-file-p1-1G       sync-part engine transport=https-h2 size=1G parallel=1 from-file=1
+cell x14-file-p1-5G       sync-part engine transport=https-h2 size=5G parallel=1 from-file=1
+cell x14-file-p4-1G       sync-part engine transport=https-h2 size=1G parallel=4 from-file=1
+cell x14-file-p4-5G       sync-part engine transport=https-h2 size=5G parallel=4 from-file=1

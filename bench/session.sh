@@ -13,12 +13,14 @@
 #   cell ID SERVER TOOL [KEY=VALUE ...]
 #                                 a measurement, against the server SERVER, or - for none.
 #     engine     resumable uploads with the load client: transport=https-h2|https-h1, size,
-#                files=1, users=1, parallel=4, resume-at, retry-for, and a fault: fault=kill|cut
+#                files=1, users=1, parallel=4, from-file=0, resume-at, retry-for, and a fault: fault=kill|cut
 #                with fault-at, a share such as 0.5, and retry-for. Once a file has that share of
 #                its parts in, kill has bench/server.sh crash the server (SIGKILL) and start it
 #                again, and cut drops this machine's traffic to the server for cut-for=10 seconds
 #                (1 to 60), through NETCUT; the parts go on meanwhile. The row's resumed columns
-#                hold the time from the fault to the file's end.
+#                hold the time from the fault to the file's end. from-file=1 reads each part from
+#                the session's data file of that size, as a browser reads the file it sends,
+#                instead of making the bytes up.
 #     upload     one single-request upload with curl: transport, size
 #     download   one download with curl: transport, size
 #     seek       seeks=100 Range requests of chunk=1M at random offsets in one download's file,
@@ -121,9 +123,9 @@ mkdir -p "$WORK" "$DATA" bench/results
 
 declare -A PROFILE_ENV=() PROFILE_USERS=() PROFILE_KIND=() CELL_SERVER=() CELL_TOOL=() CELL_ARGS=()
 CELL_IDS=()
-SERVER_VARS=" KIND BUILD_TAGS SERVER_REV SERVER_FLAGS LOG_EVENTS ALLOWED_HOSTS TUSD SSHD GOCALBOX_BENCH_H2_CONN_WINDOW GOCALBOX_BENCH_H2_STREAM_WINDOW GOCALBOX_BENCH_PART_SIZE "
+SERVER_VARS=" KIND BUILD_TAGS SERVER_REV SERVER_FLAGS LOG_EVENTS ALLOWED_HOSTS TUSD SSHD GOCALBOX_BENCH_H2_CONN_WINDOW GOCALBOX_BENCH_H2_STREAM_WINDOW GOCALBOX_BENCH_PART_SIZE GOCALBOX_BENCH_SYNC "
 declare -A TOOL_KEYS=(
-  [engine]=" transport size files users parallel resume-at retry-for fault fault-at cut-for reps "
+  [engine]=" transport size files users parallel from-file resume-at retry-for fault fault-at cut-for reps "
   [upload]=" transport size reps "
   [download]=" transport size reps "
   [seek]=" transport size seeks chunk reps "
@@ -169,7 +171,7 @@ check_cell() {
         if [ "$TOOL" = tus ]; then is_size "$v" || bad "chunk must be bytes, or a number with K, M or G; 0 sends the file in one PATCH"
         else is_size "$v" && [ "$(numfmt --from=iec "$v")" -gt 0 ] || bad "chunk must be bytes, or a number with K, M or G, above 0"; fi ;;
       reps) [[ $v =~ ^[0-9]+$ ]] || bad "reps must be a number" ;;
-      audit-parts | audit-wait) [[ $v = 0 || $v = 1 ]] || bad "$k must be 0 or 1" ;;
+      audit-parts | audit-wait | from-file) [[ $v = 0 || $v = 1 ]] || bad "$k must be 0 or 1" ;;
       resume-at | fault-at) [[ $v =~ ^0?\.[0-9]*[1-9][0-9]*$ ]] || bad "$k must be a share above 0 and below 1, such as 0.5" ;;
       fault) [[ $v = kill || $v = cut ]] || bad "fault must be kill or cut" ;;
       cut-for) [[ $v =~ ^[1-9][0-9]?$ ]] && [ "$v" -le 60 ] || bad "cut-for must be seconds from 1 to 60" ;;
@@ -537,6 +539,7 @@ run_cell() {
       args=(-csv "$tmp" -reps 1 -size "$(value size 0)" -files "$(value files 1)" -users "$(value users 1)" -parallel "$(value parallel 4)")
       [ -z "$(value resume-at '')" ] || args+=(-resume-at "$(value resume-at '')")
       [ -z "$(value retry-for '')" ] || args+=(-retry-for "$(value retry-for '')")
+      [ "$(value from-file 0)" = 0 ] || args+=(-file "$(data "$(value size 0)")")
       [ -z "$(value fault '')" ] || args+=(-fault-at "$(value fault-at '')" -fault-cmd "$(fault_cmd "$(value fault '')" "$(value cut-for 10)")")
       bench_rm "$tmp"
       if [ "${CELL_TOOL[$id]}" = engine ]; then
@@ -854,7 +857,11 @@ link_rates() {
 # --- The session --------------------------------------------------------------
 
 for s in $(for id in "${CELL_IDS[@]}"; do ARGS=${CELL_ARGS[$id]}
-  case ${CELL_TOOL[$id]} in upload | download | seek | tus | sftp-put | sftp-get | scp-put) value size 0 ;; batch) echo 1M ;; esac; done | sort -u); do
+  case ${CELL_TOOL[$id]} in
+    upload | download | seek | tus | sftp-put | sftp-get | scp-put) value size 0 ;;
+    engine) [ "$(value from-file 0)" = 0 ] || value size 0 ;;
+    batch) echo 1M ;;
+  esac; done | sort -u); do
   data "$s" > /dev/null
 done
 
